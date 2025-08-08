@@ -21,7 +21,7 @@ from tensorrt_llm.llmapi import CompletionOutput, RequestOutput, SamplingParams
 from tensorrt_llm.llmapi.llm_args import LlmArgs
 
 from ..conftest import (get_device_count, llm_models_root, parametrize_with_ids,
-                        skip_pre_hopper)
+                        skip_pre_blackwell, skip_pre_hopper)
 from ..trt_test_alternative import popen
 from .accuracy_core import (GSM8K, MMLU, LlmapiAccuracyTestHarness,
                             get_accuracy_task)
@@ -69,7 +69,9 @@ def launch_disaggregated_llm(disaggregated_server_config: Dict[str, Any],
                              ctx_server_config: Dict[str, Any],
                              gen_server_config: Dict[str, Any],
                              model_name: str,
-                             tensor_parallel_size: int = 1):
+                             tensor_parallel_size: int = 1,
+                             ctx_model: str = None,
+                             gen_model: str = None):
     temp_dir = tempfile.TemporaryDirectory()
     disaggregated_serving_config_path = os.path.join(
         temp_dir.name, "disaggregated_serving_config.yaml")
@@ -95,9 +97,19 @@ def launch_disaggregated_llm(disaggregated_server_config: Dict[str, Any],
 
     trtllm_serve_path = "trtllm-serve"
     # Common arguments for both servers
-    common_args = [
+    ctx_model = ctx_model or model_name
+    gen_model = gen_model or model_name
+    ctx_args = [
         trtllm_serve_path,
-        model_name,
+        ctx_model,
+        "--host",
+        "localhost",
+        "--backend",
+        "pytorch",
+    ]
+    gen_args = [
+        trtllm_serve_path,
+        gen_model,
         "--host",
         "localhost",
         "--backend",
@@ -123,11 +135,11 @@ def launch_disaggregated_llm(disaggregated_server_config: Dict[str, Any],
     env_gen["TRTLLM_USE_UCX_KVCACHE"] = "1"
     env_gen["CUDA_VISIBLE_DEVICES"] = ",".join(
         map(str, range(ctx_total_gpus, ctx_total_gpus + gen_total_gpus)))
-    ctx_server_args = common_args + [
+    ctx_server_args = ctx_args + [
         "--port", "8001", "--extra_llm_api_options", ctx_server_config_path,
         f"--tp_size={ctx_tp}", f"--pp_size={ctx_pp}"
     ]
-    gen_server_args = common_args + [
+    gen_server_args = gen_args + [
         "--port", "8002", "--extra_llm_api_options", gen_server_config_path,
         f"--tp_size={gen_tp}", f"--pp_size={gen_pp}"
     ]
@@ -203,17 +215,21 @@ def launch_disaggregated_llm(disaggregated_server_config: Dict[str, Any],
             disaggregated_server.wait()
 
 
-def run_parallel_test(model_name: str, model_path: str, ctx_pp: int,
-                      ctx_tp: int, gen_pp: int, gen_tp: int,
-                      test_set: LlmapiAccuracyTestHarness):
+def run_parallel_test(model_name: str,
+                      model_path: str,
+                      ctx_pp: int,
+                      ctx_tp: int,
+                      gen_pp: int,
+                      gen_tp: int,
+                      test_set: LlmapiAccuracyTestHarness,
+                      ctx_model: str = None,
+                      gen_model: str = None):
     if ctx_tp * ctx_pp + gen_tp * gen_pp > get_device_count():
         pytest.fail(
             f"Not enough devices for ctx_pp={ctx_pp}+ctx_tp={ctx_tp} and gen_pp={gen_pp}+gen_tp={gen_tp} test"
         )
-
     kv_cache_config = {
         "free_gpu_memory_fraction": 0.5,
-        "enable_block_reuse": False
     }
     ctx_server_config = {
         "pipeline_parallel_size": ctx_pp,
@@ -247,8 +263,11 @@ def run_parallel_test(model_name: str, model_path: str, ctx_pp: int,
         }
     }
     with launch_disaggregated_llm(disaggregated_server_config,
-                                  ctx_server_config, gen_server_config,
-                                  model_path) as llm:
+                                  ctx_server_config,
+                                  gen_server_config,
+                                  model_path,
+                                  ctx_model=ctx_model,
+                                  gen_model=gen_model) as llm:
         task = test_set(model_name)
         task.evaluate(llm)
 
@@ -584,3 +603,25 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                                       self.MODEL_PATH) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+
+
+@skip_pre_blackwell
+@pytest.mark.timeout(3600)
+class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
+    fp4_model = f"{llm_models_root()}/Qwen3/saved_models_Qwen3-30B-A3B_nvfp4_hf"
+    fp8_model = f"{llm_models_root()}/Qwen3/saved_models_Qwen3-30B-A3B_fp8_hf"
+
+    @pytest.mark.parametrize("ctxpp,gentp", [(2, 2)], ids=["ctxpp2gentp2"])
+    @pytest.mark.parametrize("testset", ["GSM8K"])
+    def test_mixed_ctx_gen_model(self, ctxpp, gentp, testset):
+        ctx_model = self.fp4_model
+        gen_model = self.fp8_model
+        return run_parallel_test("Qwen3/Qwen3-30B-A3B",
+                                 ctx_model,
+                                 ctx_pp=ctxpp,
+                                 ctx_tp=1,
+                                 gen_pp=1,
+                                 gen_tp=gentp,
+                                 test_set=get_accuracy_task(testset),
+                                 ctx_model=ctx_model,
+                                 gen_model=gen_model)
