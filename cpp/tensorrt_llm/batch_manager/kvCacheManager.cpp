@@ -1235,7 +1235,6 @@ void WindowBlockManager::addSequence(
     auto const prepopulatedPromptLen = loadOrAllocateBlocks(blockKeys, numContextBlocks, sequence, perBlockRetentions);
     mReusedTokens += static_cast<double>(prepopulatedPromptLen);
     mTotalInputTokens += static_cast<double>(uniqueTokens.size());
-    llmRequest.setPrepopulatedPromptLen(prepopulatedPromptLen, getTokensPerBlock());
     TLLM_LOG_DEBUG("addSequence: Request %lu, inputLength %d, prepopulatedPromptLen %d", llmRequest.mRequestId,
         inputLength, prepopulatedPromptLen);
 }
