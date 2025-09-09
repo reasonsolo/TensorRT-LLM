@@ -12,6 +12,8 @@ from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 
+from tensorrt_llm.serve.delay_stats import log_delay_ts_once
+
 try:
     from cuda.bindings import runtime as cudart
 except ImportError:
@@ -770,8 +772,20 @@ class PyExecutor:
 
                 self._pad_attention_dp_dummy_request()
 
+                for req in self.active_requests:
+                    log_delay_ts_once("executor_loop_active", ["openai_chat"],
+                                      req.py_req_timestamps)
+
                 scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
                 )
+                for req in scheduled_batch.context_requests:
+                    log_delay_ts_once("executor_loop_scheduled_ctx",
+                                      ["executor_loop_active"],
+                                      req.py_req_timestamps)
+                for req in scheduled_batch.generation_requests:
+                    log_delay_ts_once("executor_loop_scheduled_gen",
+                                      ["executor_loop_active"],
+                                      req.py_req_timestamps)
 
                 if self.kv_cache_transceiver:
                     # For requests that are fitting disagg gen init, also prepare resources for KV cache manager
@@ -987,6 +1001,9 @@ class PyExecutor:
                 self._check_disagg_ctx_cache_transfer_status(1)
 
         self.num_scheduled_requests = scheduled_batch.batch_size
+        for req in self.active_requests:
+            log_delay_ts_once("executor_loop_active", ["openai_chat"],
+                              req.py_req_timestamps)
         logger.debug(
             f'has {len(self.active_requests)} active_request, '
             f'scheduled {len(scheduled_batch.context_requests)} context requests and '
@@ -1453,6 +1470,10 @@ class PyExecutor:
             disagg_gen_init_to_prepare.generation_requests = []
             disagg_gen_init_to_prepare.paused_requests = []
 
+            for req in fitting_disagg_gen_init_requests:
+                log_delay_ts_once("disagg_gen_init", ["executor_loop_active"],
+                                  req.py_req_timestamps)
+
             for resource_mgr_type in (
                     ResourceManagerType.KV_CACHE_MANAGER,
                     ResourceManagerType.SPEC_RESOURCE_MANAGER,
@@ -1483,6 +1504,9 @@ class PyExecutor:
 
         for req in scheduled_batch.generation_requests:
             if req.is_disagg_generation_transmission_complete:
+                log_delay_ts_once("disagg_gen_transmission_complete",
+                                  ["disagg_gen_init", "ctx_response"],
+                                  req.py_req_timestamps)
                 req.state = LlmRequestState.GENERATION_IN_PROGRESS
                 req.context_current_position = req.prompt_len
                 req.decoding_iter = 1
@@ -1852,6 +1876,9 @@ class PyExecutor:
                     new_responses.append((req_id, response))
 
             if request_done:
+                log_delay_ts_once("request_done", [
+                    "executor_loop_scheduled_gen", "executor_loop_scheduled_ctx"
+                ], request.py_req_timestamps)
                 if request.is_disagg_context_transmission_state:
                     self.ctx_in_transmission_requests.append(request)
                 else:

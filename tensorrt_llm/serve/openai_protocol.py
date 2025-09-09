@@ -151,6 +151,9 @@ class CompletionResponse(OpenAIBaseModel):
     # Add prompt_tokens_ids to the response to remove the tokenization
     # in the generation server in disaggreated serving
     prompt_token_ids: Optional[Union[List[List[int]], List[int]]] = None
+    resp_created: Optional[float] = None
+    resp_merged: Optional[float] = None
+    timestamps: Optional[Dict[str, float]] = None
 
 
 class CompletionResponseStreamChoice(OpenAIBaseModel):
@@ -176,6 +179,7 @@ class CompletionStreamResponse(OpenAIBaseModel):
     model: str
     choices: List[CompletionResponseStreamChoice]
     usage: Optional[UsageInfo] = Field(default=None)
+    timestamps: Optional[Dict[str, float]] = None
 
 
 def _response_format_to_guided_decoding_params(
@@ -242,6 +246,7 @@ class CompletionRequest(OpenAIBaseModel):
     return_context_logits: bool = False
     detokenize: bool = True
     # doc: end-completion-sampling-params
+    timestamps: Optional[Dict[str, float]] = None
 
     # doc: begin-completion-extra-params
     add_special_tokens: bool = Field(
@@ -327,8 +332,12 @@ class CompletionRequest(OpenAIBaseModel):
     @model_validator(mode="before")
     @classmethod
     def check_suffix(cls, data):
-        if data.get("suffix"):
-            raise ValueError("suffix is not supported")
+        try:
+            if data.get("suffix"):
+                raise ValueError(f"suffix is not supported {data}")
+        except Exception as e:
+            print(f"data.get {data} {e}")
+            raise ValueError(f"data.get {data} {e}")
         return data
 
 
@@ -439,6 +448,8 @@ class ChatCompletionResponse(OpenAIBaseModel):
     # Add prompt_tokens_ids to the response to remove the tokenization
     # in the generation server in disaggreated serving
     prompt_token_ids: Optional[List[int]] = None
+    resp_created: Optional[float] = None
+    resp_merged: Optional[float] = None
 
 
 class DeltaMessage(OpenAIBaseModel):
@@ -542,6 +553,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
     truncate_prompt_tokens: Optional[Annotated[int, Field(ge=1)]] = None
     lora_request: Optional[LoRARequest] = None
     # doc: end-chat-completion-sampling-params
+
+    timestamps: Optional[Dict[str, float]] = None
 
     # doc: begin-chat-completion-extra-params
     echo: bool = Field(

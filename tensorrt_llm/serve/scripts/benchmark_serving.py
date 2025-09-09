@@ -63,6 +63,22 @@ class BenchmarkMetrics:
     median_ttft_ms: float
     std_ttft_ms: float
     percentiles_ttft_ms: list[tuple[float, float]]
+    mean_ttft_json_ms: float
+    median_ttft_json_ms: float
+    std_ttft_json_ms: float
+    percentiles_ttft_json_ms: list[tuple[float, float]]
+    mean_ctx_resp_ms: float
+    median_ctx_resp_ms: float
+    std_ctx_resp_ms: float
+    percentiles_ctx_resp_ms: list[tuple[float, float]]
+    mean_disagg_resp_ms: float
+    median_disagg_resp_ms: float
+    std_disagg_resp_ms: float
+    percentiles_disagg_resp_ms: list[tuple[float, float]]
+    mean_gen_resp_ms: float
+    median_gen_resp_ms: float
+    std_gen_resp_ms: float
+    percentiles_gen_resp_ms: list[tuple[float, float]]
     mean_tpot_ms: float
     median_tpot_ms: float
     std_tpot_ms: float
@@ -141,9 +157,14 @@ def calculate_metrics(
     tpots: list[float] = []
     all_tpots: list[float] = []
     ttfts: list[float] = []
+    ttft_jsons: list[float] = []
+    ctx_resp_delays: list[float] = []
+    disagg_resp_delays: list[float] = []
+    gen_resp_delays: list[float] = []
     e2els: list[float] = []
     tput_user: list[float] = []
     latest_avg_decoded_tokens_per_iter: float = 0.0
+    request_ars: list[float] = []
     error_counts: dict[str, int] = {}
     for i in range(len(outputs)):
         if outputs[i].exception_type:
@@ -172,8 +193,26 @@ def calculate_metrics(
             all_tpots.append(tpot)
             itls += outputs[i].itl
             ttfts.append(outputs[i].ttft)
+            ttft_jsons.append(outputs[i].ttft_json)
             e2els.append(outputs[i].latency)
             tput_user.append(output_len / (outputs[i].latency))
+            ctx_resp_delays.append(outputs[i].ctx_resp_delay)
+            disagg_resp_delays.append(outputs[i].disagg_resp_delay)
+            gen_resp_delays.append(outputs[i].gen_resp_delay)
+
+            # Calculate request accuracy rate (num_generated_tokens / (decode_iteration + 1))
+            decode_iter = outputs[i].decode_iteration
+            if decode_iter >= 0:
+                # For generated tokens, we use output_len - 1 (excluding the first token if needed)
+                # But according to the reference, it should be num_generated_tokens
+                num_generated_tokens = max(0, output_len -
+                                           1) if output_len > 1 else output_len
+                request_ar = num_generated_tokens / (
+                    decode_iter + 1) if decode_iter >= 0 else 0.0
+                request_ars.append(request_ar)
+            else:
+                request_ars.append(0.0)
+
             completed += 1
 
             # Track the latest avg_decoded_tokens_per_iter if available
@@ -197,6 +236,10 @@ def calculate_metrics(
             valid_metrics.append(ttfts)
             slo_values.append(goodput_config_dict["ttft"] /
                               MILLISECONDS_TO_SECONDS_CONVERSION)
+        if "ttft_json" in goodput_config_dict:
+            valid_metrics.append(ttft_jsons)
+            slo_values.append(goodput_config_dict["ttft_json"] /
+                              MILLISECONDS_TO_SECONDS_CONVERSION)
         if "tpot" in goodput_config_dict:
             valid_metrics.append(all_tpots)
             slo_values.append(goodput_config_dict["tpot"] /
@@ -204,6 +247,18 @@ def calculate_metrics(
         if "e2el" in goodput_config_dict:
             valid_metrics.append(e2els)
             slo_values.append(goodput_config_dict["e2el"] /
+                              MILLISECONDS_TO_SECONDS_CONVERSION)
+        if "ctx_resp" in goodput_config_dict:
+            valid_metrics.append(ctx_resp_delays)
+            slo_values.append(goodput_config_dict["ctx_resp"] /
+                              MILLISECONDS_TO_SECONDS_CONVERSION)
+        if "disagg_resp" in goodput_config_dict:
+            valid_metrics.append(disagg_resp_delays)
+            slo_values.append(goodput_config_dict["disagg_resp"] /
+                              MILLISECONDS_TO_SECONDS_CONVERSION)
+        if "gen_resp" in goodput_config_dict:
+            valid_metrics.append(gen_resp_delays)
+            slo_values.append(goodput_config_dict["gen_resp"] /
                               MILLISECONDS_TO_SECONDS_CONVERSION)
 
         for req_metric in zip(*valid_metrics):
@@ -230,6 +285,12 @@ def calculate_metrics(
         median_ttft_ms=np.median(ttfts or 0) * 1000,
         percentiles_ttft_ms=[(p, np.percentile(ttfts or 0, p) * 1000)
                              for p in selected_percentiles],
+        mean_ttft_json_ms=np.mean(ttfts or 0) *
+        1000,  # ttfts is empty if streaming is not supported by backend
+        std_ttft_json_ms=np.std(ttfts or 0) * 1000,
+        median_ttft_json_ms=np.median(ttfts or 0) * 1000,
+        percentiles_ttft_json_ms=[(p, np.percentile(ttfts or 0, p) * 1000)
+                                  for p in selected_percentiles],
         mean_tpot_ms=np.mean(tpots or 0) * 1000,
         std_tpot_ms=np.std(tpots or 0) * 1000,
         median_tpot_ms=np.median(tpots or 0) * 1000,
@@ -247,6 +308,25 @@ def calculate_metrics(
                              for p in selected_percentiles],
         tput_user=np.mean(tput_user or 0),
         avg_decoded_tokens_per_iter=latest_avg_decoded_tokens_per_iter,
+        mean_ctx_resp_ms=np.mean(ctx_resp_delays or 0) * 1000,
+        std_ctx_resp_ms=np.std(ctx_resp_delays or 0) * 1000,
+        median_ctx_resp_ms=np.median(ctx_resp_delays or 0) * 1000,
+        percentiles_ctx_resp_ms=[(p,
+                                  np.percentile(ctx_resp_delays or 0, p) * 1000)
+                                 for p in selected_percentiles],
+        mean_disagg_resp_ms=np.mean(disagg_resp_delays or 0) * 1000,
+        std_disagg_resp_ms=np.std(disagg_resp_delays or 0) * 1000,
+        median_disagg_resp_ms=np.median(disagg_resp_delays or 0) * 1000,
+        percentiles_disagg_resp_ms=[
+            (p, np.percentile(disagg_resp_delays or 0, p) * 1000)
+            for p in selected_percentiles
+        ],
+        mean_gen_resp_ms=np.mean(gen_resp_delays or 0) * 1000,
+        std_gen_resp_ms=np.std(gen_resp_delays or 0) * 1000,
+        median_gen_resp_ms=np.median(gen_resp_delays or 0) * 1000,
+        percentiles_gen_resp_ms=[(p,
+                                  np.percentile(gen_resp_delays or 0, p) * 1000)
+                                 for p in selected_percentiles],
     )
     return metrics, actual_output_lens
 
@@ -491,6 +571,10 @@ async def benchmark(
         "input_lens": [output.prompt_len for output in outputs],
         "output_lens": actual_output_lens,
         "ttfts": [output.ttft for output in outputs],
+        "ttft_jsons": [output.ttft_json for output in outputs],
+        "ctx_resp_delays": [output.ctx_resp_delay for output in outputs],
+        "disagg_resp_delays": [output.disagg_resp_delay for output in outputs],
+        "gen_resp_delays": [output.gen_resp_delay for output in outputs],
         "itls": [output.itl for output in outputs],
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
@@ -529,10 +613,15 @@ async def benchmark(
             result[f"p{p_word}_{metric_attribute_name}_ms"] = value
 
     process_one_metric("ttft", "TTFT", "Time to First Token")
+    process_one_metric("ttft_json", "TTFT_JSON", "Time to First Token (JSON)")
     process_one_metric("tpot", "TPOT",
                        "Time per Output Token (excl. 1st token)")
     process_one_metric("itl", "ITL", "Inter-token Latency")
     process_one_metric("e2el", "E2EL", "End-to-end Latency")
+    process_one_metric("ctx_resp", "CTX_RESP", "Context Response Latency")
+    process_one_metric("gen_resp", "GEN_RESP", "Generation Response Latency")
+    process_one_metric("disagg_resp", "DISAGG_RESP",
+                       "Disaggregated Response Latency")
 
     print("=" * 50)
 
@@ -542,7 +631,10 @@ async def benchmark(
 def check_goodput_args(args):
     # Check and parse goodput arguments
     goodput_config_dict = {}
-    VALID_NAMES = ["ttft", "tpot", "e2el"]
+    VALID_NAMES = [
+        "ttft", "ttft_json", "ctx_resp", "disagg_resp", "gen_resp", "tpot",
+        "e2el"
+    ]
     if args.goodput:
         goodput_config_dict = parse_goodput(args.goodput)
         for slo_name, slo_val in goodput_config_dict.items():
@@ -577,13 +669,41 @@ def save_to_pytorch_benchmark_format(args: argparse.Namespace,
                                      results: dict[str, Any],
                                      file_name: str) -> None:
     metrics = [
-        "median_ttft_ms", "mean_ttft_ms", "std_ttft_ms", "p99_ttft_ms",
-        "mean_tpot_ms", "median_tpot_ms", "std_tpot_ms", "p99_tpot_ms",
-        "median_itl_ms", "mean_itl_ms", "std_itl_ms", "p99_itl_ms"
+        "median_ttft_ms",
+        "mean_ttft_ms",
+        "std_ttft_ms",
+        "p99_ttft_ms",
+        "median_ttft_json_ms",
+        "mean_ttft_json_ms",
+        "std_ttft_json_ms",
+        "p99_ttft_json_ms",
+        "median_ctx_resp_ms",
+        "mean_ctx_resp_ms",
+        "std_ctx_resp_ms",
+        "p99_ctx_resp_ms",
+        "median_disagg_resp_ms",
+        "mean_disagg_resp_ms",
+        "std_disagg_resp_ms",
+        "p99_disagg_resp_ms",
+        "median_gen_resp_ms",
+        "mean_gen_resp_ms",
+        "std_gen_resp_ms",
+        "p99_gen_resp_ms",
+        "mean_tpot_ms",
+        "median_tpot_ms",
+        "std_tpot_ms",
+        "p99_tpot_ms",
+        "median_itl_ms",
+        "mean_itl_ms",
+        "std_itl_ms",
+        "p99_itl_ms",
     ]
     # These raw data might be useful, but they are rather big. They can be added
     # later if needed
-    ignored_metrics = ["ttfts", "itls", "generated_texts", "errors"]
+    ignored_metrics = [
+        "ttfts", "ttft_jsons", "itls", "generated_texts", "errors",
+        "request_ars", "decode_iterations"
+    ]
     pt_records = convert_to_pytorch_benchmark_format(
         args=args,
         metrics={k: [results[k]]
@@ -853,8 +973,9 @@ def main(args: argparse.Namespace):
         if not args.save_detailed:
             # Remove fields with too many data points
             for field in [
-                    "input_lens", "output_lens", "ttfts", "itls",
-                    "generated_texts", "errors"
+                    "input_lens", "output_lens", "ttfts", "ttft_jsons", "itls",
+                    "generated_texts", "errors", "request_ars",
+                    "decode_iterations"
             ]:
                 if field in result_json:
                     del result_json[field]
@@ -1056,7 +1177,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--percentile-metrics",
         type=str,
-        default="ttft,tpot,itl",
+        default=
+        "ttft,ttft_json,tpot,itl,request_ar,ctx_resp,disagg_resp,gen_resp",
         help="Comma-separated list of selected metrics to report percentils. "
         "This argument specifies the metrics to report percentiles. "
         "Allowed metric names are \"ttft\", \"tpot\", \"itl\", \"e2el\". "

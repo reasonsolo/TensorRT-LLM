@@ -8,11 +8,11 @@ import traceback
 from collections import deque
 from contextlib import asynccontextmanager
 from http import HTTPStatus
-from typing import Callable, Optional, Type, Union
+from typing import Optional, Type, Union
 
 import aiohttp
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.status import HTTP_500_INTERNAL_SERVER_ERROR
@@ -33,8 +33,25 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
 from tensorrt_llm.serve.router import KvCacheAwareRouter, create_router
 from tensorrt_llm.version import __version__ as VERSION
 
+from .delay_stats import log_delay
+
 # yapf: enale
 TIMEOUT_KEEP_ALIVE = 10  # seconds.
+
+import time
+
+
+async def add_process_time_header(request: Request, call_next):
+    start_time = time.perf_counter()
+    request_timestamp = 0
+    if "Request-Timestamp" in request.headers:
+        request_timestamp = float(request.headers["Request-Timestamp"])
+    response = await call_next(request)
+    process_time = time.perf_counter() - start_time
+    if request_timestamp > 0:
+        send_to_process_delay = time.time() - request_timestamp
+        logger.warning(f"send_to_process_delay: {send_to_process_delay} process_time: {process_time}")
+    return response
 
 class OpenAIDisaggServer:
 
@@ -99,7 +116,7 @@ class OpenAIDisaggServer:
         async def lifespan(app: FastAPI):
             # Create a persistent aiohttp ClientSession
             self.session = aiohttp.ClientSession(
-                connector=aiohttp.TCPConnector(limit=0, limit_per_host=0, force_close=True),
+                connector=aiohttp.TCPConnector(limit=0, limit_per_host=0, force_close=False),
                 timeout=aiohttp.ClientTimeout(total=req_timeout_secs))
 
             logger.info("Waiting for context and generation servers to be ready")
@@ -132,7 +149,6 @@ class OpenAIDisaggServer:
             await self.session.close()  # Ensure session cleanup
 
         self.app = FastAPI(lifespan=lifespan)
-
         @self.app.exception_handler(RequestValidationError)
         async def validation_exception_handler(_, exc):
             return JSONResponse(status_code=400, content={"error": str(exc)})
@@ -247,7 +263,7 @@ class OpenAIDisaggServer:
         try:
             if ctx_response is not None and len(ctx_response.choices) != 1:
                 raise ValueError("Context server did not return a single choice. This is not expected")
-
+            log_delay("merge_streaming_responses", ["_ctx_response"], gen_req)
             #If request finished after first token not due to length, return right away and skip gen
             if ctx_response is not None and ctx_response.choices[0].finish_reason not in ["length", "not_finished"]:
                 yield "data: [DONE]\n\n".encode('utf-8')
@@ -255,9 +271,9 @@ class OpenAIDisaggServer:
                 # Then yield the generation responses
                 await self._increment_metric("gen_total_requests")
                 if isinstance(gen_req, CompletionRequest):
-                    gen_response = await self.send_completion_request(gen_server, gen_req)
+                    gen_response = await self.send_completion_request(gen_server, gen_req, False)
                 elif isinstance(gen_req, ChatCompletionRequest):
-                    gen_response = await self.send_chat_request(gen_server, gen_req)
+                    gen_response = await self.send_chat_request(gen_server, gen_req, False)
                 else:
                     raise TypeError("Invalid request type: {type(gen_req).__name__}")
 
@@ -269,6 +285,7 @@ class OpenAIDisaggServer:
             await self.gen_router.finish_request(gen_req)
 
     async def openai_completion(self, req: CompletionRequest) -> Response:
+        log_delay("openai_chat", ["start"], req)
         try:
             if not isinstance(req.prompt, str):
                 # Check if it's a list and contains integers
@@ -283,6 +300,7 @@ class OpenAIDisaggServer:
             await self._handle_exception(e)
 
     async def openai_chat_completion(self, req: ChatCompletionRequest) -> Response:
+        log_delay("openai_chat_completion", ["start"], req)
 
         try:
             return await self._send_disagg_request(req)
@@ -300,7 +318,7 @@ class OpenAIDisaggServer:
             raise HTTPException(status_code=500, detail=f"Internal server error {str(exception)}")
 
     async def _send_context_request(self, ctx_server: str, ctx_req: Union[CompletionRequest, ChatCompletionRequest]):
-
+        log_delay("_send_context_request", ["start", "openai_chat"], ctx_req)
         ctx_req.disaggregated_params = DisaggregatedParams(request_type="context_only")
         ctx_req.stream = False
         ctx_req.stream_options = None
@@ -309,10 +327,10 @@ class OpenAIDisaggServer:
         await self._increment_metric("ctx_total_requests")
         try:
             if isinstance(ctx_req, ChatCompletionRequest):
-                ctx_response = await self.send_chat_request(ctx_server, ctx_req)
+                ctx_response = await self.send_chat_request(ctx_server, ctx_req, True)
             else:
                 assert isinstance(ctx_req, CompletionRequest)
-                ctx_response = await self.send_completion_request(ctx_server, ctx_req)
+                ctx_response = await self.send_completion_request(ctx_server, ctx_req, True)
         finally:
             await self.ctx_router.finish_request(ctx_req)
             await self._increment_metric("ctx_completed_requests")
@@ -328,6 +346,7 @@ class OpenAIDisaggServer:
         return ctx_response
 
     async def _send_disagg_request(self, req: Union[CompletionRequest, ChatCompletionRequest]):
+        log_delay("_send_disagg_request", ["openai_chat"], req)
         gen_server = None
         need_ctx = False
         try:
@@ -386,6 +405,9 @@ class OpenAIDisaggServer:
             if need_ctx and self.perf_metrics_keys is not None:
                 asyncio.create_task(self._add_perf_metrics_keys(
                     ctx_server, gen_server, req.disaggregated_params.ctx_request_id))
+            # logger.warning(f"ctx_response: {ctx_response}")
+            req.timestamps["_ctx_response"] = ctx_response.resp_created
+            req.timestamps.update(ctx_response.timestamps)
 
             if not req.stream:
                 try:
@@ -396,10 +418,12 @@ class OpenAIDisaggServer:
                     else:
                         await self._increment_metric("gen_total_requests")
                         if isinstance(req, CompletionRequest):
-                            gen_response = await self.send_completion_request(gen_server, req)
+                            log_delay("_send_completion_request", ["_ctx_response"], req)
+                            gen_response = await self.send_completion_request(gen_server, req, False)
                         else:
                             assert isinstance(req, ChatCompletionRequest)
-                            gen_response = await self.send_chat_request(gen_server, req)
+                            log_delay("_send_completion_request", ["_ctx_response"], req)
+                            gen_response = await self.send_chat_request(gen_server, req, False)
                         await self._increment_metric("gen_completed_requests")
                         return gen_response
                 finally:
@@ -437,7 +461,6 @@ class OpenAIDisaggServer:
                     async for line in response.content.iter_any():
                         if line:
                             yield line
-                            await asyncio.sleep(0)
                 except Exception as e:
                     logger.error(f"Unexpected error in stream: {e}")
                     raise
@@ -454,7 +477,9 @@ class OpenAIDisaggServer:
                            request: Union[CompletionRequest, ChatCompletionRequest],
                            endpoint: str,
                            response_type: Type[Union[CompletionResponse, ChatCompletionResponse]],
-                           create_generator: Callable) -> Union[CompletionResponse, ChatCompletionResponse, StreamingResponse]:
+                           create_generator: callable,
+                           is_ctx: bool = True) -> Union[CompletionResponse, ChatCompletionResponse, StreamingResponse]:
+        log_delay("_send_request_ctx" if is_ctx else "_send_request_gen", ["start", "openai_chat", "_ctx_response"], request)
         for attempt in range(self.max_retries + 1):
             try:
                 if request.stream:
@@ -467,6 +492,7 @@ class OpenAIDisaggServer:
                             raise ValueError("Received an event-stream although request stream was False")
 
                         response_dict = await response.json()
+                        log_delay("_response_ctx" if is_ctx else "_response_gen", ["start", "ctx_response"], request)
                         if not response.ok:
                             logger.error(f"Received failed response {response_dict}")
                             response.raise_for_status()
@@ -482,11 +508,11 @@ class OpenAIDisaggServer:
                 raise
 
 
-    async def send_completion_request(self, url: str, request: CompletionRequest) -> Union[CompletionResponse, StreamingResponse]:
-        return await self.send_request(url, request, "/v1/completions", CompletionResponse, self.create_completion_generator)
+    async def send_completion_request(self, url: str, request: CompletionRequest, is_ctx: bool = True) -> Union[CompletionResponse, StreamingResponse]:
+        return await self.send_request(url, request, "/v1/completions", CompletionResponse, self.create_completion_generator, is_ctx)
 
-    async def send_chat_request(self, url: str, request: ChatCompletionRequest) -> ChatCompletionResponse:
-        return await self.send_request(url, request, "/v1/chat/completions", ChatCompletionResponse, self.create_chat_generator)
+    async def send_chat_request(self, url: str, request: ChatCompletionRequest, is_ctx: bool = True) -> ChatCompletionResponse:
+        return await self.send_request(url, request, "/v1/chat/completions", ChatCompletionResponse, self.create_chat_generator, is_ctx)
 
     @classmethod
     async def check_server_ready(cls, session: aiohttp.ClientSession, server_url: str) -> bool:

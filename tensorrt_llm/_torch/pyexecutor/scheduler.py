@@ -203,6 +203,18 @@ class SimpleScheduler(RequestScheduler):
                          inflight_request_ids: set[int]) -> SchedulerOutput:
         fitting_requests, fitting_disagg_gen_init_requests, paused_requests = self.capacity_scheduler.schedule_request(
             active_requests)
+        ts_dict = {
+            req.request_id: req.py_req_timestamps
+            for req in active_requests
+        }
+        # reinstall ts_dict to cpp-copied requests
+        # logger.warning(f"ts_dict: {ts_dict}")
+        for req in fitting_disagg_gen_init_requests:
+            req.py_req_timestamps = ts_dict[req.request_id]
+        for req in fitting_requests:
+            req.py_req_timestamps = ts_dict[req.request_id]
+        for req in paused_requests:
+            req.py_req_timestamps = ts_dict[req.request_id]
 
         context_requests, generation_requests = self.micro_batch_scheduler.schedule(
             fitting_requests, inflight_request_ids)

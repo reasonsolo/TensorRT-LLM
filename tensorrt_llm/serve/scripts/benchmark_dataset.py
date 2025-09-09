@@ -472,6 +472,7 @@ class RandomDataset(BenchmarkDataset):
         requests = []
         if self.sample_from_sharegpt:
             with open(self.dataset_path) as f:
+                logger.info(f"Loading dataset from {self.dataset_path}")
                 dataset = json.load(f)
             # Filter out the conversations with less than 2 turns.
             dataset = [

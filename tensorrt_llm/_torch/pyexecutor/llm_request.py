@@ -302,6 +302,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             is_draft: bool = False,
             seq_slot: Optional[int] = None,
             target_seq_slot: Optional[int] = None,
+            py_req_timestamps: Optional[Dict[str, float]] = None,
             **kwargs):
 
         self.py_logits_post_processors = kwargs.pop("py_logits_post_processors",
@@ -355,6 +356,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # If the request is a draft request, target_seq_slot is the sequence slot ID of its target request.
         self.py_target_seq_slot = target_seq_slot
         self.use_draft_model = is_draft
+        self.py_req_timestamps = py_req_timestamps
 
         # TODO: remove this when use DynamicDecodeOp in pytorch flow.
         # currently, keep py_stop_words_list as python list, rather than tensor.
@@ -417,6 +419,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         py_request.py_seq_slot = None
 
         py_request.child_requests = []
+        py_request.py_req_timestamps = self.py_req_timestamps
 
         assert py_request.is_child
         assert py_request.request_id == child.request_id
@@ -563,7 +566,8 @@ def executor_request_to_llm_request(
         context_phase_params=executor_request.context_phase_params,
         cache_salt_id=executor_request.cache_salt_id,
         py_multimodal_data=getattr(executor_request, "py_multimodal_data",
-                                   None))
+                                   None),
+        py_req_timestamps=getattr(executor_request, "py_req_timestamps", None))
     if child_req_ids:
         for child_id in child_req_ids:
             llm_request.create_child_request(child_id)

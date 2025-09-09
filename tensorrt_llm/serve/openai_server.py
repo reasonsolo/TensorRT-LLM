@@ -3,6 +3,7 @@ import asyncio
 import os
 import re
 import signal
+import time
 import traceback
 from collections import deque
 from contextlib import asynccontextmanager
@@ -23,6 +24,7 @@ from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocParams
 from tensorrt_llm.inputs import prompt_inputs
+from tensorrt_llm.inputs.data import TokensPrompt
 from tensorrt_llm.inputs.utils import ConversationMessage, apply_chat_template
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import MultimodalEncoder
@@ -30,6 +32,7 @@ from tensorrt_llm.llmapi.disagg_utils import MetadataServerConfig, ServerRole
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.logger import logger
 from tensorrt_llm.metrics.collector import MetricsCollector
+from tensorrt_llm.sampling_params import SamplingParams
 from tensorrt_llm.serve.chat_utils import (check_multiple_response,
                                            parse_chat_messages_coroutines)
 from tensorrt_llm.serve.metadata_server import create_metadata_server
@@ -63,6 +66,8 @@ from .harmony_adapter import (HarmonyAdapter, get_harmony_adapter,
 
 # yapf: enale
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
+from .delay_stats import (log_delay, log_delay_ts_once, profile_and_print,
+                          scoped_delay)
 
 
 class OpenAIServer:
@@ -375,7 +380,17 @@ class OpenAIServer:
                 async with self.perf_metrics_lock:
                     self.perf_metrics.append(item)
 
+    async def tokenize_prompt(self, prompt: str, sampling_params: SamplingParams) -> TokensPrompt:
+        prompt = prompt_inputs(prompt)
+        if prompt.get("prompt") is not None:
+            prompt_token_ids, extra_processed_inputs = await asyncio.to_thread(self.llm.input_processor, prompt, sampling_params)
+            tokens_prompt = TokensPrompt(prompt_token_ids=prompt_token_ids, query_token_ids=extra_processed_inputs.get("query_token_ids") if extra_processed_inputs is not None else None)
+        else:
+            tokens_prompt = prompt
+        return tokens_prompt
+
     async def openai_chat(self, request: ChatCompletionRequest, raw_request: Request) -> Response:
+        log_delay("openai_chat", ["start", "_send_request_ctx", "_send_request_gen", "_ctx_response"], request)
 
         def get_role() -> str:
             if request.add_generation_prompt:
@@ -385,12 +400,13 @@ class OpenAIServer:
             return role
 
         async def chat_stream_generator(
-                promise: RequestOutput, postproc_params: PostprocParams) -> AsyncGenerator[str, None]:
+                promise: RequestOutput, postproc_params: PostprocParams, request: ChatCompletionRequest) -> AsyncGenerator[str, None]:
             try:
                 if not self.postproc_worker_enabled:
                     post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
                 async for res in promise:
                     pp_results = res.outputs[0]._postprocess_result if self.postproc_worker_enabled else post_processor(res, args)
+                    log_delay_ts_once("chat_stream_generator", ["request_done"], request.timestamps)
                     await self._extract_metrics(res)
                     for pp_res in pp_results:
                         yield pp_res
@@ -413,43 +429,44 @@ class OpenAIServer:
             if disaggregated_params and disaggregated_params.request_type and disaggregated_params.request_type == "context_only":
                 chat_response.prompt_token_ids = promise.prompt_token_ids
             await self._extract_metrics(promise)
+
             return chat_response
 
         try:
-            check_multiple_response(request.n, self.llm.args.backend)
-            conversation: List[ConversationMessage] = []
-            tool_dicts = None if request.tools is None else [
-                tool.model_dump() for tool in request.tools
-            ]
-            # Pass the tokenizer vocabulary size so ``logit_bias`` can be
-            # expanded into an embedding bias tensor in the sampler.
-            sampling_params = request.to_sampling_params(
-                vocab_size=self.tokenizer.tokenizer.vocab_size,
-                gather_generation_logits=self.llm.args.gather_generation_logits,
-                backend=self.llm.args.backend)
-            # TODO: better way to enable metrics
-            if len(os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", "")) > 0:
-                sampling_params.return_perf_metrics = True
-            postproc_args = ChatPostprocArgs.from_request(request)
-            disaggregated_params = to_llm_disaggregated_params(request.disaggregated_params)
+            #with scoped_delay("openai_chat_generate_async", request):
+            with profile_and_print():
+                check_multiple_response(request.n, self.llm.args.backend)
+                conversation: List[ConversationMessage] = []
+                tool_dicts = None if request.tools is None else [
+                    tool.model_dump() for tool in request.tools
+                ]
+                # Pass the tokenizer vocabulary size so ``logit_bias`` can be
+                # expanded into an embedding bias tensor in the sampler.
+                sampling_params = request.to_sampling_params(
+                    vocab_size=self.tokenizer.tokenizer.vocab_size)
+                # TODO: better way to enable metrics
+                if len(os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", "")) > 0:
+                    sampling_params.return_perf_metrics = True
+                postproc_args = ChatPostprocArgs.from_request(request)
+                disaggregated_params = to_llm_disaggregated_params(request.disaggregated_params)
 
-            conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(request.messages, self.model_config)
+                conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(request.messages, self.model_config)
 
-            if request.prompt_token_ids is not None:
-                prompt = request.prompt_token_ids
-            else:
-                prompt: str = apply_chat_template(
-                    model_type=self.model_config.model_type,
-                    tokenizer=self.tokenizer,
-                    processor=self.processor,
-                    conversation=conversation,
-                    add_generation_prompt=request.add_generation_prompt,
-                    mm_placeholder_counts=mm_placeholder_counts,
-                    tools=tool_dicts,
-                    documents=request.documents,
-                    chat_template=request.chat_template,
-                    chat_template_kwargs=request.chat_template_kwargs or {},
-                )
+                if request.prompt_token_ids is not None:
+                    prompt = request.prompt_token_ids
+                else:
+                    prompt: str = apply_chat_template(
+                        model_type=self.model_config.model_type,
+                        tokenizer=self.tokenizer,
+                        processor=self.processor,
+                        conversation=conversation,
+                        add_generation_prompt=request.add_generation_prompt,
+                        mm_placeholder_counts=mm_placeholder_counts,
+                        tools=tool_dicts,
+                        documents=request.documents,
+                        chat_template=request.chat_template,
+                        chat_template_kwargs=request.chat_template_kwargs or {},
+                    )
             prompt = prompt_inputs(prompt)
 
             mm_data = await mm_coroutines
@@ -474,6 +491,7 @@ class OpenAIServer:
                 lora_request=request.lora_request,
                 disaggregated_params=disaggregated_params,
                 cache_salt=request.cache_salt,
+                req_timestamps=request.timestamps,
             )
             asyncio.create_task(self.await_disconnected(raw_request, promise))
             if not self.postproc_worker_enabled:
@@ -481,11 +499,13 @@ class OpenAIServer:
                 postproc_args.num_prompt_tokens = len(promise.prompt_token_ids)
 
             if request.stream:
-                response_generator = chat_stream_generator(promise, postproc_params)
+                response_generator = chat_stream_generator(promise, postproc_params, request)
                 return StreamingResponse(content=response_generator,
                                          media_type="text/event-stream")
             else:
                 response = await create_chat_response(promise, postproc_params, disaggregated_params)
+                response.timestamps = request.timestamps
+                log_delay_ts_once("chat_response", ["openai_response", "request_done"], request.timestamps)
                 return JSONResponse(content=response.model_dump())
         except CppExecutorError:
             logger.error(traceback.format_exc())
@@ -572,9 +592,9 @@ class OpenAIServer:
             return self.create_error_response(str(e))
 
     async def openai_completion(self, request: CompletionRequest, raw_request: Request) -> Response:
-
+        log_delay("openai_chat", ["start", "_send_request_ctx", "_send_request_gen", "_ctx_response"], request)
         async def completion_response(promise: RequestOutput,
-                                      postproc_params: Optional[PostprocParams]) -> CompletionResponse:
+                                      postproc_params: Optional[PostprocParams], request: CompletionRequest) -> CompletionResponse:
             response = await promise
             if not self.postproc_worker_enabled:
                 post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
@@ -585,6 +605,7 @@ class OpenAIServer:
                 # Include prompt token ids for context-only requests
                 pp_result.prompt_token_ids = response.prompt_token_ids
             await self._extract_metrics(response)
+            log_delay_ts_once("completion_response", ["request_done"], request.timestamps)
             return pp_result
 
         def merge_completion_responses(responses: List[CompletionResponse]) -> CompletionResponse:
@@ -610,10 +631,11 @@ class OpenAIServer:
                 choices=all_choices,
                 usage=usage_info,
                 prompt_token_ids=all_prompt_token_ids,
+                resp_created=time.time(),
             )
             return merged_rsp
 
-        async def completion_generator(promise: RequestOutput, params: Optional[PostprocParams]):
+        async def completion_generator(promise: RequestOutput, params: Optional[PostprocParams], request: CompletionRequest):
             try:
                 async for output in promise:
                     if not self.postproc_worker_enabled:
@@ -622,6 +644,7 @@ class OpenAIServer:
                     else:
                         pp_result = output.outputs[0]._postprocess_result
                     await self._extract_metrics(output)
+                    log_delay_ts_once("completion_generator", ["request_done"], request.timestamps)
                     for pp_res in pp_result:
                         yield pp_res
             except:
@@ -653,58 +676,63 @@ class OpenAIServer:
             yield "data: [DONE]\n\n"
 
         try:
-            check_multiple_response(request.n, self.llm.args.backend)
-            if isinstance(request.prompt, str) or \
-                (isinstance(request.prompt, list) and isinstance(request.prompt[0], int)):
-                prompts = [request.prompt]
-            else:
-                prompts = request.prompt
+            with scoped_delay("openai_completion_generate_async", request):
+                check_multiple_response(request.n, self.llm.args.backend)
+                if isinstance(request.prompt, str) or \
+                    (isinstance(request.prompt, list) and isinstance(request.prompt[0], int)):
+                    prompts = [request.prompt]
+                else:
+                    prompts = request.prompt
 
-            promises: List[RequestOutput] = []
-            postproc_params_collection: List[Optional[PostprocParams]] = []
-            # Pass the tokenizer vocabulary size so ``logit_bias`` can be
-            # expanded into an embedding bias tensor in the sampler.
-            sampling_params = request.to_sampling_params(
-                vocab_size=self.tokenizer.tokenizer.vocab_size)
-            # TODO: better way to enable metrics
-            if len(os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", "")) > 0:
-                sampling_params.return_perf_metrics = True
-            disaggregated_params = to_llm_disaggregated_params(request.disaggregated_params)
-            for idx, prompt in enumerate(prompts):
-                postproc_args = CompletionPostprocArgs.from_request(request)
-                postproc_args.prompt_idx = idx
-                if request.echo:
-                    postproc_args.prompt = prompt
-                postproc_params = PostprocParams(
-                    post_processor=completion_stream_post_processor
-                    if request.stream else completion_response_post_processor,
-                    postproc_args=postproc_args,
-                )
-                promise = self.llm.generate_async(
-                    inputs=prompt,
-                    sampling_params=sampling_params,
-                    _postproc_params=postproc_params,
-                    streaming=request.stream,
-                    lora_request=request.lora_request,
-                    disaggregated_params=disaggregated_params
-                )
-                asyncio.create_task(self.await_disconnected(raw_request, promise))
-                if not self.postproc_worker_enabled:
-                    postproc_args.tokenizer = self.tokenizer
-                    postproc_args.num_prompt_tokens = len(promise.prompt_token_ids)
-                promises.append(promise)
-                postproc_params_collection.append(None if self.postproc_worker_enabled else postproc_params)
+                promises: List[RequestOutput] = []
+                postproc_params_collection: List[Optional[PostprocParams]] = []
+                # Pass the tokenizer vocabulary size so ``logit_bias`` can be
+                # expanded into an embedding bias tensor in the sampler.
+                sampling_params = request.to_sampling_params(
+                    vocab_size=self.tokenizer.tokenizer.vocab_size)
+                # TODO: better way to enable metrics
+                if len(os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", "")) > 0:
+                    sampling_params.return_perf_metrics = True
+                disaggregated_params = to_llm_disaggregated_params(request.disaggregated_params)
+                for idx, prompt in enumerate(prompts):
+                    postproc_args = CompletionPostprocArgs.from_request(request)
+                    postproc_args.prompt_idx = idx
+                    if request.echo:
+                        postproc_args.prompt = prompt
+                    postproc_params = PostprocParams(
+                        post_processor=completion_stream_post_processor
+                        if request.stream else completion_response_post_processor,
+                        postproc_args=postproc_args,
+                    )
+                    tokens_prompt = await self.tokenize_prompt(prompt, sampling_params)
+                    promise = self.llm.generate_async(
+                        inputs=tokens_prompt,
+                        sampling_params=sampling_params,
+                        _postproc_params=postproc_params,
+                        streaming=request.stream,
+                        lora_request=request.lora_request,
+                        disaggregated_params=disaggregated_params,
+                        req_timestamps=request.timestamps,
+                    )
+                    asyncio.create_task(self.await_disconnected(raw_request, promise))
+                    if not self.postproc_worker_enabled:
+                        postproc_args.tokenizer = self.tokenizer
+                        postproc_args.num_prompt_tokens = len(promise.prompt_token_ids)
+                    promises.append(promise)
+                    postproc_params_collection.append(None if self.postproc_worker_enabled else postproc_params)
 
             if request.stream:
-                generators = [completion_generator(promise, params)
+                generators = [completion_generator(promise, params, request)
                               for promise, params in zip(promises, postproc_params_collection)]
                 response_generator = merge_generators(generators) if len(promises) > 1 else generators[0]
                 return StreamingResponse(content=generator_wrapper(response_generator),
                                             media_type="text/event-stream")
             else:
-                rsps = await asyncio.gather(*[completion_response(promise, params)
+                rsps = await asyncio.gather(*[completion_response(promise, params, request)
                                               for promise, params in zip(promises, postproc_params_collection)])
                 response = merge_completion_responses(rsps) if len(rsps) > 1 else rsps[0]
+                log_delay_ts_once("completion_response", ["openai_response", "request_done"], request.timestamps)
+                response.timestamps = request.timestamps
                 return JSONResponse(content=response.model_dump())
         except CppExecutorError:
             logger.error(traceback.format_exc())
@@ -796,6 +824,7 @@ class OpenAIServer:
                 _postproc_params=postproc_params if self.postproc_worker_enabled else None,
                 streaming=bool(request.stream),
                 lora_request=request.lora_request,
+                req_timestamps=request.timestamps,
             )
             postproc_args.request_id = promise.request_id
 
@@ -865,6 +894,7 @@ class OpenAIServer:
                 inputs=input_tokens,
                 sampling_params=sampling_params,
                 streaming=request.stream,
+                req_timestamps=request.timestamps,
             )
 
             asyncio.create_task(self.await_disconnected(raw_request, promise))

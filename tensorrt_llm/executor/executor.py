@@ -7,8 +7,8 @@ import traceback
 from abc import ABC, abstractmethod
 from pathlib import Path
 from queue import Queue
-from typing import (TYPE_CHECKING, AsyncIterable, Generator, List, Optional,
-                    Union)
+from typing import (TYPE_CHECKING, AsyncIterable, Dict, Generator, List,
+                    Optional, Union)
 
 import numpy as np
 import torch
@@ -125,6 +125,7 @@ class GenerationExecutor(ABC):
         multimodal_params: Optional[MultimodalParams] = None,
         scheduling_params: Optional[SchedulingParams] = None,
         cache_salt_id: Optional[int] = None,
+        req_timestamps: Optional[Dict[str, float]] = None,
     ) -> GenerationResult:
         """Generate output for the given prompt token ids in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
@@ -149,7 +150,8 @@ class GenerationExecutor(ABC):
             disaggregated_params=disaggregated_params,
             multimodal_params=multimodal_params,
             scheduling_params=scheduling_params,
-            cache_salt_id=cache_salt_id)
+            cache_salt_id=cache_salt_id,
+            req_timestamps=req_timestamps)
         result = self.submit(request)
         # release memory in time
         if hasattr(request, "multimodal_params"):

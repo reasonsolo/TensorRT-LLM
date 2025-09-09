@@ -1,3 +1,4 @@
+import time
 from dataclasses import dataclass, field
 from typing import List, Literal, Optional, Tuple, Union
 
@@ -284,6 +285,7 @@ def chat_response_post_processor(
         model=args.model,
         choices=choices,
         usage=usage,
+        resp_created=time.time(),
     )
     return response
 
@@ -395,7 +397,8 @@ def completion_response_post_processor(
                       total_tokens=completion_tokens + prompt_tokens)
     response = CompletionResponse(choices=choices,
                                   model=args.model,
-                                  usage=usage)
+                                  usage=usage,
+                                  resp_created=time.time())
     return response
 
 

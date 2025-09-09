@@ -1,6 +1,6 @@
 import os
 from dataclasses import dataclass
-from typing import List, Optional, Union
+from typing import Dict, List, Optional, Union
 
 import numpy as np
 import torch
@@ -98,6 +98,7 @@ class GenerationRequest:
         multimodal_params: Optional[MultimodalParams] = None,
         scheduling_params: Optional[SchedulingParams] = None,
         cache_salt_id: Optional[int] = None,
+        req_timestamps: Optional[Dict[str, float]] = None,
     ):
         if isinstance(prompt_token_ids, list):
             self.prompt_token_ids = prompt_token_ids
@@ -124,6 +125,7 @@ class GenerationRequest:
         self.disaggregated_params = disaggregated_params
         self.scheduling_params = scheduling_params
         self.cache_salt_id = cache_salt_id
+        self.req_timestamps = req_timestamps
 
     def set_id(self, id):
         assert self.id is None, f"Request ID is already set: {self.id}"

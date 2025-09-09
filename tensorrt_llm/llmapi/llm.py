@@ -7,7 +7,7 @@ import tempfile
 import time
 import weakref
 from pathlib import Path
-from typing import Any, List, Literal, Optional, Sequence, Union
+from typing import Any, Dict, List, Literal, Optional, Sequence, Union
 
 from tqdm import tqdm
 from transformers import PreTrainedTokenizerBase
@@ -327,6 +327,7 @@ class BaseLLM:
         _postproc_params: Optional[PostprocParams] = None,
         scheduling_params: Optional[SchedulingParams] = None,
         cache_salt: Optional[str] = None,
+        req_timestamps: Optional[Dict[str, float]] = None,
     ) -> RequestOutput:
         """Generate output for the given prompt in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
@@ -448,6 +449,7 @@ class BaseLLM:
             multimodal_params=multimodal_params,
             scheduling_params=scheduling_params,
             cache_salt_id=cache_salt_id,
+            req_timestamps=req_timestamps,
         )
 
         return RequestOutput._from_generation_result(result, prompt,
@@ -654,7 +656,7 @@ class BaseLLM:
 
     def _try_load_tokenizer(self) -> Optional[TokenizerBase]:
         if self.args.skip_tokenizer_init:
-            return None
+            return Nonegg
 
         if self.args.tokenizer is not None:
             assert isinstance(self.args.tokenizer, TokenizerBase)

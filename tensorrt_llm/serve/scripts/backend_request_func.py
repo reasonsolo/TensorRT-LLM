@@ -40,6 +40,7 @@ class RequestFuncOutput:
     latency: float = 0.0
     output_tokens: int = 0
     ttft: float = 0.0  # Time to first token
+    ttft_json: float = 0.0  # Time to first token
     itl: list[float] = field(
         default_factory=list)  # list of inter-token latencies
     tpot: float = 0.0  # avg next-token latencies
@@ -47,6 +48,27 @@ class RequestFuncOutput:
     error: str = ""
     avg_decoded_tokens_per_iter: float = 0.0  # Average tokens decoded per iteration
     exception_type: str = None  # unset
+    decode_iteration: int = 0  # Number of decoding iterations
+    disagg_resp_delay: float = 0.0
+    gen_resp_delay: float = 0.0
+    ctx_resp_delay: float = 0.0
+    total_resp: int = 0
+
+
+def gather_decode_resp_latency(output: RequestFuncOutput,
+                               data,
+                               timestamp,
+                               is_ctx: bool = False):
+    output.total_resp += 1
+    if "resp_created" in data:
+        resp_created = float(data.get("resp_created"))
+        if is_ctx:
+            output.ctx_resp_delay += timestamp - resp_created
+        else:
+            output.gen_resp_delay += timestamp - resp_created
+    if "resp_merged" in data:
+        resp_created = float(data.get("resp_merged"))
+        output.disagg_resp_delay += timestamp - resp_created
 
 
 async def async_request_trt_llm(
@@ -81,10 +103,12 @@ async def async_request_trt_llm(
     output.prompt_len = request_func_input.prompt_len
 
     ttft = 0.0
+    st_json = time.perf_counter()
+    data = json.dumps(payload)
     st = time.perf_counter()
     most_recent_timestamp = st
     try:
-        async with request_session.post(url=api_url, json=payload) as response:
+        async with request_session.post(url=api_url, data=data) as response:
             if response.status == 200:
                 output.success = True
                 if streaming:
@@ -103,10 +127,12 @@ async def async_request_trt_llm(
                         if ttft == 0.0:
                             ttft = timestamp - st
                             output.ttft = ttft
+                            output.ttft_json = timestamp - st_json
 
                         # Decoding phase
                         else:
                             output.itl.append(timestamp - most_recent_timestamp)
+                            gather_decode_resp_latency(output, data, timestamp)
 
                         most_recent_timestamp = timestamp
 
@@ -175,6 +201,7 @@ async def async_request_openai_completions(
         "max_tokens": request_func_input.output_len,
         "logprobs": request_func_input.logprobs,
         "stream": streaming,
+        "timestamps": {"start": time.time()}
     }
     if streaming:
         payload["stream_options"] = {"include_usage": True}
@@ -188,11 +215,15 @@ async def async_request_openai_completions(
     output.prompt_len = request_func_input.prompt_len
 
     generated_text = ""
+    json_st = time.perf_counter()
+    #data = json.dumps(payload)
+    data = aiohttp.JsonPayload(payload)
     st = time.perf_counter()
     most_recent_timestamp = st
+    decode_iteration_count = 0  # Track decoding iterations
+    # headers["Request-Timestamp"] = str(time.time())
     try:
-        async with request_session.post(url=api_url,
-                                        json=payload,
+        async with request_session.post(url=api_url, data=data,
                                         headers=headers) as response:
             if response.status == 200:
                 if streaming:
@@ -205,6 +236,7 @@ async def async_request_openai_completions(
                         chunk = chunk_bytes.decode("utf-8").removeprefix(
                             "data: ")
                         if chunk != "[DONE]":
+                            timestamp = time.perf_counter()
                             data = json.loads(chunk)
 
                             # NOTE: Some completion API might have a last
@@ -214,17 +246,25 @@ async def async_request_openai_completions(
                                 # Note that text could be empty here
                                 # e.g. for special tokens
                                 text = choices[0].get("text")
-                                timestamp = time.perf_counter()
                                 # First token
                                 if not first_chunk_received:
                                     first_chunk_received = True
-                                    ttft = time.perf_counter() - st
+                                    ttft = timestamp - st
+                                    output.ttft_json = timestamp - json_st
                                     output.ttft = ttft
+                                    gather_decode_resp_latency(output,
+                                                               data,
+                                                               timestamp,
+                                                               is_ctx=True)
 
                                 # Decoding phase
                                 else:
                                     output.itl.append(timestamp -
                                                       most_recent_timestamp)
+                                    gather_decode_resp_latency(output,
+                                                               data,
+                                                               timestamp,
+                                                               is_ctx=False)
 
                                 most_recent_timestamp = timestamp
                                 generated_text += text or ""
@@ -279,6 +319,27 @@ async def async_request_openai_completions(
     return output
 
 
+class JsonPerf:
+    total_time = 0.0
+    count = 0
+
+    def add(self, time):
+        self.total_time += time
+        self.count += 1
+        if self.count % 100 == 0:
+            print(
+                f"====== json_perf: total_time: {self.total_time}, count: {self.count}, avg: {self.total_time / self.count}"
+            )
+
+    def __del__(self):
+        print(
+            f"====== json_perf: total_time: {self.total_time}, count: {self.count}, avg: {self.total_time / self.count}"
+        )
+
+
+json_perf = JsonPerf()
+
+
 async def async_request_openai_chat_completions(
     request_func_input: RequestFuncInput,
     streaming: bool = True,
@@ -304,6 +365,7 @@ async def async_request_openai_chat_completions(
         "temperature": 0.0,
         "max_completion_tokens": request_func_input.output_len,
         "stream": streaming,
+        "timestamps": {"start": time.time()}
     }
 
     if isinstance(request_func_input.prompt, list) and all(
@@ -333,11 +395,13 @@ async def async_request_openai_chat_completions(
 
     generated_text = ""
     ttft = 0.0
+    #data = json.dumps(payload) payload.JsonPayload
+    json_st = time.perf_counter()
+    data = aiohttp.JsonPayload(payload)
     st = time.perf_counter()
     most_recent_timestamp = st
     try:
-        async with request_session.post(url=api_url,
-                                        json=payload,
+        async with request_session.post(url=api_url, data=data,
                                         headers=headers) as response:
             if response.status == 200:
                 output.success = True
@@ -359,11 +423,14 @@ async def async_request_openai_chat_completions(
                                 if ttft == 0.0:
                                     ttft = timestamp - st
                                     output.ttft = ttft
+                                    output.ttft_json = timestamp - json_st
 
                                 # Decoding phase
                                 else:
                                     output.itl.append(timestamp -
                                                       most_recent_timestamp)
+                                    gather_decode_resp_latency(
+                                        output, data, timestamp)
 
                                 generated_text += content or ""
 

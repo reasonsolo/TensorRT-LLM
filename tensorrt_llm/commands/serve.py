@@ -176,7 +176,7 @@ def launch_server(host: str,
                           model=model,
                           server_role=server_role,
                           metadata_server_cfg=metadata_server_cfg)
-
+    # with yappi.run():
     asyncio.run(server(host, port))
 
 
