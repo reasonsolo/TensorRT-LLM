@@ -165,6 +165,20 @@ class Router(ABC):
         """
 
     @abstractmethod
+    def add_server(self, server):
+        """
+        Args:
+            server: The server to add
+        """
+
+    @abstractmethod
+    def remove_server(self, server):
+        """
+        Args:
+            server: The server to remove
+        """
+
+    @abstractmethod
     async def get_next_server(self, request: OpenAIRequest) -> tuple[str, dict]:
         '''Select server by request and return some intermediate information'''
 
@@ -423,6 +437,19 @@ class RoundRobinRouter(Router):
     async def finish_request(self, request: OpenAIRequest):
         pass
 
+    async def add_server(self, server: str):
+        if server in self._servers:
+            raise ValueError(f"Server {server} already exists")
+        self._servers.append(server)
+        self._server_idx = 0
+
+    async def remove_server(self, server):
+        if server not in self._servers:
+            logger.warning(f"Server {server} does not exist")
+        self._servers.remove(server)
+        if self._server_idx >= len(self._servers):
+            self._server_idx = 0
+
 
 class LoadBalancingRouter(Router):
 
@@ -463,6 +490,24 @@ class LoadBalancingRouter(Router):
         for server in new_servers:
             heapq.heappush(self._server_load_heap,
                            (self._get_server_load(server), server))
+
+    def add_server(self, server: str):
+        if server in self._servers:
+            logger.warning(f"Server {server} already exists")
+            return
+        self._servers.append(server)
+        self._server_state[server] = ServerState(server, self._use_tokens)
+        heapq.heappush(self._server_load_heap,
+                       (self._get_server_load(server), server))
+
+    def remove_server(self, server: str):
+        if server not in self._servers:
+            logger.warning(f"Server {server} does not exist")
+            return
+        self._servers.remove(server)
+        self._server_state.pop(server)
+        heapq.heappop(self._server_load_heap,
+                      (self._get_server_load(server), server))
 
     def _init_heap(self):
         for server in self._servers:
@@ -555,6 +600,24 @@ class KvCacheAwareRouter(Router):
                 request.model)
         tokenizer = self._tokenizers[request.model]
         return [tokenizer(prompt)["input_ids"] for prompt in prompts]
+
+    def add_server(self, server: str):
+        if server in self._servers:
+            logger.warning(f"Server {server} already exists")
+            return
+        self._servers.append(server)
+        if server not in self._server_state:
+            self._server_state[server] = KvCacheAwareServerState(
+                server, self._use_tokens)
+
+    # TODO: distinguish between a server is temporarily removed or permanently removed
+    # A possible solution is to delay the removal of the server state for some time
+    def remove_server(self, server: str):
+        if server not in self._servers:
+            logger.warning(f"Server {server} does not exist")
+            return
+        self._servers.remove(server)
+        self._server_state.pop(server)
 
     async def get_next_server(self, request: OpenAIRequest) -> tuple[str, dict]:
         servers = list(self._server_state.keys())

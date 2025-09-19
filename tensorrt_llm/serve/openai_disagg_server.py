@@ -12,6 +12,7 @@ from typing import Callable, Optional, Type, Union
 
 import aiohttp
 import uvicorn
+from attr import asdict
 from fastapi import FastAPI, HTTPException
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -23,6 +24,10 @@ from tensorrt_llm.llmapi.disagg_utils import (DisaggServerConfig,
                                               MetadataServerConfig,
                                               get_ctx_gen_server_urls)
 from tensorrt_llm.logger import logger
+from tensorrt_llm.serve.cluster_management import ClusterManager
+from tensorrt_llm.serve.cluster_storage import (HttpClusterStorageServer,
+                                                WatchEventType,
+                                                create_cluster_storage)
 from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ChatCompletionResponse,
@@ -52,6 +57,10 @@ class OpenAIDisaggServer:
         self.gen_router = create_router(
             config.gen_router_config, self.gen_servers, metadata_server_cfg, self.metadata_server)
         self.conditional_disagg_config = config.conditional_disagg_config
+        self.cluster_config = config.cluster_config
+
+        self.cluster_storage = create_cluster_storage(self.cluster_config.cluster_storage_uri, self.cluster_config.cluster_name) if self.cluster_config else None
+        self.cluster_manager = ClusterManager(self.cluster_config, self.cluster_storage) if self.cluster_storage else None
 
         self.perf_metrics_max_requests = config.perf_metrics_max_requests
         if self.perf_metrics_max_requests > 0:
@@ -82,7 +91,7 @@ class OpenAIDisaggServer:
 
         logger.info(f"Server max retries: {self.max_retries}")
 
-        if (len(self.gen_servers) == 0):
+        if (len(self.gen_servers) == 0) and self.cluster_manager is None:
             raise ValueError("At least one generation server must be provided")
 
         if os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") != "1" and len(self.ctx_servers) == 0:
@@ -91,6 +100,9 @@ class OpenAIDisaggServer:
         if self.conditional_disagg_config is not None and \
                 not isinstance(self.gen_router, KvCacheAwareRouter):
             raise ValueError("Generation router must be a KvCacheAwareRouter to enable conditional disaggregation")
+
+        if self.cluster_manager and self.metadata_server:
+            raise ValueError("Cluster manager and metadata server cannot be used together")
 
         # Session will be initialized in lifespan
         self.session: Optional[aiohttp.ClientSession] = None
@@ -114,6 +126,10 @@ class OpenAIDisaggServer:
             if self.metrics_interval_secs > 0:
                 self._metrics_task = asyncio.create_task(self._log_metrics_periodically(self.metrics_interval_secs))
 
+            if self.metadata_server and self.cluster_manager:
+                await self.cluster_manager.watch_workers()
+                self._update_worker_task = asyncio.create_task(self._update_router_by_watch_events())
+
             yield
 
             if self.metadata_server:
@@ -130,6 +146,7 @@ class OpenAIDisaggServer:
                     pass
 
             await self.session.close()  # Ensure session cleanup
+            await self._update_worker_task.cancel()
 
         self.app = FastAPI(lifespan=lifespan)
 
@@ -178,6 +195,9 @@ class OpenAIDisaggServer:
         self.app.add_api_route("/v1/chat/completions",
                                self.openai_chat_completion,
                                methods=["POST"])
+        if isinstance(self.cluster_storage, HttpClusterStorageServer):
+            self.cluster_storage.add_routes()
+
 
     async def health(self) -> Response:
         return Response(status_code=200)
@@ -269,6 +289,8 @@ class OpenAIDisaggServer:
             await self.gen_router.finish_request(gen_req)
 
     async def openai_completion(self, req: CompletionRequest) -> Response:
+        if not await self.is_ready():
+            raise HTTPException(status_code=400, detail="Cluster is not ready")
         try:
             if not isinstance(req.prompt, str):
                 # Check if it's a list and contains integers
@@ -283,7 +305,8 @@ class OpenAIDisaggServer:
             await self._handle_exception(e)
 
     async def openai_chat_completion(self, req: ChatCompletionRequest) -> Response:
-
+        if not await self.is_ready():
+            raise HTTPException(status_code=400, detail="Cluster is not ready")
         try:
             return await self._send_disagg_request(req)
         except Exception as e:
@@ -520,5 +543,29 @@ class OpenAIDisaggServer:
             raise TimeoutError("Timeout waiting for context and generation servers to be ready")
         logger.info("Context and generation servers are ready")
 
+    async def is_ready(self) -> bool:
+        if self.cluster_manager:
+            return await self.cluster_manager.is_ready()
+        return True
+
     async def wait_for_servers_ready(self, server_start_timeout_secs: int = 180):
+        if self.cluster_manager:
+            return await self.cluster_manager.is_ready()
         await self.wait_for_all_servers_ready(self.session, self.ctx_servers, self.gen_servers, server_start_timeout_secs)
+
+    async def _update_router_by_watch_events(self):
+        worker_repr = lambda worker_info: f"http://{worker_info.ip}:{worker_info.port}"
+        router_map = {
+            "ctx": self.ctx_router,
+            "gen": self.gen_router
+        }
+        while True:
+            worker_events = await self.cluster_manager.get_worker_events()
+            for worker_info, event_type in worker_events:
+                router = router_map[worker_info.role]
+                if event_type == WatchEventType.SET:
+                    router.add_server(worker_repr(worker_info))
+                elif event_type == WatchEventType.DELETE:
+                    router.remove_server(worker_repr(worker_info))
+                else:
+                    raise ValueError(f"Invalid event type: {event_type}, {asdict(worker_info)}")

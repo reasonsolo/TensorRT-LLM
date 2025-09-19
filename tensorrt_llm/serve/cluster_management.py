@@ -4,7 +4,7 @@ import os
 import random
 import time
 from dataclasses import asdict, dataclass
-from typing import List, Literal, Tuple
+from typing import List, Tuple
 
 from tensorrt_llm.llmapi.disagg_utils import DisaggClusterConfig, ServerRole
 
@@ -19,6 +19,7 @@ class WorkerInfo:
     port: int
     role: ServerRole
     status: str
+
 
 @dataclass
 class WorkerWatchEvent:
@@ -36,8 +37,7 @@ def get_worker_key(name: str, role: ServerRole, worker_id: str = "") -> str:
 
 class ClusterManager:
 
-    def __init__(self, config: DisaggClusterConfig,
-                 storage: ClusterStorage):
+    def __init__(self, config: DisaggClusterConfig, storage: ClusterStorage):
         self._config = config
         self._cluster_storage = storage
         self._minimal_ctx_worker_num = config.minimal_instances.context_servers
@@ -67,7 +67,8 @@ class ClusterManager:
         await self._cluster_storage.unwatch([self.worker_key_prefix])
         self._watch_handle = None
 
-    async def get_worker_events(self) -> List[Tuple[WorkerInfo, WatchEventType]]:
+    async def get_worker_events(
+            self) -> List[Tuple[WorkerInfo, WatchEventType]]:
         events = await self._watch_handle.drain()
         worker_events = []
         for event in events:
@@ -78,9 +79,11 @@ class ClusterManager:
             elif event.event_type == WatchEventType.DELETE:
                 self._remove_worker(worker_info)
         return worker_events
-    
+
     def _log_cluster_status(self, worker_info: WorkerInfo, change_event: str):
-        logger.info(f"Worker {worker_info.worker_id} becomes {change_event}, current context worker: {self.current_ctx_worker_num}/{self._minimal_ctx_worker_num}, current generation worker: {self.current_gen_worker_num}/{self._minimal_gen_worker_num}")
+        logger.info(
+            f"Worker {worker_info.worker_id} becomes {change_event}, current context worker: {self.current_ctx_worker_num}/{self._minimal_ctx_worker_num}, current generation worker: {self.current_gen_worker_num}/{self._minimal_gen_worker_num}"
+        )
 
     def _add_worker(self, worker_info: WorkerInfo):
         if worker_info.role == ServerRole.CONTEXT:

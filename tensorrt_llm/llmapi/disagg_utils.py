@@ -42,6 +42,7 @@ class RouterConfig():
 class ConditionalDisaggConfig():
     max_local_prefill_length: int = 0
 
+
 @dataclass
 class MinimalInstances:
     context_servers: int = 1
@@ -68,6 +69,7 @@ class DisaggServerConfig():
     max_retries: int = 1
     perf_metrics_max_requests: int = 0
     cluster_config: Optional[DisaggClusterConfig] = None
+
 
 @dataclass
 class MetadataServerConfig():
@@ -130,7 +132,7 @@ def extract_disagg_cfg(hostname: str = 'localhost',
             else:
                 # Inherit the value from the top-level
                 servers[key] = value
-    
+
     ctx_router_config, gen_router_config = None, None
     if cluster:
         cluster_config = extract_cluster_config(cluster)
@@ -238,17 +240,22 @@ def get_server_configs_dict(
 
     return num_workers, server_dict
 
+
 def extract_cluster_config(cluster_config: dict) -> DisaggClusterConfig:
+
     def get_minimal_instances(minimal_instances: dict) -> MinimalInstances:
         return MinimalInstances(
             context_servers=minimal_instances.get("context_servers", 1),
             generation_servers=minimal_instances.get("generation_servers", 1))
+
     return DisaggClusterConfig(
         cluster_storage_uri=cluster_config.get("uri", ""),
         cluster_name=cluster_config.get("name", ""),
-        minimal_instances=get_minimal_instances(cluster_config.get("minimal_instances", {})),
+        minimal_instances=get_minimal_instances(
+            cluster_config.get("minimal_instances", {})),
         heartbeat_interval=cluster_config.get("heartbeat_interval", 5),
         inactive_timeout=cluster_config.get("inactive_timeout", 10))
+
 
 def split_world_comm(
         server_configs: List[CtxGenServerConfig]) -> Tuple[bool, int, Comm]:

@@ -26,12 +26,15 @@ from tensorrt_llm.inputs import prompt_inputs
 from tensorrt_llm.inputs.utils import ConversationMessage, apply_chat_template
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import MultimodalEncoder
-from tensorrt_llm.llmapi.disagg_utils import MetadataServerConfig, ServerRole
+from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
+                                              MetadataServerConfig, ServerRole)
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.logger import logger
 from tensorrt_llm.metrics.collector import MetricsCollector
 from tensorrt_llm.serve.chat_utils import (check_multiple_response,
                                            parse_chat_messages_coroutines)
+from tensorrt_llm.serve.cluster_management import ClusterWorker
+from tensorrt_llm.serve.cluster_storage import create_cluster_storage
 from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ChatCompletionResponse,
@@ -63,10 +66,12 @@ class OpenAIServer:
                  llm: Union[LLM, MultimodalEncoder],
                  model: str,
                  server_role: Optional[ServerRole],
-                 metadata_server_cfg: MetadataServerConfig):
+                 metadata_server_cfg: MetadataServerConfig,
+                 cluster_config: Optional[DisaggClusterConfig] = None):
         self.llm = llm
         self.tokenizer = llm.tokenizer
         self.metadata_server = create_metadata_server(metadata_server_cfg)
+        self.cluster_config = cluster_config
         self.server_role = server_role
         self.binding_addr = None  # Will be set in __call__
         hf_tokenizer_path = llm._hf_model_dir or self.tokenizer.tokenizer.name_or_path
@@ -105,6 +110,10 @@ class OpenAIServer:
         self.harmony_adapter: HarmonyAdapter | None = None
         self.use_harmony = self.model_config.model_type == "gpt_oss"
 
+        # as disagg-worker
+        self.cluster_storage = None
+        self.cluster_worker = None
+
         @asynccontextmanager
         async def lifespan(app: FastAPI):
             if self.metadata_server is not None:
@@ -120,12 +129,18 @@ class OpenAIServer:
                 self.metadata_server.put(f"trtllm/{self.llm.llm_id}", metadata)
                 logger.info(f"trtllm/{self.llm.llm_id} is registered")
 
+            if self.cluster_config:
+                self.cluster_storage = create_cluster_storage(self.cluster_config.cluster_storage_uri, self.cluster_config.cluster_name)
+                self.cluster_worker= ClusterWorker(self.server_role, self.host, self.port, self.cluster_config, self.cluster_storage)
+                self.cluster_worker.register_worker()
+
             # terminate rank0 worker
             yield
 
             if self.metadata_server is not None:
                 self.metadata_server.remove(f"trtllm/{self.llm.llm_id}")
                 logger.info(f"trtllm/{self.llm.llm_id} is unregistered")
+            self.cluster_worker.unregister_worker()
             self.llm.shutdown()
 
         self.app = FastAPI(lifespan=lifespan)
