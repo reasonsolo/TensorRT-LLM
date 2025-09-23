@@ -31,10 +31,10 @@ from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.logger import logger
 from tensorrt_llm.metrics.collector import MetricsCollector
+from tensorrt_llm.serve.auto_scaling import ClusterWorker
 from tensorrt_llm.serve.chat_utils import (check_multiple_response,
                                            parse_chat_messages_coroutines)
-from tensorrt_llm.serve.cluster_management import ClusterWorker
-from tensorrt_llm.serve.cluster_storage import create_cluster_storage
+from tensorrt_llm.serve.cluster_storage import create_cluster_storage_client
 from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ChatCompletionResponse,
@@ -73,7 +73,10 @@ class OpenAIServer:
         self.metadata_server = create_metadata_server(metadata_server_cfg)
         self.cluster_config = cluster_config
         self.server_role = server_role
-        self.binding_addr = None  # Will be set in __call__
+        # Will be set in __call__
+        self.binding_addr = None
+        self.host = None
+        self.port = None
         hf_tokenizer_path = llm._hf_model_dir or self.tokenizer.tokenizer.name_or_path
         trust_remote_code = llm.args.trust_remote_code
         try:
@@ -130,9 +133,10 @@ class OpenAIServer:
                 logger.info(f"trtllm/{self.llm.llm_id} is registered")
 
             if self.cluster_config:
-                self.cluster_storage = create_cluster_storage(self.cluster_config.cluster_storage_uri, self.cluster_config.cluster_name)
+                logger.info(f"Cluster config: {self.cluster_config}")
+                self.cluster_storage = create_cluster_storage_client(self.cluster_config.cluster_uri, self.cluster_config.cluster_name)
                 self.cluster_worker= ClusterWorker(self.server_role, self.host, self.port, self.cluster_config, self.cluster_storage)
-                self.cluster_worker.register_worker()
+                await self.cluster_worker.register_worker()
 
             # terminate rank0 worker
             yield
@@ -140,13 +144,16 @@ class OpenAIServer:
             if self.metadata_server is not None:
                 self.metadata_server.remove(f"trtllm/{self.llm.llm_id}")
                 logger.info(f"trtllm/{self.llm.llm_id} is unregistered")
-            self.cluster_worker.unregister_worker()
             self.llm.shutdown()
 
         self.app = FastAPI(lifespan=lifespan)
 
         @self.app.exception_handler(RequestValidationError)
         async def validation_exception_handler(_, exc):
+            return self.create_error_response(message=str(exc))
+        @self.app.exception_handler(Exception)
+        async def exception_handler(_, exc):
+            logger.error(f"Exception: {exc}")
             return self.create_error_response(message=str(exc))
 
         if self.server_role is not ServerRole.MM_ENCODER:
@@ -757,9 +764,11 @@ class OpenAIServer:
     async def __call__(self, host, port):
         # Store the binding address for server registration
         self.binding_addr = f"http://{host}:{port}"
+        self.host = host
+        self.port = port
         config = uvicorn.Config(self.app,
                                 host=host,
                                 port=port,
-                                log_level="info",
+                                log_level="debug",
                                 timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
         await uvicorn.Server(config).serve()

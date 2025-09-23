@@ -5,21 +5,23 @@ import pytest
 
 from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               MinimalInstances, ServerRole)
-from tensorrt_llm.serve.cluster_management import ClusterManager, ClusterWorker
+from tensorrt_llm.serve.auto_scaling import ClusterManager, ClusterWorker
 from tensorrt_llm.serve.cluster_storage import WatchEventType
 
 from .test_cluster_storage import TEST_PORT, pytest_async_module
 
+INACTIVE_TIMEOUT = 4
+HEARTBEAT_INTERVAL = 2
+
 
 @pytest.fixture(scope="module")
-def config(cluster_storage_name):
-    return DisaggClusterConfig(
-        cluster_storage_uri=f"http://localhost:{TEST_PORT}",
-        cluster_name=cluster_storage_name,
-        minimal_instances=MinimalInstances(context_servers=1,
-                                           generation_servers=1),
-        inactive_timeout=4,
-        heartbeat_interval=2)
+def config():
+    return DisaggClusterConfig(cluster_uri=f"http://localhost:{TEST_PORT}",
+                               cluster_name="test",
+                               minimal_instances=MinimalInstances(
+                                   context_servers=1, generation_servers=1),
+                               inactive_timeout=INACTIVE_TIMEOUT,
+                               heartbeat_interval=HEARTBEAT_INTERVAL)
 
 
 @pytest.fixture(scope="module")
@@ -42,7 +44,7 @@ async def test_cluster_manager(cluster_manager, storage_client, config):
     await cluster_manager.watch_workers()
     await ctx_worker.register_worker()
     worker_events = await cluster_manager.get_worker_events()
-    assert worker_events == [(ctx_worker.worker_info, "set")]
+    assert worker_events == [(ctx_worker.worker_info, WatchEventType.SET)]
     assert cluster_manager.current_ctx_worker_num == 1
     assert cluster_manager.current_gen_worker_num == 0
     assert await cluster_manager.is_ready() == False
@@ -51,21 +53,21 @@ async def test_cluster_manager(cluster_manager, storage_client, config):
                                storage_client)
     await gen_worker.register_worker()
     worker_events = await cluster_manager.get_worker_events()
-    assert worker_events == [(gen_worker.worker_info, "set")]
+    assert worker_events == [(gen_worker.worker_info, WatchEventType.SET)]
     assert cluster_manager.current_ctx_worker_num == 1
     assert cluster_manager.current_gen_worker_num == 1
     assert await cluster_manager.is_ready() == True
 
-    await ctx_worker.unregister_worker()
+    await ctx_worker.deregister_worker()
     worker_events = await cluster_manager.get_worker_events()
-    assert worker_events == [(ctx_worker.worker_info, "delete")]
+    assert worker_events == [(ctx_worker.worker_info, WatchEventType.DELETE)]
     assert cluster_manager.current_ctx_worker_num == 0
     assert cluster_manager.current_gen_worker_num == 1
     assert await cluster_manager.is_ready() == False
 
-    await gen_worker.unregister_worker()
+    await gen_worker.deregister_worker()
     worker_events = await cluster_manager.get_worker_events()
-    assert worker_events == [(gen_worker.worker_info, "delete")]
+    assert worker_events == [(gen_worker.worker_info, WatchEventType.DELETE)]
     assert cluster_manager.current_ctx_worker_num == 0
     assert cluster_manager.current_gen_worker_num == 0
     assert await cluster_manager.is_ready() == False
@@ -109,11 +111,14 @@ async def test_cluster_worker(cluster_manager, storage_client, config):
     assert set(new_worker_ids) == worker_ids
     assert len(dead_workers_ids) == 0
 
+    await asyncio.sleep(config.inactive_timeout + 1)
+    assert await cluster_manager.is_ready() == True
+
     new_worker_ids = []
     dead_workers_ids = []
     # stop heartbeat, then we should see two workers deleted
     keep_heartbeat = False
-    await asyncio.sleep(config.inactive_timeout + 2)
+    await asyncio.sleep(config.inactive_timeout + 1)
     while len(dead_workers_ids) < 2:
         try:
             worker_events = await asyncio.wait_for(

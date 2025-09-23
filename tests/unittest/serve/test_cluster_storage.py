@@ -14,11 +14,6 @@ from tensorrt_llm.serve.cluster_storage import (HttpClusterStorageClient,
 pytest_async_module = pytest.mark.asyncio(loop_scope="module")
 
 
-@pytest.fixture(scope="module")
-def cluster_storage_name():
-    return "test"
-
-
 class Server(uvicorn.Server):
 
     def install_signal_handlers(self):
@@ -55,9 +50,8 @@ def storage_server():
 
 @pytest.fixture(scope="function")
 @pytest.mark.asyncio(loop_scope="function")
-async def storage_client(cluster_storage_name):
-    return HttpClusterStorageClient(f"http://localhost:{TEST_PORT}",
-                                    cluster_storage_name)
+async def storage_client():
+    return HttpClusterStorageClient(f"http://localhost:{TEST_PORT}", "test")
 
 
 @pytest_async_module

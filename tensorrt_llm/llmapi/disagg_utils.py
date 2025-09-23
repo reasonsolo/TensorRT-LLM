@@ -1,6 +1,6 @@
 import logging
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import IntEnum
 from typing import Any, List, Literal, Optional, Tuple
 
 import yaml
@@ -16,7 +16,7 @@ __all__ = [
 ]
 
 
-class ServerRole(Enum):
+class ServerRole(IntEnum):
     CONTEXT = 0
     GENERATION = 1
     MM_ENCODER = 2
@@ -51,8 +51,8 @@ class MinimalInstances:
 
 @dataclass
 class DisaggClusterConfig:
-    cluster_storage_uri: str
-    cluster_name: str
+    cluster_uri: str
+    cluster_name: str = ""
     minimal_instances: Optional[MinimalInstances] = None
     heartbeat_interval: int = 5
     inactive_timeout: int = 10
@@ -133,19 +133,18 @@ def extract_disagg_cfg(hostname: str = 'localhost',
                 # Inherit the value from the top-level
                 servers[key] = value
 
-    ctx_router_config, gen_router_config = None, None
+    server_configs = []
+    cluster_config = None
+    ctx_router_config = extract_router_config(context_servers)
+    gen_router_config = extract_router_config(generation_servers)
+    ctx_router_config.server_role = ServerRole.CONTEXT
+    gen_router_config.server_role = ServerRole.GENERATION
     if cluster:
         cluster_config = extract_cluster_config(cluster)
     else:
-        ctx_router_config = extract_router_config(context_servers)
-        gen_router_config = extract_router_config(generation_servers)
-
         server_configs = extract_ctx_gen_cfgs(
             type="ctx", **context_servers) + extract_ctx_gen_cfgs(
                 type="gen", **generation_servers)
-
-        ctx_router_config.server_role = ServerRole.CONTEXT
-        gen_router_config.server_role = ServerRole.GENERATION
 
     conditional_disagg_config = ConditionalDisaggConfig(
         **conditional_disagg_config) if conditional_disagg_config else None
@@ -249,8 +248,8 @@ def extract_cluster_config(cluster_config: dict) -> DisaggClusterConfig:
             generation_servers=minimal_instances.get("generation_servers", 1))
 
     return DisaggClusterConfig(
-        cluster_storage_uri=cluster_config.get("uri", ""),
-        cluster_name=cluster_config.get("name", ""),
+        cluster_uri=cluster_config.get("cluster_uri", ""),
+        cluster_name=cluster_config.get("cluster_name", ""),
         minimal_instances=get_minimal_instances(
             cluster_config.get("minimal_instances", {})),
         heartbeat_interval=cluster_config.get("heartbeat_interval", 5),

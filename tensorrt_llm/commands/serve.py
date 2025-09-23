@@ -163,6 +163,7 @@ def launch_server(host: str,
 
     backend = llm_args["backend"]
     model = llm_args["model"]
+    logger.info(f"LLM args: {llm_args.keys()}")
     if backend == 'pytorch':
         llm = PyTorchLLM(**llm_args)
     elif backend == '_autodeploy':
@@ -307,6 +308,10 @@ def launch_mm_encoder_server(
     help=
     "Exit with runtime error when attention window is too large to fit even a single sequence in the KV cache."
 )
+@click.option("--disagg_cluster_uri",
+              type=str,
+              default=None,
+              help="URI of the disaggregated cluster.")
 def serve(
         model: str, tokenizer: Optional[str], host: str, port: int,
         log_level: str, backend: str, max_beam_width: int, max_batch_size: int,
@@ -316,7 +321,8 @@ def serve(
         num_postprocess_workers: int, trust_remote_code: bool,
         extra_llm_api_options: Optional[str], reasoning_parser: Optional[str],
         metadata_server_config_file: Optional[str], server_role: Optional[str],
-        fail_fast_on_attention_window_too_large: bool):
+        fail_fast_on_attention_window_too_large: bool,
+        disagg_cluster_uri: Optional[str]):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
@@ -352,8 +358,14 @@ def serve(
     metadata_server_cfg = parse_metadata_server_config_file(
         metadata_server_config_file)
 
-    cluster_config = extract_cluster_config(
-        llm_args["cluster"]) if "cluster" in llm_args else None
+    cluster_config = llm_args.pop("cluster", None)
+    if cluster_config:
+        cluster_config = extract_cluster_config(cluster_config)
+    elif disagg_cluster_uri:
+        cluster_config = DisaggClusterConfig(
+            cluster_storage_uri=disagg_cluster_uri)
+    else:
+        cluster_config = None
 
     if metadata_server_cfg is not None or cluster_config is not None:
         assert server_role is not None, "server_role is required when metadata_server_cfg or cluster_config is provided"

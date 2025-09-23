@@ -164,15 +164,19 @@ class Router(ABC):
             new_servers: The new server list
         """
 
+    @property
+    def servers(self) -> List[str]:
+        return self._servers
+
     @abstractmethod
-    def add_server(self, server):
+    async def add_server(self, server):
         """
         Args:
             server: The server to add
         """
 
     @abstractmethod
-    def remove_server(self, server):
+    async def remove_server(self, server):
         """
         Args:
             server: The server to remove
@@ -439,16 +443,28 @@ class RoundRobinRouter(Router):
 
     async def add_server(self, server: str):
         if server in self._servers:
-            raise ValueError(f"Server {server} already exists")
-        self._servers.append(server)
-        self._server_idx = 0
+            logger.warning(f"Server {server} already exists")
+            return
+        async with self._lock:
+            old_servers = self._servers
+            new_servers = old_servers.copy() + [server]
+            self._servers = new_servers
+            self._on_servers_updated(old_servers, new_servers)
+        logger.debug(
+            f"Added server {server}, current server list: {self._servers}")
 
     async def remove_server(self, server):
         if server not in self._servers:
             logger.warning(f"Server {server} does not exist")
-        self._servers.remove(server)
-        if self._server_idx >= len(self._servers):
-            self._server_idx = 0
+            return
+        async with self._lock:
+            old_servers = self._servers
+            new_servers = old_servers.copy()
+            new_servers.remove(server)
+            self._servers = new_servers
+            self._on_servers_updated(old_servers, new_servers)
+        logger.debug(
+            f"Removed server {server}, current server list: {self._servers}")
 
 
 class LoadBalancingRouter(Router):
@@ -491,23 +507,30 @@ class LoadBalancingRouter(Router):
             heapq.heappush(self._server_load_heap,
                            (self._get_server_load(server), server))
 
-    def add_server(self, server: str):
+    async def add_server(self, server: str):
         if server in self._servers:
             logger.warning(f"Server {server} already exists")
             return
-        self._servers.append(server)
-        self._server_state[server] = ServerState(server, self._use_tokens)
-        heapq.heappush(self._server_load_heap,
-                       (self._get_server_load(server), server))
+        async with self._lock:
+            self._servers.append(server)
+            old_servers = self._servers
+            new_servers = old_servers.copy() + [server]
+            self._on_servers_updated(old_servers, new_servers)
+        logger.debug(
+            f"Added server {server}, current server list: {self._servers}")
 
-    def remove_server(self, server: str):
+    async def remove_server(self, server: str):
         if server not in self._servers:
             logger.warning(f"Server {server} does not exist")
             return
-        self._servers.remove(server)
-        self._server_state.pop(server)
-        heapq.heappop(self._server_load_heap,
-                      (self._get_server_load(server), server))
+        async with self._lock:
+            old_servers = self._servers
+            new_servers = old_servers.copy()
+            new_servers.remove(server)
+            self._servers = new_servers
+            self._on_servers_updated(old_servers, new_servers)
+        logger.debug(
+            f"Removed server {server}, current server list: {self._servers}")
 
     def _init_heap(self):
         for server in self._servers:
@@ -601,23 +624,29 @@ class KvCacheAwareRouter(Router):
         tokenizer = self._tokenizers[request.model]
         return [tokenizer(prompt)["input_ids"] for prompt in prompts]
 
-    def add_server(self, server: str):
+    async def add_server(self, server: str):
         if server in self._servers:
             logger.warning(f"Server {server} already exists")
             return
-        self._servers.append(server)
-        if server not in self._server_state:
-            self._server_state[server] = KvCacheAwareServerState(
-                server, self._use_tokens)
+        async with self._lock:
+            self._servers.append(server)
+            if server not in self._server_state:
+                self._server_state[server] = KvCacheAwareServerState(
+                    server, self._use_tokens)
+        logger.debug(
+            f"Added server {server}, current server list: {self._servers}")
 
     # TODO: distinguish between a server is temporarily removed or permanently removed
     # A possible solution is to delay the removal of the server state for some time
-    def remove_server(self, server: str):
+    async def remove_server(self, server: str):
         if server not in self._servers:
             logger.warning(f"Server {server} does not exist")
             return
-        self._servers.remove(server)
-        self._server_state.pop(server)
+        async with self._lock:
+            self._servers.remove(server)
+            self._server_state.pop(server)
+        logger.debug(
+            f"Removed server {server}, current server list: {self._servers}")
 
     async def get_next_server(self, request: OpenAIRequest) -> tuple[str, dict]:
         servers = list(self._server_state.keys())
@@ -695,21 +724,21 @@ def create_router(router_config: Optional[RouterConfig],
     Raises:
         ValueError: If an unsupported router type is provided
     """
-    if router_config is None:
-        # Create a default router without server_role
-        return RoundRobinRouter(None, servers)
-
     router_map = {
         "round_robin": RoundRobinRouter,
         "load_balancing": LoadBalancingRouter,
         "kv_cache_aware": KvCacheAwareRouter,
     }
-
-    router_type = router_config.type
+    default_router_type = "round_robin"
+    router_type = router_config.type if router_config else default_router_type
     router_class = router_map.get(router_type.lower())
+
     if router_class is None:
         raise ValueError(f"Unsupported router type: {router_type}. "
                          f"Supported types are: {list(router_map.keys())}")
+    if router_config is None:
+        # Create a default router without server_role
+        return router_class(None, servers)
 
     # Pass server_role as the first argument
     return router_class(router_config.server_role, servers, metadata_server_cfg,

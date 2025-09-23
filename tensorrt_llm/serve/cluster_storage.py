@@ -1,6 +1,5 @@
 import abc
 import asyncio
-import json
 import logging
 import time
 from dataclasses import dataclass
@@ -41,18 +40,17 @@ class WatchEventQueue:
                  events: asyncio.Queue[WatchEvent]):
         self.key_prefixes = key_prefixes
         self.events = events
-        self.lock = asyncio.Lock()
 
     async def drain(self):
         events = []
-        async with self.lock:
-            event = await self.events.get()
+        event = await self.events.get()
+        logger.debug(f"Draining watch event: {self.events.qsize()}")
+        events.append(event)
+        while not self.events.empty():
+            event = self.events.get_nowait()
             events.append(event)
-            self.events.task_done()
-            while not self.events.empty():
-                event = self.events.get_nowait()
-                events.append(event)
-                self.events.task_done()
+        self.events.task_done()
+        logger.debug(f"after draining watch event: {self.events.qsize()}")
         return events
 
 
@@ -83,9 +81,9 @@ class ClusterStorage(abc.ABC):
         ...
 
 
-def create_cluster_storage(cluster_uri, cluster_name):
+def create_cluster_storage(cluster_uri, cluster_name, **kwargs):
     if cluster_uri.startswith("http"):
-        return HttpClusterStorageServer(cluster_uri, cluster_name)
+        return HttpClusterStorageServer(cluster_uri, cluster_name, **kwargs)
     raise ValueError(f"Invalid cluster storage URI: {cluster_uri}")
 
 
@@ -109,7 +107,7 @@ def jsonify(f):
 
 
 def key_time():
-    return time.perf_counter()
+    return time.monotonic()
 
 
 class HttpClusterStorageServer(ClusterStorage):
@@ -120,8 +118,8 @@ class HttpClusterStorageServer(ClusterStorage):
         self._watch_handles = {}
         self._watch_lock = asyncio.Lock()
         self._server = server
-        if self._server:
-            self.add_routes()
+        self._check_expired_task = None
+        self.add_routes()
 
     def add_routes(self):
         self._server.add_api_route("/set", jsonify(self.set), methods=["POST"])
@@ -132,8 +130,12 @@ class HttpClusterStorageServer(ClusterStorage):
         self._server.add_api_route("/expire",
                                    jsonify(self.expire),
                                    methods=["POST"])
-        self._server.add_event_handler(
-            "startup", lambda: asyncio.create_task(self._check_expired()))
+        self._server.add_event_handler("startup", self.start_checking_expired)
+
+    def start_checking_expired(self):
+        if self._check_expired_task:
+            return
+        self._check_expired_task = asyncio.create_task(self._check_expired())
 
     async def set(self, storage_item: StorageItem) -> bool:
         return await self._set_storage(storage_item)
@@ -171,15 +173,19 @@ class HttpClusterStorageServer(ClusterStorage):
 
     async def _notify_watch_event(self, key, storage_item: StorageItem,
                                   event_type: WatchEventType):
+        loop = asyncio.get_event_loop()
         async with self._watch_lock:
-            logger.debug(
-                f"Notifying watch event for key {key} with type {event_type}, watch handles: {self._watch_handles}"
-            )
             for watch_key, handle in self._watch_handles.items():
                 if key.startswith(watch_key):
-                    async with handle.lock:
-                        await handle.events.put(
-                            WatchEvent(storage_item, event_type))
+                    # update queue immediately and wake up the event loop
+                    handle.events.put_nowait(
+                        WatchEvent(storage_item, event_type))
+                logger.info(
+                    f"Notifying watch event for watch key {watch_key} with type {event_type}"
+                )
+            loop._write_to_self()
+        logger.info(
+            f"Notified watch event for key {key} with type {event_type}")
 
     async def _set_storage(self, storage_item: StorageItem) -> bool:
         async with self._lock:
@@ -224,31 +230,39 @@ class HttpClusterStorageServer(ClusterStorage):
     async def _check_expired(self):
         while True:
             await asyncio.sleep(1)
-            before_len = len(self._storage)
-            async with self._lock:
-                key_to_delete = []
-                for key, item in self._storage.items():
-                    if item.expire_time > 0 and item.expire_time < key_time():
-                        await self._notify_watch_event(key, item,
-                                                       WatchEventType.DELETE)
-                        key_to_delete.append(key)
-                for key in key_to_delete:
-                    self._storage.pop(key)
+            try:
+                before_len = len(self._storage)
+                async with self._lock:
+                    key_to_delete = []
+                    for key, item in self._storage.items():
+                        if item.expire_time > 0 and item.expire_time < key_time(
+                        ):
+                            await self._notify_watch_event(
+                                key, item, WatchEventType.DELETE)
+                            key_to_delete.append(key)
+                    for key in key_to_delete:
+                        self._storage.pop(key)
                 logger.debug(
                     f"Checked expired, {before_len} -> {len(self._storage)}, keys to delete: {key_to_delete}"
                 )
+            except Exception as e:
+                logger.error(f"Error checking expired: {e}")
 
 
 class HttpClusterStorageClient(ClusterStorage):
 
-    def __init__(self, cluster_uri, cluster_name, loop=None):
-        self._session = aiohttp.ClientSession(
-            connector=aiohttp.TCPConnector(limit=0, limit_per_host=0,
-                                           loop=loop),
-            timeout=aiohttp.ClientTimeout(total=5),
-        )
-        self._cluster_uri = cluster_uri
+    def __init__(self, cluster_uri, cluster_name):
+        self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(
+            total=5))
+        self._cluster_uri = cluster_uri if cluster_uri.startswith(
+            "http") else f"http://{cluster_uri}"
         self._cluster_name = cluster_name
+
+    async def __del__(self):
+        await self._session.close()
+
+    def _url_for(self, endpoint):
+        return f"{self._cluster_uri}/{endpoint}"
 
     def _post_json(self, url, headers={}, **kwargs):
         headers["Content-Type"] = "application/json"
@@ -260,40 +274,44 @@ class HttpClusterStorageClient(ClusterStorage):
                                        value=value,
                                        overwrite_if_exists=overwrite_if_exists,
                                        ttl=ttl)
-            assert storage_item.model_validate_json(
-                json.dumps(storage_item.model_dump()))
-            async with self._post_json(f"{self._cluster_uri}/set",
+            async with self._post_json(self._url_for("set"),
                                        json=storage_item.model_dump()) as resp:
                 return resp.status == 200
-        except (aiohttp.ClientError, OSError):
+        except (aiohttp.ClientError, OSError) as e:
+            logger.warning(
+                f"Failed to set key {key} with value {value}, error: {e}")
             return False
 
     async def expire(self, key, ttl) -> bool:
         try:
             storage_item = StorageItem(key=key, ttl=ttl)
-            async with self._post_json(f"{self._cluster_uri}/expire",
+            async with self._post_json(self._url_for("expire"),
                                        json=storage_item.model_dump()) as resp:
                 return resp.status == 200
-        except (aiohttp.ClientError, OSError):
+        except (aiohttp.ClientError, OSError) as e:
+            logger.warning(
+                f"Failed to expire key {key} with ttl {ttl}, error: {e}")
             return False
 
     async def get(self, key) -> str:
         try:
-            async with self._session.get(f"{self._cluster_uri}/get",
+            async with self._session.get(self._url_for("get"),
                                          params={"key": key}) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     return data.get("result")
                 return None
-        except (aiohttp.ClientError, OSError):
+        except (aiohttp.ClientError, OSError) as e:
+            logger.warning(f"Failed to get key {key}, error: {e}")
             return None
 
     async def delete(self, key) -> bool:
         try:
-            async with self._session.delete(f"{self._cluster_uri}/delete",
+            async with self._session.delete(self._url_for("delete"),
                                             params={"key": key}) as resp:
                 return resp.status == 200
-        except (aiohttp.ClientError, OSError):
+        except (aiohttp.ClientError, OSError) as e:
+            logger.warning(f"Failed to delete key {key}, error: {e}")
             return False
 
     async def watch(self, keys):
