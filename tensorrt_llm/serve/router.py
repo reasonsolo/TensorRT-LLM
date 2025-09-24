@@ -591,6 +591,7 @@ class KvCacheAwareRouter(Router):
         super().__init__(server_role, servers, metadata_server_cfg,
                          metadata_server)
         self._lock = asyncio.Lock()
+        self._use_tokens = use_tokens
 
         # Load map between servers and their number of tokens processed
         self._server_state: dict[str, KvCacheAwareServerState] = {
@@ -629,8 +630,8 @@ class KvCacheAwareRouter(Router):
             logger.warning(f"Server {server} already exists")
             return
         async with self._lock:
-            self._servers.append(server)
-            if server not in self._server_state:
+            if server not in self._servers:
+                self._servers.append(server)
                 self._server_state[server] = KvCacheAwareServerState(
                     server, self._use_tokens)
         logger.debug(
@@ -649,7 +650,8 @@ class KvCacheAwareRouter(Router):
             f"Removed server {server}, current server list: {self._servers}")
 
     async def get_next_server(self, request: OpenAIRequest) -> tuple[str, dict]:
-        servers = list(self._server_state.keys())
+        async with self._lock:
+            servers = list(self._server_state.keys())
         token_lists = self._tokenize(request)
         block_hashes: list[list[int]] = []
         for token_list in token_lists:
@@ -681,8 +683,8 @@ class KvCacheAwareRouter(Router):
                 i] / self._max_batch_size
             scores.append(score)
         server = servers[scores.index(max(scores))]
-        await self._server_state[server].increment_load(request)
         async with self._lock:
+            await self._server_state[server].increment_load(request)
             self._req_routing_table[id(request)] = server
         return server, {
             "block_hashes": block_hashes,  # list[list[int]]
@@ -696,8 +698,9 @@ class KvCacheAwareRouter(Router):
         async with self._lock:
             server = self._req_routing_table[id(request)]
             del self._req_routing_table[id(request)]
-        await self._server_state[server].decrement_load(request,
-                                                        session=session)
+            if server in self._server_state:
+                await self._server_state[server].decrement_load(request,
+                                                                session=session)
 
     def _on_servers_updated(self, old_servers, new_servers):
         raise NotImplementedError(
@@ -736,10 +739,7 @@ def create_router(router_config: Optional[RouterConfig],
     if router_class is None:
         raise ValueError(f"Unsupported router type: {router_type}. "
                          f"Supported types are: {list(router_map.keys())}")
-    if router_config is None:
-        # Create a default router without server_role
-        return router_class(None, servers)
 
-    # Pass server_role as the first argument
-    return router_class(router_config.server_role, servers, metadata_server_cfg,
-                        metadata_server, **router_config.args)
+    return router_class(router_config.server_role if router_config else None,
+                        servers, metadata_server_cfg, metadata_server,
+                        **router_config.args)

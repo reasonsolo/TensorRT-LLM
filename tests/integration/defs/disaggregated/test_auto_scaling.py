@@ -10,6 +10,8 @@ import yaml
 from tensorrt_llm.logger import logger
 
 TEST_PORT = 18000
+HEARTBEAT_INTERVAL = 1
+INACTIVE_TIMEOUT = 2
 
 
 @pytest.fixture
@@ -26,40 +28,39 @@ def disagg_cluster_config():
             "context_servers": 1,
             "generation_servers": 1
         },
-        "heartbeat_interval": 1,
-        "inactive_timeout": 2,
+        "heartbeat_interval": HEARTBEAT_INTERVAL,
+        "inactive_timeout": INACTIVE_TIMEOUT,
     }
 
 
 @pytest.fixture
-def disagg_server_config(disagg_cluster_config):
+def router(request):
+    return request.param
+
+
+@pytest.fixture
+def disagg_server_config(disagg_cluster_config, router):
     return {
         "hostname": "localhost",
         "port": TEST_PORT,
         "cluster": disagg_cluster_config,
-    }
-
-
-@pytest.fixture
-def gen_worker_config(disagg_cluster_config):
-    return {
-        "cluster": disagg_cluster_config,
-        "disable_overlap_scheduler": True,
-        "cache_transceiver_config": {
-            "backend": "DEFAULT"
+        "context_servers": {
+            "router": {
+                "type": router
+            }
         },
-        "kv_cache_config": {
-            "free_gpu_memory_fraction": 0.2,
-            "enable_partial_reuse": False,
+        "generation_servers": {
+            "router": {
+                "type": router
+            }
         },
     }
 
 
 @pytest.fixture
-def ctx_worker_config(disagg_cluster_config):
+def worker_config(disagg_cluster_config):
     return {
         "cluster": disagg_cluster_config,
-        "backend": "pytorch",
         "disable_overlap_scheduler": True,
         "cache_transceiver_config": {
             "backend": "DEFAULT"
@@ -202,16 +203,17 @@ def request_completion(model_name, prompt, port=TEST_PORT):
                                      temperature=0.0)
 
 
+@pytest.mark.parametrize("router",
+                         ["round_robin", "load_balancing", "kv_cache_aware"],
+                         indirect=True)
 @pytest.mark.asyncio(loop_scope="module")
 @pytest.mark.timeout(600)
-async def test_auto_scaling(model_name, disagg_server_config, ctx_worker_config,
-                            gen_worker_config):
+async def test_service_discovery(model_name, disagg_server_config,
+                                 worker_config, router):
     try:
         # initial cluster, 1 ctx, 1 gen, request should succeed
-        ctx_worker1 = run_ctx_worker(model_name, ctx_worker_config,
-                                     TEST_PORT + 100)
-        gen_worker1 = run_gen_worker(model_name, gen_worker_config,
-                                     TEST_PORT + 200)
+        ctx_worker1 = run_ctx_worker(model_name, worker_config, TEST_PORT + 100)
+        gen_worker1 = run_gen_worker(model_name, worker_config, TEST_PORT + 200)
         disagg_server = run_disagg_server(disagg_server_config, TEST_PORT)
         await wait_for_disagg_server_ready(TEST_PORT)
         verify_cluster_info(True, 1, 1)
@@ -228,56 +230,57 @@ async def test_auto_scaling(model_name, disagg_server_config, ctx_worker_config,
             request_completion(model_name, "Hello, my name is", port=TEST_PORT)
 
         # add gen2, the request should succeed
-        gen_worker2 = run_gen_worker(model_name, gen_worker_config,
-                                     TEST_PORT + 201)
+        gen_worker2 = run_gen_worker(model_name, worker_config, TEST_PORT + 201)
         await wait_for_worker_ready(TEST_PORT + 201)
-        await asyncio.sleep(4)
+        await asyncio.sleep(INACTIVE_TIMEOUT + 1)
         verify_cluster_info(True, 1, 1)
 
         response = request_completion(model_name,
                                       "The capital of France is",
                                       port=TEST_PORT)
         print(response)
+        response_text = response.choices[0].text
         assert len(response.choices[0].text) >= 1
 
         # kill ctx1, the request should fail
         terminate(ctx_worker1)
-        await asyncio.sleep(4)
+        await asyncio.sleep(INACTIVE_TIMEOUT + 1)
         verify_cluster_info(False, 0, 1)
         with pytest.raises(Exception):
             request_completion(model_name,
                                "The capital of France is",
                                port=TEST_PORT)
 
-        # restart ctx1 with the same port, the request should succeed
-        ctx_worker2 = run_ctx_worker(model_name, ctx_worker_config,
-                                     TEST_PORT + 100)
+        # restart ctx1 and gen1 with the same port, we have 1 ctx and 2 gens now
+        ctx_worker1 = run_ctx_worker(model_name, worker_config, TEST_PORT + 100)
+        gen_worker1 = run_gen_worker(model_name, worker_config, TEST_PORT + 200)
         await wait_for_worker_ready(TEST_PORT + 100)
-        await asyncio.sleep(4)
-        verify_cluster_info(True, 1, 1)
+        await wait_for_worker_ready(TEST_PORT + 200)
+        await asyncio.sleep(INACTIVE_TIMEOUT + 1)
+        verify_cluster_info(True, 1, 2)
 
-        response = request_completion(model_name,
-                                      "The capital of France is",
-                                      port=TEST_PORT)
-        print(response)
+        # send 10 requests, the responses should be generated by the different gen servers
+        for i in range(10):
+            response = request_completion(model_name,
+                                          "The capital of France is",
+                                          port=TEST_PORT)
+            assert response.choices[0].text == response_text
+            print(response)
     finally:
         terminate(ctx_worker1)
         terminate(gen_worker1)
         terminate(disagg_server)
         terminate(gen_worker2)
-        terminate(ctx_worker2)
 
 
 @pytest.mark.asyncio(loop_scope="module")
 @pytest.mark.timeout(300)
 async def test_disagg_server_restart(model_name, disagg_server_config,
-                                     ctx_worker_config, gen_worker_config):
+                                     worker_config):
     try:
         # initial cluster, 1 ctx, 1 gen, request should succeed
-        ctx_worker1 = run_ctx_worker(model_name, ctx_worker_config,
-                                     TEST_PORT + 100)
-        gen_worker1 = run_gen_worker(model_name, gen_worker_config,
-                                     TEST_PORT + 200)
+        ctx_worker1 = run_ctx_worker(model_name, worker_config, TEST_PORT + 100)
+        gen_worker1 = run_gen_worker(model_name, worker_config, TEST_PORT + 200)
         disagg_server = run_disagg_server(disagg_server_config, TEST_PORT)
         await wait_for_disagg_server_ready(TEST_PORT)
         verify_cluster_info(True, 1, 1)
@@ -289,7 +292,7 @@ async def test_disagg_server_restart(model_name, disagg_server_config,
 
         # kill disagg server, the request should fail
         terminate(disagg_server)
-        await asyncio.sleep(5)
+        await asyncio.sleep(INACTIVE_TIMEOUT + 1)
         with pytest.raises(Exception):
             verify_cluster_info(False, 1, 1, expected_code=500)
 

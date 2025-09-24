@@ -237,9 +237,6 @@ class ClusterWorker:
         while not self._stop:
             remaining_time = self._config.heartbeat_interval - (
                 key_time() - self._last_heartbeat)
-            logger.info(
-                f"Worker {self.worker_info.worker_id} heartbeat remaining time: {remaining_time}"
-            )
             if remaining_time > 0:
                 await asyncio.sleep(remaining_time)
             self._last_heartbeat = key_time()
