@@ -48,6 +48,9 @@ class ClusterManager:
         self._current_gen_workers = {}
         self._watch_handle = None
 
+    async def start(self):
+        await self._cluster_storage.start()
+
     async def cluster_info(self) -> dict:
         async with self._lock:
             return {
@@ -93,11 +96,16 @@ class ClusterManager:
         events = await self._watch_handle.drain()
         worker_events = []
         for event in events:
-            worker_info = self._parse_worker_info(event.storage_item.value)
-            need_notify_event = await self._update_workers(
-                worker_info, event.event_type)
-            if need_notify_event:
-                worker_events.append((worker_info, event.event_type))
+            try:
+                worker_info = self._parse_worker_info(event.storage_item.value)
+                need_notify_event = await self._update_workers(
+                    worker_info, event.event_type)
+                if need_notify_event:
+                    worker_events.append((worker_info, event.event_type))
+            except Exception:
+                logger.error(
+                    f"Error parsing worker info: {event.storage_item.value}")
+                break
         return worker_events
 
     def _log_cluster_status(self, worker_info: WorkerInfo, change_event: str):
@@ -144,8 +152,12 @@ class ClusterManager:
             return need_notify_event
 
     def _parse_worker_info(self, worker_info: str) -> WorkerInfo:
-        worker_info = WorkerInfo(**json.loads(worker_info))
-        worker_info.role = ServerRole(worker_info.role)
+        try:
+            worker_info = WorkerInfo(**json.loads(worker_info))
+            worker_info.role = ServerRole(worker_info.role)
+        except Exception as e:
+            logger.error(f"Error parsing worker info: {worker_info}")
+            raise e
         return worker_info
 
     async def is_ready(self) -> bool:

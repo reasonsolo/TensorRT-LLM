@@ -273,6 +273,9 @@ async def test_service_discovery(model_name, disagg_server_config,
         terminate(gen_worker2)
 
 
+@pytest.mark.parametrize("router",
+                         ["round_robin", "load_balancing", "kv_cache_aware"],
+                         indirect=True)
 @pytest.mark.asyncio(loop_scope="module")
 @pytest.mark.timeout(300)
 async def test_disagg_server_restart(model_name, disagg_server_config,

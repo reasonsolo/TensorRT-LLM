@@ -1,4 +1,7 @@
+import asyncio
 import contextlib
+import subprocess
+import tempfile
 import threading
 import time
 
@@ -6,18 +9,26 @@ import pytest
 import uvicorn
 from fastapi import FastAPI
 
-from tensorrt_llm.serve.cluster_storage import (HttpClusterStorageClient,
-                                                HttpClusterStorageServer,
+from tensorrt_llm.serve.cluster_storage import (HttpClusterStorageServer,
                                                 StorageItem, WatchEvent,
-                                                WatchEventType)
+                                                WatchEventType,
+                                                create_cluster_storage,
+                                                create_cluster_storage_client)
 
 pytest_async_module = pytest.mark.asyncio(loop_scope="module")
+pytest_ignore_tleak = pytest.mark.threadleak(enabled=False)
+
+_counter = 0
+
+
+# generate unique keys so that tests can run without affecting each other
+def gen_key(prefix):
+    global _counter
+    _counter += 1
+    return f"{prefix}_{_counter}"
 
 
 class Server(uvicorn.Server):
-
-    def install_signal_handlers(self):
-        pass
 
     @contextlib.contextmanager
     def run_in_thread(self):
@@ -32,109 +43,173 @@ class Server(uvicorn.Server):
             thread.join()
 
 
-TEST_PORT = 26817  # some random port
+timeout = pytest.mark.timeout
 
 
-@pytest.fixture(scope="module")
-def storage_server():
-    app = FastAPI()
-    cluster_storage = HttpClusterStorageServer("", "", app)
-    server = Server(
-        uvicorn.Config(app=app,
-                       host="0.0.0.0",
-                       port=TEST_PORT,
-                       log_level="debug"))
-    with server.run_in_thread():
-        yield cluster_storage
-
-
-@pytest.fixture(scope="function")
+@pytest.fixture
 @pytest.mark.asyncio(loop_scope="function")
-async def storage_client():
-    return HttpClusterStorageClient(f"http://localhost:{TEST_PORT}", "test")
+async def storage_client(storage_server):
+    _, cluster_uri = storage_server
+    return create_cluster_storage_client(cluster_uri, "test")
 
 
-@pytest_async_module
-async def test_set(storage_server, storage_client):
-    client = await storage_client
-    assert await client.set("test_key", "test_value", overwrite_if_exists=True)
-    assert await client.get("test_key") == "test_value"
+# storage server client is the server itself in HTTP tests
+@pytest.fixture
+def storage_server_client(storage_server):
+    _, cluster_uri = storage_server
+    yield create_cluster_storage(cluster_uri, "test")
 
 
-@pytest_async_module
-async def test_get(storage_server, storage_client):
-    client = await storage_client
-    assert await client.set("test_key", "test_value", overwrite_if_exists=True)
-    assert await client.get("test_key") == "test_value"
+@pytest.mark.usefixtures("storage_client", "storage_server_client")
+class TestClusterStorage:
+    __test__ = False
+
+    @timeout(5)
+    @pytest_async_module
+    async def test_set(self, storage_server, storage_client):
+        client = await storage_client
+        assert await client.set("test_key",
+                                "test_value",
+                                overwrite_if_exists=True)
+        assert await client.get("test_key") == "test_value"
+
+    @timeout(5)
+    @pytest_async_module
+    async def test_get(self, storage_server, storage_client):
+        client = await storage_client
+        assert await client.set("test_key",
+                                "test_value",
+                                overwrite_if_exists=True)
+        assert await client.get("test_key") == "test_value"
+
+    @timeout(5)
+    @pytest_async_module
+    async def test_expire(self, storage_server, storage_client):
+        client = await storage_client
+        assert await client.set("test_key",
+                                "test_value",
+                                overwrite_if_exists=True,
+                                ttl=2)
+        assert await client.get("test_key") == "test_value"
+        time.sleep(1)
+        assert await client.get("test_key") == "test_value"
+        time.sleep(2)
+        assert await client.get("test_key") is None
+
+    @timeout(5)
+    @pytest_async_module
+    async def test_get_keys(self, storage_server, storage_client):
+        client = await storage_client
+        keys = [gen_key("test_key_unique") for _ in range(3)]
+        for key in keys:
+            assert await client.set(key,
+                                    "test_value1",
+                                    overwrite_if_exists=True)
+
+        answer_keys = await client.get_keys("test_key_unique")
+        assert set(keys) == set(answer_keys)
+        answer_keys = await client.get_keys(keys[0])
+        assert answer_keys == [keys[0]]
+        answer_keys = await client.get_keys(keys[1])
+        assert answer_keys == [keys[1]]
+
+    @pytest_ignore_tleak
+    @pytest_async_module
+    @timeout(5)
+    async def test_watch(self, storage_server_client, storage_client):
+        await storage_client
+        item1 = StorageItem(key=gen_key("test_key"), value="test_value1")
+        event_queue = await storage_server_client.watch("test_key")
+        await storage_server_client.set(key=item1.key, value=item1.value)
+        await asyncio.sleep(1)
+        watch_events = await event_queue.drain()
+        assert watch_events == [
+            WatchEvent(storage_item=item1, event_type=WatchEventType.SET)
+        ]
+        assert await storage_server_client.get(item1.key) == item1.value
+
+    @pytest_ignore_tleak
+    @pytest_async_module
+    @timeout(10)
+    async def test_watch_multiple(self, storage_server_client):
+        item1 = StorageItem(key=gen_key("test_key"), value="test_value1")
+        item2 = StorageItem(key=gen_key("test_key"), value="test_value2")
+        event_queue = await storage_server_client.watch("test_key")
+        await storage_server_client.set(key=item1.key, value=item1.value)
+        await storage_server_client.set(key=item2.key, value=item2.value)
+        await asyncio.sleep(1)
+        watch_events = await event_queue.drain()
+        assert len(watch_events) == 2
+        keys = set([event.storage_item.key for event in watch_events])
+        assert keys == {item1.key, item2.key}
+        assert set([event.event_type
+                    for event in watch_events]) == {WatchEventType.SET}
+
+    @pytest_ignore_tleak
+    @pytest_async_module
+    @timeout(10)
+    async def test_watch_set_and_delete(self, storage_server_client):
+        item1 = StorageItem(key=gen_key("test_key"), value="test_value1")
+        item2 = StorageItem(key=gen_key("test_key"), value="test_value2")
+        item3 = StorageItem(key=gen_key("test_key"), value="test_value3")
+        event_queue = await storage_server_client.watch("test_key")
+        await storage_server_client.set(key=item1.key, value=item1.value)
+        await storage_server_client.set(key=item2.key, value=item2.value)
+        await asyncio.sleep(1)
+        watch_events = await event_queue.drain()
+        assert len(watch_events) == 2
+        assert set([event.storage_item.key
+                    for event in watch_events]) == {item1.key, item2.key}
+        assert set([event.event_type
+                    for event in watch_events]) == {WatchEventType.SET}
+
+        event_queue = await storage_server_client.watch("test_key")
+        await storage_server_client.delete(item1.key)
+        await storage_server_client.set(key=item3.key, value=item3.value)
+        await asyncio.sleep(1)
+        watch_events = await event_queue.drain()
+        assert len(watch_events) == 2
+        assert set([event.storage_item.key
+                    for event in watch_events]) == {item1.key, item3.key}
+        assert set([event.event_type for event in watch_events
+                    ]) == {WatchEventType.DELETE, WatchEventType.SET}
 
 
-@pytest_async_module
-async def test_expire(storage_server, storage_client):
-    client = await storage_client
-    assert await client.set("test_key", "test_value", overwrite_if_exists=True)
-    assert await client.expire("test_key", 2)
-    assert await client.get("test_key") == "test_value"
-    time.sleep(1)
-    assert await client.get("test_key") == "test_value"
-    time.sleep(2)
-    assert await client.get("test_key") is None
+def http_server_storage(port):
+    cluster_storage = HttpClusterStorageServer("", "")
+
+    @contextlib.asynccontextmanager
+    async def lifespan(app: FastAPI):
+        cluster_storage.start()
+        yield
+
+    app = FastAPI(lifespan=lifespan)
+    cluster_storage.add_routes(app)
+    server = Server(
+        uvicorn.Config(app=app, host="localhost", port=port, log_level="info"))
+    return server, cluster_storage
 
 
-@pytest.fixture(scope="function")
-def dummy_storage_server():
-    return HttpClusterStorageServer("", "", FastAPI())
+class TestHttpClusterStorage(TestClusterStorage):
+    __test__ = True
+
+    @pytest.fixture(scope="class")
+    def storage_server(self):
+        port = 18000
+        server, cluster_storage = http_server_storage(port)
+        with server.run_in_thread():
+            yield cluster_storage, f"http://localhost:{port}"
 
 
-@pytest_async_module
-async def test_watch(dummy_storage_server, storage_client):
-    item1 = StorageItem(key="test_key1", value="test_value1")
+class TestEtcdClusterStorage(TestClusterStorage):
+    __test__ = True
 
-    event_queue = await dummy_storage_server.watch("test_key")
-    await storage_client
-    await dummy_storage_server._set_storage(item1)
-    watch_event = await event_queue.drain()
-    assert watch_event == [
-        WatchEvent(storage_item=item1, event_type=WatchEventType.SET)
-    ]
-    assert await dummy_storage_server._get_storage("test_key1") == "test_value1"
-
-
-@pytest_async_module
-async def test_watch_multiple(dummy_storage_server):
-    item1 = StorageItem(key="test_key1", value="test_value1")
-    item2 = StorageItem(key="test_key2", value="test_value2")
-    event_queue = await dummy_storage_server.watch("test_key")
-    await dummy_storage_server._set_storage(item1)
-    await dummy_storage_server._set_storage(item2)
-    watch_events = await event_queue.drain()
-    assert len(watch_events) == 2
-    keys = set([event.storage_item.key for event in watch_events])
-    assert keys == {"test_key1", "test_key2"}
-    assert set([event.event_type
-                for event in watch_events]) == {WatchEventType.SET}
-
-
-@pytest_async_module
-async def test_watch_set_and_delete(dummy_storage_server):
-    item1 = StorageItem(key="test_key1", value="test_value1")
-    item2 = StorageItem(key="test_key2", value="test_value2")
-    item3 = StorageItem(key="test_key3", value="test_value3")
-    event_queue = await dummy_storage_server.watch("test_key")
-    await dummy_storage_server._set_storage(item1)
-    await dummy_storage_server._set_storage(item2)
-    watch_events = await event_queue.drain()
-    assert len(watch_events) == 2
-    assert set([event.storage_item.key
-                for event in watch_events]) == {"test_key1", "test_key2"}
-    assert set([event.event_type
-                for event in watch_events]) == {WatchEventType.SET}
-
-    event_queue = await dummy_storage_server.watch("test_key")
-    await dummy_storage_server._delete_storage(item1.key)
-    await dummy_storage_server._set_storage(item3)
-    watch_events = await event_queue.drain()
-    assert len(watch_events) == 2
-    assert set([event.storage_item.key
-                for event in watch_events]) == {"test_key1", "test_key3"}
-    assert set([event.event_type for event in watch_events
-                ]) == {WatchEventType.DELETE, WatchEventType.SET}
+    @pytest.fixture(scope="class")
+    def storage_server(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.etcd = subprocess.Popen(
+                ["etcd", "--data-dir", temp_dir, "--log-level", "debug"])
+            time.sleep(2)  # wait for etcd to start
+            yield self.etcd, "etcd://localhost:2379"
+        self.etcd.kill()
+        self.etcd.wait()

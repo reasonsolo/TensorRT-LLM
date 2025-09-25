@@ -24,8 +24,7 @@ from tensorrt_llm.llmapi.disagg_utils import (DisaggServerConfig,
                                               get_ctx_gen_server_urls)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.auto_scaling import ClusterManager
-from tensorrt_llm.serve.cluster_storage import (HttpClusterStorageServer,
-                                                WatchEventType,
+from tensorrt_llm.serve.cluster_storage import (WatchEventType,
                                                 create_cluster_storage)
 from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
@@ -112,10 +111,9 @@ class OpenAIDisaggServer:
                 timeout=aiohttp.ClientTimeout(total=req_timeout_secs))
 
             if self.cluster_manager:
+                await self.cluster_manager.start()
                 await self.cluster_manager.watch_workers()
                 self._update_worker_task = asyncio.create_task(self._update_router_by_watch_events())
-                if isinstance(self.cluster_storage, HttpClusterStorageServer):
-                    self.cluster_storage.start_checking_expired()
 
             logger.info("Waiting for context and generation servers to be ready")
             await self.wait_for_servers_ready(server_start_timeout_secs)
