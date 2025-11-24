@@ -139,7 +139,7 @@ CCACHE_DIR        ?= $(CODE_DIR)/cpp/.ccache
 CONAN_DIR         ?= $(CODE_DIR)/cpp/.conan
 USER_CACHE_DIR    ?= $(shell readlink -f "${HOME_DIR}/.cache")
 RUN_CMD           ?=
-CONTAINER_NAME    ?= tensorrt_llm
+CONTAINER_NAME    ?= tensorrt_llm1_bug5
 WORK_DIR          ?= $(CODE_DIR)
 DOCKER_PULL       ?= 0
 
@@ -157,7 +157,6 @@ endif
     		$(GPU_OPTS) \
     		--volume $(SOURCE_DIR):$(CODE_DIR) \
     		$(EXTRA_VOLUMES) \
-    		$(if $(and $(filter 1,$(LOCAL_USER)),$(shell [ -w "$(USER_CACHE_DIR)" ] && echo 1)),--volume $(USER_CACHE_DIR):/home/$(USER_NAME)/.cache:rw) \
     		--env "CCACHE_DIR=$(CCACHE_DIR)" \
     		--env "CCACHE_BASEDIR=$(CODE_DIR)" \
     		--env "CONAN_HOME=$(CONAN_DIR)" \
@@ -206,8 +205,7 @@ ubuntu22_%: BASE_TAG = 13.0.1-devel-ubuntu22.04
 
 trtllm_%: STAGE = release
 trtllm_%: PUSH_TO_STAGING := 0
-trtllm_%: DEVEL_IMAGE = $(shell \
-    if [ "$(PLATFORM)" = "amd64" ]; then \
+trtllm_%: DEVEL_IMAGE = $(1_bug5   if [ "$(PLATFORM)" = "amd64" ]; then \
         . ../jenkins/current_image_tags.properties && echo $$LLM_DOCKER_IMAGE; \
     elif [ "$(PLATFORM)" = "arm64" ]; then \
         . ../jenkins/current_image_tags.properties && echo $$LLM_SBSA_DOCKER_IMAGE; \
