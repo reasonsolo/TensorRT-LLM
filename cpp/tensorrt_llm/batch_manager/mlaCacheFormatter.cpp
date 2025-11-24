@@ -402,18 +402,6 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
 
         std::optional<int> cacheBufferId = std::nullopt;
 
-        auto reorderConns = [&](auto const& conns)
-        {
-            auto const selfTPRank = selfIdx % selfConfig.getParallelConfig().mTensorParallelism;
-            std::vector<std::pair<size_t, size_t>> reorderConnsAndIdxs;
-            for (size_t i = selfTPRank; i < conns.size() + selfTPRank; i++)
-            {
-                size_t idx = i % conns.size();
-                reorderConnsAndIdxs.push_back(std::make_pair(conns[idx], idx));
-            }
-            return reorderConnsAndIdxs;
-        };
-
         if (common::getEnvTryZCopyForKVCacheTransfer()
             && destConfig.getParallelConfig().mPipelineParallelism
                 == selfConfig.getParallelConfig().mPipelineParallelism)
@@ -539,10 +527,9 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
                 if (!common::getEnvEnableReceiveKVCacheParallel())
                 {
 
-                    auto reorderConnsAndIdxs = reorderConns(pickUpConnections);
-                    for (auto const& [conn, idx] : reorderConnsAndIdxs)
+                    for (size_t i = 0; i < pickUpConnections.size(); i++)
                     {
-                        recvBufferFun(deviceId, idx);
+                        recvBufferFun(deviceId, i);
                     }
                 }
                 else

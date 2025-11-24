@@ -32,6 +32,7 @@
 #include <future>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <unordered_map>
 
 namespace tensorrt_llm::batch_manager
@@ -118,6 +119,7 @@ void TransferSession::appendMeasure(LlmRequest::TimePoint start, LlmRequest::Tim
 {
     if (mTimes)
     {
+        std::lock_guard<decltype(mTimes->mMutex)> lock(mTimes->mMutex);
         mTimes->measures.emplace_back(Measure{start, end, size});
     }
 }

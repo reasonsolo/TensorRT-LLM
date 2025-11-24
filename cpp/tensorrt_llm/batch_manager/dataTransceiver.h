@@ -21,6 +21,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include <mutex>
 
 #include "tensorrt_llm/batch_manager/cacheTransceiver.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
@@ -76,6 +77,7 @@ public:
 
     struct KVCacheTimes
     {
+        std::mutex mMutex;
         std::array<LlmRequest::TimePoint, kTimeCounts> times;
         std::vector<Measure> measures;
     };
