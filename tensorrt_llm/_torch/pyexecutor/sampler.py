@@ -622,6 +622,7 @@ class TorchSampler(Sampler):
         self.max_tokens = args.max_total_draft_tokens + 1
         assert args.max_beam_width == MAX_BEAM_WIDTH, "TorchSampler only supports beam_width = 1"
         self.max_num_sequences = args.max_num_sequences
+        self.num_accepted_draft_tokens = 0
 
         # AutoDeploy build creates the sampler in inference mode,
         # which would disallow in-place mutating of new_tokens.

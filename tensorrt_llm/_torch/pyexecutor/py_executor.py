@@ -222,6 +222,7 @@ class PyExecutor:
         self.previous_batch: Optional[BatchState] = None
         self.has_previous_draft_tokens = False
         self.num_scheduled_requests: int = 0
+        self.num_accepted_draft_tokens: int = 0
         self.benchmark_req_queues_size = int(
             os.environ.get("TLLM_BENCHMARK_REQ_QUEUES_SIZE", 0))
         self._disable_mpi = mpi_disabled()
@@ -554,7 +555,7 @@ class PyExecutor:
                 torch.cuda.cudart().cudaProfilerStop()
                 enabled = False
 
-            if start_time is not None and self.print_log and self.dist.rank == 0:
+            if start_time is not None and self.print_log: # and self.dist.rank == 0:
                 end_time = time.time()
                 if it % 2 == 0:
                     end_event_1.record()
@@ -586,7 +587,9 @@ class PyExecutor:
                     f"prev_device_step_time = {prev_device_step_time}, "
                     f"timestamp = {formatted_timestamp}, "
                     f"num_scheduled_requests: {self.num_scheduled_requests}, "
+                    f"num_accepted_draft_tokens: {self.num_accepted_draft_tokens}, "
                     f"states = {self.model_engine.iter_states}")
+                self.num_accepted_draft_tokens = 0
 
             it += 1
 
@@ -2121,6 +2124,7 @@ class PyExecutor:
                          resource_manager: Optional[ResourceManager] = None):
         try:
             self.sampler.update_requests(sample_state, resource_manager)
+            self.num_accepted_draft_tokens += self.sampler.num_accepted_draft_tokens
         except Exception as e:
             traceback.print_exc()
             error_msg = str(e)

@@ -261,6 +261,7 @@ class MTPSampler(TorchSampler):
             resource_manager: Optional[BaseResourceManager] = None) -> None:
         # resource_manager will be not be used in this function
         assert isinstance(state, SampleStateMTP)
+        self.num_accepted_draft_tokens = 0
 
         state.sampler_event.synchronize()
         new_tokens = state.host.new_tokens.tolist()
@@ -286,6 +287,7 @@ class MTPSampler(TorchSampler):
                         req, new_token, max_seq_len=self.max_seq_len):
                     break
             req.py_num_accepted_draft_tokens = num_new_tokens - 1
+            self.num_accepted_draft_tokens += req.py_num_accepted_draft_tokens
             req.py_rewind_len = self.draft_len - req.py_num_accepted_draft_tokens
             self._request_common_handling(req, next_draft_tokens_list)
 
