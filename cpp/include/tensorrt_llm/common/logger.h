@@ -23,6 +23,7 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/stringUtils.h"
+#include "tensorrt_llm/common/timestampUtils.h"
 
 namespace tensorrt_llm::common
 {
@@ -123,14 +124,19 @@ private:
         TLLM_THROW("Unknown log level: %d", level);
     }
 
+    static inline std::string getTimeString()
+    {
+        return getCurrentTimestamp();
+    }
+
     static inline std::string getPrefix(Level const level)
     {
-        return fmtstr("%s[%s] ", kPREFIX, getLevelName(level));
+        return fmtstr("%s[%s][%s] ", kPREFIX, getTimeString().c_str(), getLevelName(level));
     }
 
     static inline std::string getPrefix(Level const level, int const rank)
     {
-        return fmtstr("%s[%s][%d] ", kPREFIX, getLevelName(level), rank);
+        return fmtstr("%s[%s][%s][%d] ", kPREFIX, getTimeString().c_str(), getLevelName(level), rank);
     }
 };
 

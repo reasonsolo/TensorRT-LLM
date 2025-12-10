@@ -1436,7 +1436,7 @@ public:
 
     void setState(LlmRequestState state)
     {
-        TLLM_LOG_DEBUG("Set request %lu from state %d to %d", mRequestId, mState, state);
+        TLLM_LOG_INFO("Set request %lu from state %d to %d", mRequestId, mState, state);
         mState = state;
     }
 

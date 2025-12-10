@@ -1020,6 +1020,8 @@ class PyExecutor:
 
     def _prepare_and_schedule_batch(self):
         new_requests = self._fetch_and_activate_new_requests()
+        if len(new_requests) > 0:
+            logger.info(f"new_requests: {[req.py_request_id for req in new_requests]}")
         if self.should_stop_processing:
             return None, None
 
@@ -1371,6 +1373,8 @@ class PyExecutor:
                             can_forward = True
 
                 self._pause_requests(scheduled_batch.paused_requests)
+                if len(scheduled_batch.generation_requests) > 0:
+                    logger.info(f"scheduled_gen_batch: {[req.py_request_id for req in scheduled_batch.generation_requests]}")
 
                 can_queue = self._can_queue(scheduled_batch)
                 if can_queue:

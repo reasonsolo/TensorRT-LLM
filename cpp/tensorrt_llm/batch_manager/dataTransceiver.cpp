@@ -334,6 +334,7 @@ public:
 
     void release(LlmRequest::RequestIdType requestId)
     {
+        TLLM_LOG_INFO("Releasing request %ld", requestId);
         std::unique_lock<std::mutex> lk(mMtxForMap);
         auto it = mRequestToSession.find(requestId);
         TLLM_CHECK(it != mRequestToSession.end());
@@ -410,7 +411,11 @@ public:
             session = std::addressof(it->second);
         }
         session->setLlmRequest(llmRequest);
+        TLLM_LOG_INFO("Start formatting request %ld", llmRequest.mRequestId);
         mFormatter->format(*session);
+        TLLM_LOG_INFO("Formatted request %ld time cost: %f seconds", llmRequest.mRequestId,
+            std::chrono::duration<double>(LlmRequest::getSteadyClockNow() - llmRequest.getKvCacheTransferStart())
+                .count());
         llmRequest.setKvCacheTransferEnd(LlmRequest::getSteadyClockNow());
     }
 
@@ -423,6 +428,7 @@ public:
         if (it != mReadyResponses.end()
             && (!mCurrentRequest.has_value() || getCurrentRequestId() != llmRequest.mRequestId))
         {
+            TLLM_LOG_INFO("Cancelling request %ld", llmRequest.mRequestId);
             mCancelledRequests.insert(llmRequest.mRequestId);
             isCancelled = true;
         }
@@ -503,6 +509,7 @@ private:
                 resp = std::move(resource.mSendQueue.front());
                 resource.mSendQueue.pop_front();
             }
+            TLLM_LOG_INFO("Sending data for request %ld, remain send count: %ld", resp.mRequest->mRequestId, resource.mSendQueue.size());
             sendAndRemoveResponse(resp.mRequest->mRequestId, std::move(resp));
         }
     }
@@ -514,6 +521,7 @@ private:
             TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
             sendSync(*resp.mRequest);
             release(id);
+            TLLM_LOG_INFO("Response for request %ld sent and removed", id);
             resp.mPromise.set_value();
         }
         catch (tensorrt_llm::common::RequestSpecificException const& e)
@@ -532,6 +540,7 @@ private:
     void asyncSendAndRemoveResponse(RequestIdType id, Response resp) noexcept
     {
         std::unique_lock lk(mAsyncSendResource.mMtxForQueue);
+        TLLM_LOG_INFO("Adding response for request %ld to async send queue, remain send count: %ld", id, mAsyncSendResource.mSendQueue.size());
         mAsyncSendResource.mSendQueue.emplace_back(std::move(resp));
         mAsyncSendResource.mCVforQueue.notify_one();
     }
@@ -558,6 +567,7 @@ private:
 
             if (isReady)
             {
+                TLLM_LOG_INFO("Sending response for ready request %ld, remain send count: %ld", reqId, count);
                 if (dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager) != nullptr)
                 {
                     // our nixl impl seems only support recv and send in the same thread
@@ -578,6 +588,7 @@ private:
                 // not be removed from mCancelledRequests. This should be handled by timeout.
                 auto it = mReadyResponses.find(mCurrentRequest.value());
                 TLLM_CHECK(it != mReadyResponses.end());
+                TLLM_LOG_INFO("Removing response for request %ld, remain send count: %ld", mCurrentRequest.value(), mRemainSendCount[mCurrentRequest.value()]);
                 {
                     std::scoped_lock lkResp(mSenderMutex);
                     mReadyResponses.erase(it);
@@ -621,11 +632,10 @@ private:
                     {
                         std::scoped_lock lk(mSenderMutex);
                         mCurrentRequest = reqId;
-                    }
-
-                    if (mRemainSendCount.find(reqId) == mRemainSendCount.end())
-                    {
-                        mRemainSendCount[reqId] = getCounterpartsCount(reqId);
+                        if (mRemainSendCount.find(reqId) == mRemainSendCount.end())
+                        {
+                            mRemainSendCount[reqId] = getCounterpartsCount(reqId);
+                        }
                     }
                 }
                 auto it = getCurrentResponse();
@@ -903,6 +913,7 @@ public:
     {
         std::ostringstream oss;
         RequestInfo::serialize(info, oss);
+        TLLM_LOG_INFO("Send serialized request info for request %ld", info.getRequestId());
         auto const& serializedInfo = oss.str();
         std::size_t const infoSize = serializedInfo.size();
         TransceiverTag::Id id{TransceiverTag::Id::REQUEST_SEND};
@@ -988,9 +999,11 @@ private:
             llmRequest.getContextPhaseParams().value().getReqId());
         llmRequest.setKvCacheTransferStart(std::chrono::steady_clock::now());
         TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
+        TLLM_LOG_INFO("Request info sent for request %ld", llmRequest.mRequestId);
         auto session = sendRequestInfo(llmRequest);
         session.setTime(TransferSession::kTimeRequestInfo);
         bool isReady = receiveReadySignal(session);
+        TLLM_LOG_INFO("Request info received and ready signal received for request %ld", llmRequest.mRequestId);
         if (!isReady)
         {
             // Reuse the error state for the cancelled request.
@@ -1000,6 +1013,7 @@ private:
         }
         receiveSync(session);
         llmRequest.setKvCacheTransferEnd(std::chrono::steady_clock::now());
+        TLLM_LOG_INFO("Received sync finish for request %ld", llmRequest.mRequestId);
 
         TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
             "End calling requestSync for request ID: %zu, context request ID: %zu.", llmRequest.mRequestId,
