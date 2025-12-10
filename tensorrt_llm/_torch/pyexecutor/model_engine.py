@@ -283,7 +283,8 @@ class PyTorchModelEngine(ModelEngine):
                     enable_piecewise_cuda_graph=self.
                     _torch_compile_piecewise_cuda_graph,
                     capture_num_tokens=self._piecewise_cuda_graph_num_tokens,
-                    max_num_streams=torch_compile_max_num_streams)
+                    max_num_streams=torch_compile_max_num_streams,
+                    mapping=self.mapping)
                 if isinstance(self.model, DecoderModelForCausalLM):
                     self.model.model = torch.compile(
                         self.model.model,
@@ -2642,7 +2643,7 @@ class PyTorchModelEngine(ModelEngine):
             # attn_metadata now depends on spec_metadata since it determines the shape/content of spec_dec parameter Tensors
             is_spec_dec_mode = spec_metadata.spec_dec_mode.attention_need_spec_dec_mode(
                 spec_resource_manager, self.is_draft_model, self.attn_backend,
-                self.model_is_wrapped, spec_metadata.is_spec_dec_tree)
+                self.model_is_wrapped)
             attn_metadata.update_spec_dec_param(
                 batch_size=scheduled_requests.batch_size,
                 is_spec_decoding_enabled=is_spec_dec_mode,
@@ -2837,17 +2838,23 @@ class PyTorchModelEngine(ModelEngine):
         return {'mm_embeddings': mm_embeddings, 'logits': None}
 
     def _init_userbuffers(self, hidden_size):
-        if self.mapping.tp_size <= 1:
+        if self.mapping.tp_size <= 1 or self.mapping.pp_size > 1:
             return False
 
         # Disable UB for unsupported platforms
         if not ub.ub_supported():
             return False
-        use_nccl_symmetric = self.llm_args.allreduce_strategy == "NCCL_SYMMETRIC"
-        ub.initialize_userbuffers_manager(
-            self.mapping.tp_size, self.mapping.pp_size, self.mapping.cp_size,
-            self.mapping.rank, self.mapping.gpus_per_node,
-            hidden_size * self.max_num_tokens * 2, use_nccl_symmetric)
+        # NCCL_SYMMETRIC strategy no longer requires UserBuffer allocator initialization.
+        # It uses NCCLWindowAllocator from ncclUtils directly.
+        if self.llm_args.allreduce_strategy == "NCCL_SYMMETRIC":
+            # Skip UB initialization for NCCL_SYMMETRIC - it uses NCCLWindowAllocator directly
+            return False
+        ub.initialize_userbuffers_manager(self.mapping.tp_size,
+                                          self.mapping.pp_size,
+                                          self.mapping.cp_size,
+                                          self.mapping.rank,
+                                          self.mapping.gpus_per_node,
+                                          hidden_size * self.max_num_tokens * 2)
 
         return True
 
