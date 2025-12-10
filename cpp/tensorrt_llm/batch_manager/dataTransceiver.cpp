@@ -423,6 +423,7 @@ public:
         if (it != mReadyResponses.end()
             && (!mCurrentRequest.has_value() || getCurrentRequestId() != llmRequest.mRequestId))
         {
+            TLLM_LOG_DEBUG("Cancelling request %ld", llmRequest.mRequestId);
             mCancelledRequests.insert(llmRequest.mRequestId);
             isCancelled = true;
         }
@@ -503,6 +504,7 @@ private:
                 resp = std::move(resource.mSendQueue.front());
                 resource.mSendQueue.pop_front();
             }
+            TLLM_LOG_DEBUG("Sending data for request %ld, remain send count: %ld", resp.mRequest->mRequestId, resource.mSendQueue.size());
             sendAndRemoveResponse(resp.mRequest->mRequestId, std::move(resp));
         }
     }
@@ -558,6 +560,7 @@ private:
 
             if (isReady)
             {
+                TLLM_LOG_DEBUG("Sending response for ready request %ld, remain send count: %ld", reqId, count);
                 if (dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager) != nullptr)
                 {
                     // our nixl impl seems only support recv and send in the same thread
@@ -578,6 +581,7 @@ private:
                 // not be removed from mCancelledRequests. This should be handled by timeout.
                 auto it = mReadyResponses.find(mCurrentRequest.value());
                 TLLM_CHECK(it != mReadyResponses.end());
+                TLLM_LOG_DEBUG("Removing response for request %ld, remain send count: %ld", mCurrentRequest.value(), mRemainSendCount[mCurrentRequest.value()]);
                 {
                     std::scoped_lock lkResp(mSenderMutex);
                     mReadyResponses.erase(it);
@@ -621,11 +625,10 @@ private:
                     {
                         std::scoped_lock lk(mSenderMutex);
                         mCurrentRequest = reqId;
-                    }
-
-                    if (mRemainSendCount.find(reqId) == mRemainSendCount.end())
-                    {
-                        mRemainSendCount[reqId] = getCounterpartsCount(reqId);
+                        if (mRemainSendCount.find(reqId) == mRemainSendCount.end())
+                        {
+                            mRemainSendCount[reqId] = getCounterpartsCount(reqId);
+                        }
                     }
                 }
                 auto it = getCurrentResponse();
