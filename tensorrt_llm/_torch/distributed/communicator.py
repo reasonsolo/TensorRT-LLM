@@ -834,6 +834,10 @@ class PPCommNCCL:
 
         # NCCL send kernel in send_stream cannot be captured,
         # so we send in the current stream instead in CUDA graph cases.
+        logger.info(f"rank {self.mapping.pp_rank} to rank {dest} tensor {tensor.shape}")
+        self.nccl_comm.send(tensor, dest)
+        logger.info(f"rank {self.mapping.pp_rank} to rank {dest} tensor {tensor.shape} done")
+        return 
         if torch.cuda.is_current_stream_capturing():
             self.nccl_comm.send(tensor, dest)
             return
@@ -846,7 +850,10 @@ class PPCommNCCL:
     def recv(self, tensor: torch.Tensor, src: Optional[int] = None):
         if src is None:
             src = self.mapping.prev_pp_rank()
+        logger.info(f"rank {self.mapping.pp_rank} from rank {src} tensor {tensor.shape}")
         self.nccl_comm.recv(tensor, src)
+        logger.info(f"rank {self.mapping.pp_rank} from rank {src} tensor {tensor.shape} done")
+
 
 
 class PPCommTorch:

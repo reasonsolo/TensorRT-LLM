@@ -902,7 +902,8 @@ class PyExecutor:
 
     def _pp_schedule_and_propagate(self):
         """The first PP rank schedules the requests and propagates the result to all other PP ranks."""
-
+        if os.environ.get("TRTLLM_DISABLE_PP_SCHEDULE", None):
+            return self._schedule()
         # The first PP rank schedules the requests, other ranks receive the schedule result from the previous PP rank.
         if self.dist.is_first_pp_rank:
             scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
@@ -923,7 +924,7 @@ class PyExecutor:
                 with nvtx_range("wait_send_schedule_handler"):
                     self.send_schedule_handler.wait()
             with nvtx_range("send_schedule_to_next_pp"):
-                self.send_schedule_handler = self.dist.isend_object(
+                self.send_schedule_handler = self.dist.send_object(
                     serializable_schedule, self.dist.next_pp_rank,
                     PP_COMM_TAG_SCHEDULE_RESULT)
         return scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs
@@ -988,6 +989,7 @@ class PyExecutor:
 
                 # Fetch new requests from request queue
                 new_requests = self._fetch_and_activate_new_requests()
+                logger.info(f'get new request {[req.request_id for req in new_requests]}')
                 if self.should_stop_processing:
                     break
 
@@ -1003,10 +1005,16 @@ class PyExecutor:
                         get_new_active_requests_queue_latency())
 
                 self._pad_attention_dp_dummy_request()
+                logger.info(f'get new requests {len(new_requests)}')
 
                 # Stage 0: first PP rank schedules requests and propagates the result to all other PP ranks.
-                scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._pp_schedule_and_propagate(
-                )
+                try:
+                    scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._pp_schedule_and_propagate(
+                    )
+                except KeyError as e:
+                    logger.error(f'schedule pp batch failed')
+                    assert not self.dist.is_first_pp_rank
+                    break
                 if not self.dist.is_first_pp_rank:
                     # Retry until current rank can run first PP's schedule result.
                     self._pp_retry_until_can_schedule(scheduled_batch)
@@ -1027,7 +1035,7 @@ class PyExecutor:
 
                 self.num_scheduled_requests = scheduled_batch.batch_size
 
-                logger.debug(
+                logger.info(
                     f'iteration {self.iter_counter}, microbatch {microbatch_id}, '
                     f'has {len(self.active_requests)} active_requests, '
                     f'scheduled {len(scheduled_batch.context_requests)} context requests and '
@@ -2428,6 +2436,7 @@ class PyExecutor:
                 request_id=req_id,
                 error_msg=error_msg,
                 client_id=request.py_client_id)
+        logger.info(f'clear failed reuqests {[req.request_id for req in failed_requests]}')
         if requests is None:
             self.active_requests.clear()
         else:
@@ -2440,6 +2449,7 @@ class PyExecutor:
             self._terminate_request(request)
 
     def _terminate_request(self, request: LlmRequest):
+        logger.info(f'terminate request {request.request_id}')
         if self._disagg_pp_termination_handler is not None:
             self._disagg_pp_termination_handler.terminate(request)
         else:

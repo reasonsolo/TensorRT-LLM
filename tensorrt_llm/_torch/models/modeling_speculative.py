@@ -22,6 +22,7 @@ from ..utils import AuxStreamType
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM, TModel,
                              register_auto_model)
+from tensorrt_llm.logger import logger
 
 
 class Eagle3Attention(Attention):

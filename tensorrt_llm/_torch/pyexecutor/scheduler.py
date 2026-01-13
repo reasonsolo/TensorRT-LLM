@@ -104,19 +104,26 @@ class SerializableSchedulerOutput:
     ) -> Tuple[ScheduledRequests, RequestList, int]:
         id_to_request = {req.request_id: req for req in active_requests}
         scheduled_requests = ScheduledRequests()
-        scheduled_requests.context_requests = [
-            id_to_request[req_id] for req_id in self.context_requests
-        ]
-        scheduled_requests.generation_requests = [
-            id_to_request[req_id] for req_id in self.generation_requests
-        ]
-        scheduled_requests.paused_requests = [
-            id_to_request[req_id] for req_id in self.paused_requests
-        ]
-        fitting_disagg_gen_init_requests = [
-            id_to_request[req_id]
-            for req_id in self.fitting_disagg_gen_init_requests
-        ]
+        try:
+            scheduled_requests.context_requests = [
+                id_to_request[req_id] for req_id in self.context_requests
+            ]
+            scheduled_requests.generation_requests = [
+                id_to_request[req_id] for req_id in self.generation_requests
+            ]
+            scheduled_requests.paused_requests = [
+                id_to_request[req_id] for req_id in self.paused_requests
+            ]
+            fitting_disagg_gen_init_requests = [
+                id_to_request[req_id]
+                for req_id in self.fitting_disagg_gen_init_requests
+            ]
+        except KeyError as e:
+            import traceback
+            from tensorrt_llm.logger import logger
+            traceback.print_exc()
+            logger.error(f'active reqs: {[req.request_id for req in active_requests]}, ctx_req {self.context_requests}')
+            raise 
         return scheduled_requests, fitting_disagg_gen_init_requests, self.num_fitting_requests
 
 

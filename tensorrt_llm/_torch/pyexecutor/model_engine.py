@@ -189,6 +189,7 @@ class PyTorchModelEngine(ModelEngine):
             checkpoint_format=llm_args.checkpoint_format)
         self.input_processor_with_hash = create_input_processor_with_hash(
             self.input_processor)
+
         if model is None:
             lora_config: Optional[
                 LoraConfig] = None if is_draft_model else llm_args.lora_config

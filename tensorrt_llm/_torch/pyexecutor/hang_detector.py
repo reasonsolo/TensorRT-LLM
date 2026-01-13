@@ -2,6 +2,7 @@ import asyncio
 import threading
 from contextlib import contextmanager
 from typing import Callable, Optional
+import os
 
 from tensorrt_llm._utils import print_all_stacks
 from tensorrt_llm.logger import logger
@@ -11,7 +12,7 @@ class HangDetector:
     def __init__(
         self, timeout: Optional[int] = None, on_detected: Optional[Callable[[], None]] = None
     ):
-        self.timeout = timeout if timeout is not None else 300
+        self.timeout = int(os.environ.get("TLLM_HANG_DETECTOR_TIMEOUT", 60))
         assert self.timeout > 0, "timeout must be greater than 0"
         self.on_detected = on_detected or (lambda: None)
         self.task = None
