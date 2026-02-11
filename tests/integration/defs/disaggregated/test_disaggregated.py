@@ -209,6 +209,10 @@ def get_test_config(test_desc, example_dir, test_root):
         (2, f"{test_configs_root}/disagg_config_cancel_stress_test.yaml"),
         "cancel_stress_test_large":
         (8, f"{test_configs_root}/disagg_config_cancel_stress_test_large.yaml"),
+        "deepseek_v3_lite_fp8_stress":
+        (4,
+         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_stress.yaml"
+         ),
     }
 
     if test_desc not in config_map:
@@ -2182,12 +2186,18 @@ def test_disaggregated_gpt_oss_120b_harmony(disaggregated_test_root,
                             request_count=60000,
                             accuracy_threshold=0.42),
                  marks=(pytest.mark.skip_less_device(4), skip_pre_blackwell)),
+    pytest.param(TestConfig(model_path='DeepSeek-V3-Lite/fp8',
+                            test_desc='deepseek_v3_lite_fp8_stress',
+                            request_count=60000,
+                            accuracy_threshold=0.42),
+                 marks=(pytest.mark.skip_less_device(4), skip_pre_blackwell)),
 ],
                          ids=lambda x: x.test_desc)
-@pytest.mark.parametrize("concurrency", [512], ids=lambda x: f"conc{x}")
-@pytest.mark.parametrize("output_tokens", [1024],
+@pytest.mark.parametrize("concurrency", [512, 1024, 2048],
+                         ids=lambda x: f"conc{x}")
+@pytest.mark.parametrize("output_tokens", [1024, 128],
                          ids=lambda x: f"output{x//1000}k")
-@pytest.mark.parametrize("input_tokens", [8192],
+@pytest.mark.parametrize("input_tokens", [8192, 1024],
                          ids=lambda x: f"input{x//1000}k")
 def test_disaggregated_stress_test(disaggregated_test_root,
                                    disaggregated_example_root, llm_venv,

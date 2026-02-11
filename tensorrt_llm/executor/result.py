@@ -159,6 +159,13 @@ class CompletionOutput:
         return self.logprobs[self._last_logprobs_len:]
 
 
+def _validate_disaggregated_params(
+        req_disagg_params: Optional[DisaggregatedParams],
+        resp_disagg_params: Optional[DisaggregatedParams]) -> None:
+    if req_disagg_params is not None and req_disagg_params.request_type == "context_only":
+        assert resp_disagg_params is not None, f"Disaggregated params missing in context-only response, in request: {req_disagg_params}"
+
+
 class GenerationResultBase:
     ''' This holds the core logic of the GenerationResult class. '''
 
@@ -389,6 +396,9 @@ class GenerationResultBase:
                 # Generation only response has no disaggregated_params attached
                 if not disaggregated_params:
                     disaggregated_params = self.disaggregated_params
+
+                _validate_disaggregated_params(self.disaggregated_params,
+                                               disaggregated_params)
 
                 self._outputs[0].disaggregated_params = disaggregated_params
 

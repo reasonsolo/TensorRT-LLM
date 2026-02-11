@@ -1,0 +1,40 @@
+hostname: localhost
+port: 8999
+model: DeepSeek-V3-Lite/fp8
+backend: "pytorch"
+disable_overlap_scheduler: True
+context_servers:
+  num_instances: 1
+  tensor_parallel_size: 2
+  pipeline_parallel_size: 1
+  max_batch_size: 128
+  max_num_tokens: 8192
+  kv_cache_config:
+    enable_block_reuse: false
+    free_gpu_memory_fraction: 0.80
+    dtype: fp8
+  cache_transceiver_config:
+    backend: "NIXL"
+  moe_config:
+    backend: DEEPGEMM
+  urls:
+      - "localhost:8001"
+generation_servers:
+  num_instances: 1
+  tensor_parallel_size: 2
+  pipeline_parallel_size: 1
+  max_batch_size: 128
+  max_num_tokens: 1024
+  kv_cache_config:
+    enable_block_reuse: false
+    free_gpu_memory_fraction: 0.80
+    dtype: fp8
+  cuda_graph_config:
+    enable_padding: true
+    batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 768, 1024]
+  moe_config:
+    backend: DEEPGEMM
+  cache_transceiver_config:
+    backend: "NIXL"
+  urls:
+      - "localhost:8002"

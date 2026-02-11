@@ -10,10 +10,11 @@ from ..executor import (DetokenizedGenerationResultBase, GenerationResult,
                         GenerationResultBase)
 from ..executor.postproc_worker import PostprocArgs
 from ..executor.result import Logprob, TokenLogprobs
-from ..llmapi import SamplingParams
+from ..llmapi import DisaggregatedParams, SamplingParams
 from ..llmapi.reasoning_parser import (BaseReasoningParser,
                                        ReasoningParserFactory)
 from ..llmapi.tokenizer import TransformersTokenizer
+from ..logger import logger
 # yapf: disable
 from .chat_utils import make_tool_call_id
 from .harmony_adapter import (handle_non_streaming_response,
@@ -396,6 +397,7 @@ class CompletionPostprocArgs(PostprocArgs):
     prompt: Optional[str] = None
     return_logprobs: bool = False
     stream_options: Optional[StreamOptions] = None
+    disaggregated_params: Optional[DisaggregatedParams] = None
 
     @classmethod
     def from_request(cls, request: CompletionRequest):
@@ -403,6 +405,7 @@ class CompletionPostprocArgs(PostprocArgs):
             echo=request.echo,
             model=request.model,
             num_choices=request.n if request.n else 1,
+            disaggregated_params=request.disaggregated_params,
             stream_options=request.stream_options,
             detokenize=request.detokenize,
             return_logprobs=bool(request.logprobs),
@@ -516,6 +519,10 @@ def completion_response_post_processor(
             text = args.prompt + text
         disaggregated_params = to_disaggregated_params(
             output.disaggregated_params)
+        if args.disaggregated_params is not None and disaggregated_params is None and args.disaggregated_params.request_type == "context_only":
+            logger.error(
+                f"Disaggregated params missing in ctx-only response, request: {args.disaggregated_params}"
+            )
         choice = CompletionResponseChoice(
             text=text if args.detokenize else "",
             token_ids=None if args.detokenize else output.token_ids,
@@ -557,6 +564,7 @@ class ChatCompletionPostprocArgs(PostprocArgs):
                                 ChatCompletionNamedToolChoiceParam]]
     request_id: Optional[int] = None
     chat_template_kwargs: Optional[dict[str, Any]] = None
+    disaggregated_params: Optional[DisaggregatedParams] = None
 
     @classmethod
     def from_request(cls, request: ChatCompletionRequest):
@@ -565,6 +573,7 @@ class ChatCompletionPostprocArgs(PostprocArgs):
             tools=request.tools,
             tool_choice=request.tool_choice,
             chat_template_kwargs=request.chat_template_kwargs,
+            disaggregated_params=request.disaggregated_params,
         )
 
 
