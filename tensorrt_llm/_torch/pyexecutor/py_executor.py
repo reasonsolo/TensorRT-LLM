@@ -1279,7 +1279,7 @@ class PyExecutor:
                     self._prepare_disagg_gen_init(
                         fitting_disagg_gen_init_requests)
 
-                    if num_fitting_reqs == 0 and not fitting_disagg_gen_init_requests:
+                    if num_fitting_reqs == 0 and not fitting_disagg_gen_init_requests and self.iter_counter % 100 == 0:
                         logger.warning(
                             "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
                         )
@@ -1579,13 +1579,19 @@ class PyExecutor:
                 self._handle_canceled_requests()
 
                 finished_requests = self._handle_responses()
+                # Complete ctx send sessions AFTER responses are created so
+                # _handle_responses sees the request before it is terminated.
+                if self.kv_cache_transceiver:
+                    self._check_disagg_ctx_cache_transfer_status(0)
+                previous_scheduled_batch = executed_batch.sample_state.scheduled_requests
                 attn_metadata = getattr(self.model_engine, 'attn_metadata',
                                         None)
                 kv_cache_dtype_byte_size = getattr(self.model_engine,
                                                    'kv_cache_dtype_byte_size',
                                                    None)
                 self.resource_manager.update_resources(
-                    scheduled_requests, attn_metadata, kv_cache_dtype_byte_size)
+                    previous_scheduled_batch, attn_metadata,
+                    kv_cache_dtype_byte_size)
 
                 self._remove_inflight_ids(scheduled_requests)
 
@@ -1770,7 +1776,7 @@ class PyExecutor:
             # For requests that are fitting disagg gen init, also prepare resources for KV cache manager
             self._prepare_disagg_gen_init(fitting_disagg_gen_init_requests)
 
-            if num_fitting_reqs == 0 and not fitting_disagg_gen_init_requests:
+            if num_fitting_reqs == 0 and not fitting_disagg_gen_init_requests and self.iter_counter % 100 == 0:
                 logger.warning(
                     "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
                 )
@@ -1925,6 +1931,10 @@ class PyExecutor:
 
                     self._handle_canceled_requests()
                     finished_requests = self._handle_responses()
+                    # Complete ctx send sessions AFTER responses are created so
+                    # _handle_responses sees the request before it is terminated.
+                    if self.kv_cache_transceiver:
+                        self._check_disagg_ctx_cache_transfer_status(0)
                     # Compute GPU times after _handle_responses creates metric entries
                     # (safe in non-overlap mode: no next iteration to overwrite events)
                     self.perf_manager.compute_batch_gpu_times(
@@ -2720,6 +2730,8 @@ class PyExecutor:
         need_check_one = all([
             req.is_disagg_generation_transmission_in_progress
             for req in self.active_requests
+            if req.py_disaggregated_params \
+                and req.py_disaggregated_params.schedule_style != DisaggScheduleStyle.GENERATION_FIRST
         ])
 
         if need_check:
@@ -2770,7 +2782,10 @@ class PyExecutor:
             if req.is_context_only_request and req.py_disaggregated_params.
             schedule_style == DisaggScheduleStyle.GENERATION_FIRST
         ]
-        if ctx_only_requests:
+        # Always call prepare_context_requests when there are new requests
+        # or previously-waiting requests, so the tp_allgather consensus
+        # can promote requests whose peer info has arrived on all ranks.
+        if ctx_only_requests or self.kv_cache_transceiver.wait_req_id_to_request:
             self.kv_cache_transceiver.prepare_context_requests(
                 ctx_only_requests)
 
@@ -2858,6 +2873,7 @@ class PyExecutor:
                 req.decoding_iter = 1
                 req.py_decoding_iter = 1
                 req.py_kv_transfer_start_time = None
+                req.decoding_iter = 1
                 first_gen_tokens = req.context_phase_params.first_gen_tokens
                 ctx_draft_tokens = req.context_phase_params.draft_tokens
                 req.py_draft_tokens = [] if ctx_draft_tokens is None else ctx_draft_tokens
@@ -2929,6 +2945,8 @@ class PyExecutor:
 
         block_transfer = all([
             req.is_disagg_generation_transmission_in_progress
+            and req.py_disaggregated_params.schedule_style
+            != DisaggScheduleStyle.GENERATION_FIRST
             for req in self.active_requests
         ])
         self._check_disagg_gen_cache_transfer_status(1 if block_transfer else 0)
