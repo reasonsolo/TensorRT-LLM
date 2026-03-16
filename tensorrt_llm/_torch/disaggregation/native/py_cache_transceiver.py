@@ -100,6 +100,7 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         self.mapping = mapping
 
         self.ctx_need_tp_sync = mapping.tp_size > 1 and (not mapping.enable_attention_dp)
+        self.ctx_need_pp_sync = mapping.pp_size > 1
 
         self.gen_need_sync = not (
             mapping.world_size == 1 or (mapping.enable_attention_dp and mapping.pp_size == 1)
@@ -381,7 +382,7 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
 
     def prepare_context_requests(self, requests: List[LlmRequest]):
         # Place new generation-first context requests into wait state, then
-        # use tp_allgather consensus to promote ready requests to CONTEXT_INIT.
+        # use allgather consensus to promote ready requests to CONTEXT_INIT.
         for req in requests:
             unique_rid = get_unique_rid(req)
             if unique_rid not in self.send_sessions:
@@ -389,16 +390,17 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
                 req.state = LlmRequestState.DISAGG_CONTEXT_WAIT_SCHEDULER
 
         # Check which waiting requests have peer info locally, then use
-        # tp_allgather consensus so all TP ranks agree before promoting.
+        # allgather consensus so all TP/PP ranks agree before promoting.
         # Without consensus, background peer info arriving at different
         # times on different ranks causes scheduling mismatches → hang.
-        # Place tp sync here because this function runs in every iteration
+        # Place sync here because this function runs in every iteration
         # but check_context_transfer_status runs when can_queue is True
         local_ready_request_ids = []
         for request_id in self.wait_req_id_to_request.keys():
             if self.transfer_worker.has_all_peer_req_infos_for_send(request_id):
                 local_ready_request_ids.append(request_id)
 
+        # TP consensus: ensure all TP ranks have peer info
         if self.ctx_need_tp_sync:
             ready_request_ids_all_ranks = self.dist.tp_allgather(local_ready_request_ids)
         else:
@@ -406,6 +408,16 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
 
         sync_size = self.dist.tp_size if self.ctx_need_tp_sync else 1
         ready_request_ids = _find_consensus_request_ids(ready_request_ids_all_ranks, sync_size)
+
+        # PP consensus: ensure all PP ranks have peer info before promoting.
+        # In PP, the first PP rank schedules and propagates to others. If a
+        # request is promoted on the first rank but peer info hasn't arrived
+        # on other ranks, respond_and_send_async on those ranks would fail
+        # to dispatch the KV transfer (gen-first skips listener dispatch).
+        if self.ctx_need_pp_sync:
+            ready_request_ids_pp = self.dist.pp_allgather(ready_request_ids)
+            pp_sync_size = self.mapping.pp_size
+            ready_request_ids = _find_consensus_request_ids(ready_request_ids_pp, pp_sync_size)
 
         for request_id in ready_request_ids:
             self.wait_req_id_to_request[request_id].state = LlmRequestState.CONTEXT_INIT

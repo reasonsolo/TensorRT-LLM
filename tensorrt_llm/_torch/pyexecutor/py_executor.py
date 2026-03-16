@@ -1255,6 +1255,7 @@ class PyExecutor:
                 self._handle_control_request()
 
                 if self.kv_cache_transceiver:
+                    self._check_disagg_ctx_schedulable_status(new_requests)
                     self._check_disagg_gen_transfer_status()
 
                 if self.enable_iter_perf_stats:
