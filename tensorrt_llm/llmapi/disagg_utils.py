@@ -178,7 +178,7 @@ def extract_disagg_cfg(hostname: str = 'localhost',
                                 conditional_disagg_config, otlp_config,
                                 max_retries, perf_metrics_max_requests,
                                 disagg_cluster_config)
-    if node_id:
+    if node_id is not None:
         config.node_id = node_id
     if schedule_style:
         config.schedule_style = schedule_style

@@ -405,19 +405,27 @@ class OpenAIDisaggregatedService(OpenAIService):
                     await queue.put(e)
                 await queue.put(None)  # sentinel
 
-            asyncio.create_task(_consume_gen())
+            consume_task: asyncio.Task = asyncio.create_task(_consume_gen())
 
             # Now send ctx request — gen server has received its request
             await self._ctx_client.send_request(ctx_req, server=ctx_server, hooks=hooks)
 
             async def _yield_from_queue():
-                while True:
-                    item = await queue.get()
-                    if item is None:
-                        break
-                    if isinstance(item, Exception):
-                        raise item
-                    yield item
+                try:
+                    while True:
+                        item = await queue.get()
+                        if item is None:
+                            break
+                        if isinstance(item, Exception):
+                            raise item
+                        yield item
+                finally:
+                    if not consume_task.done():
+                        consume_task.cancel()
+                    try:
+                        await consume_task
+                    except asyncio.CancelledError:
+                        pass
 
             return _yield_from_queue()
         else:
@@ -425,20 +433,15 @@ class OpenAIDisaggregatedService(OpenAIService):
             # through generator consumption, so asyncio.gather works fine.
             tasks = []
             if need_ctx:
-                async def request_ctx():
-                    response = await self._ctx_client.send_request(
-                        ctx_req, server=ctx_server, hooks=hooks
+                tasks.append(
+                    asyncio.create_task(
+                        self._ctx_client.send_request(ctx_req, server=ctx_server, hooks=hooks)
                     )
-                    return response
-
-                tasks.append(asyncio.create_task(request_ctx()))
-
-            async def request_gen():
-                response = await self._gen_client.send_request(
-                    gen_req, server=gen_server, hooks=hooks
                 )
-                return response
-
-            tasks.append(asyncio.create_task(request_gen()))
+            tasks.append(
+                asyncio.create_task(
+                    self._gen_client.send_request(gen_req, server=gen_server, hooks=hooks)
+                )
+            )
             responses = await asyncio.gather(*tasks)
             return responses[-1]

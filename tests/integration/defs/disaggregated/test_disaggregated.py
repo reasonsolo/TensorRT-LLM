@@ -284,7 +284,7 @@ def get_client_test_set(test_desc):
                              verify_streaming_completion=True,
                              verify_chat=False,
                              verify_streaming_chat=False)
-    if test_desc in ("overlap", "trtllm_sampler"):
+    if test_desc.startswith("overlap") or test_desc == "trtllm_sampler":
         return ClientTestSet(completion=True,
                              completion_streaming=True,
                              chat=True,

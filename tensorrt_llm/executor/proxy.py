@@ -24,7 +24,7 @@ from .postproc_worker import PostprocWorker, PostprocWorkerConfig
 from .request import CancellingRequest, GenerationRequest
 from .result import GenerationResult, IterationResult
 from .rpc import RPCClient
-from .rpc.rpc_common import get_unique_ipc_addr
+from .rpc.rpc_common import RPCError, get_unique_ipc_addr
 from .utils import (ErrorResponse, WorkerCommIpcAddrs, create_mpi_comm_session,
                     get_spawn_proxy_process_env, is_llm_response,
                     print_alive_threads)
@@ -396,7 +396,7 @@ class GenerationExecutorProxy(GenerationExecutor):
         try:
             params = self.rpc_client.get_disaggregated_params().remote()
             return params if isinstance(params, dict) else {}
-        except Exception as e:
+        except RPCError as e:
             logger.warning(f"Error fetching disaggregated params via RPC: {e}")
             return {}
 

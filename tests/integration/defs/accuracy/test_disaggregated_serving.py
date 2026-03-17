@@ -1616,12 +1616,13 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize(
         "gen_tp_pp", [(1, 1), (1, 2), (2, 1), (2, 2)],
         ids=["gen_tp1pp1", "gen_tp1pp2", "gen_tp2pp1", "gen_tp2pp2"])
-    @pytest.mark.parametrize("ctx_tp_pp", [(1, 1), (1, 2), (2, 1), (2, 2),
-                                           (1, 4)],
-                             ids=[
-                                 "ctx_tp1pp1", "ctx_tp1pp2", "ctx_tp2pp1",
-                                 "ctx_tp2pp2", "ctx_tp1pp4"
-                             ])
+    @pytest.mark.parametrize(
+        "ctx_tp_pp",
+        [(1, 1), (1, 2), (2, 1), (2, 2), (1, 4)],
+        ids=[
+            "ctx_tp1pp1", "ctx_tp1pp2", "ctx_tp2pp1", "ctx_tp2pp2", "ctx_tp1pp4"
+        ],
+    )
     def test_gen_first(self, ctx_tp_pp, gen_tp_pp):
         ctx_tp, ctx_pp = ctx_tp_pp
         gen_tp, gen_pp = gen_tp_pp

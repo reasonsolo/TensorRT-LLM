@@ -24,8 +24,8 @@ from tensorrt_llm.commands.utils import get_is_diffusion_model
 from tensorrt_llm.executor.utils import LlmLauncherEnvs
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
-                                 DisaggScheduleStyle, DynamicBatchConfig,
-                                 KvCacheConfig, SchedulerConfig, VisualGen)
+                                 DynamicBatchConfig, KvCacheConfig,
+                                 SchedulerConfig, VisualGen)
 from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               MetadataServerConfig, ServerRole,
                                               extract_disagg_cluster_config,
@@ -1011,7 +1011,8 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
               help="The logging level.")
 @click.option("-s",
               "--schedule_style",
-              type=None,
+              type=click.Choice(["context_first", "generation_first"],
+                                case_sensitive=False),
               default=None,
               help="The schedule style for the disaggregated server.")
 @click.option(
@@ -1041,13 +1042,6 @@ def disaggregated(
 
     disagg_cfg = parse_disagg_config_file(config_file)
     if schedule_style:
-        valid_styles = [
-            key.lower() for key in DisaggScheduleStyle.__members__.keys()
-        ]
-        if schedule_style not in valid_styles:
-            raise ValueError(
-                f"Invalid schedule style: {schedule_style}, options: {valid_styles}"
-            )
         disagg_cfg.schedule_style = schedule_style
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         try:
