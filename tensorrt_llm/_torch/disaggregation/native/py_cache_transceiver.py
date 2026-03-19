@@ -409,11 +409,9 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         sync_size = self.dist.tp_size if self.ctx_need_tp_sync else 1
         ready_request_ids = _find_consensus_request_ids(ready_request_ids_all_ranks, sync_size)
 
-        # PP consensus: ensure all PP ranks have peer info before promoting.
-        # In PP, the first PP rank schedules and propagates to others. If a
-        # request is promoted on the first rank but peer info hasn't arrived
-        # on other ranks, respond_and_send_async on those ranks would fail
-        # to dispatch the KV transfer (gen-first skips listener dispatch).
+        # TODO: This is a workaround for functionality: pp_allgather impacts the pp loop performance.
+        # One possible solution is to let pp rank0 decide the ready request ids, the other pp ranks
+        # treat the unready request as ctx-first requests.
         if self.ctx_need_pp_sync:
             ready_request_ids_pp = self.dist.pp_allgather(ready_request_ids)
             pp_sync_size = self.mapping.pp_size

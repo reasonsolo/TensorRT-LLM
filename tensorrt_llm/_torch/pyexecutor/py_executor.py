@@ -1152,7 +1152,7 @@ class PyExecutor:
         is_dp_broadcast = self.dist.tp_size > 1 and self.enable_attention_dp
         if self.dist.rank == 0 or (self.dist.is_first_pp_rank
                                    and is_dp_broadcast):
-            scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
+            scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs, all_gen_first = self._schedule(
             )
             serializable_schedule = SerializableSchedulerOutput.from_scheduler_result(
                 scheduled_batch, fitting_disagg_gen_init_requests,
@@ -1280,7 +1280,7 @@ class PyExecutor:
                     self._prepare_disagg_gen_init(
                         fitting_disagg_gen_init_requests)
 
-                    if num_fitting_reqs == 0 and not fitting_disagg_gen_init_requests and self.iter_counter % 100 == 0:
+                    if num_fitting_reqs == 0 and not fitting_disagg_gen_init_requests and not all_gen_first:
                         logger.warning(
                             "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
                         )
@@ -1584,14 +1584,14 @@ class PyExecutor:
                 # _handle_responses sees the request before it is terminated.
                 if self.kv_cache_transceiver:
                     self._check_disagg_ctx_cache_transfer_status(0)
-                previous_scheduled_batch = executed_batch.sample_state.scheduled_requests
+                sample_state_scheduled_requests = executed_batch.sample_state.scheduled_requests
                 attn_metadata = getattr(self.model_engine, 'attn_metadata',
                                         None)
                 kv_cache_dtype_byte_size = getattr(self.model_engine,
                                                    'kv_cache_dtype_byte_size',
                                                    None)
                 self.resource_manager.update_resources(
-                    previous_scheduled_batch, attn_metadata,
+                    sample_state_scheduled_requests, attn_metadata,
                     kv_cache_dtype_byte_size)
 
                 self._remove_inflight_ids(scheduled_requests)
@@ -1766,7 +1766,7 @@ class PyExecutor:
             # that speculation is about to happen.
             self._prepare_draft_requests()
 
-        scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
+        scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs, all_gen_first = self._schedule(
         )
 
         if self.drafter is not None and not self.use_spec_decode:
@@ -1777,7 +1777,7 @@ class PyExecutor:
             # For requests that are fitting disagg gen init, also prepare resources for KV cache manager
             self._prepare_disagg_gen_init(fitting_disagg_gen_init_requests)
 
-            if num_fitting_reqs == 0 and not fitting_disagg_gen_init_requests and self.iter_counter % 100 == 0:
+            if num_fitting_reqs == 0 and not fitting_disagg_gen_init_requests and not all_gen_first:
                 logger.warning(
                     "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
                 )
@@ -2719,7 +2719,12 @@ class PyExecutor:
         scheduled_requests.generation_requests = scheduler_output.generation_requests
         scheduled_requests.paused_requests = scheduler_output.paused_requests
 
-        return scheduled_requests, scheduler_output.fitting_disagg_gen_init_requests, scheduler_output.num_fitting_requests
+        all_gen_first = self.active_requests and all(
+            req.py_disaggregated_params and req.py_disaggregated_params.
+            schedule_style == DisaggScheduleStyle.GENERATION_FIRST
+            for req in self.active_requests)
+
+        return scheduled_requests, scheduler_output.fitting_disagg_gen_init_requests, scheduler_output.num_fitting_requests, all_gen_first
 
     @nvtx_range("_check_disagg_gen_transfer_status")
     def _check_disagg_gen_transfer_status(self):

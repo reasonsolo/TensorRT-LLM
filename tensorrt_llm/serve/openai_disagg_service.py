@@ -408,7 +408,15 @@ class OpenAIDisaggregatedService(OpenAIService):
             consume_task: asyncio.Task = asyncio.create_task(_consume_gen())
 
             # Now send ctx request — gen server has received its request
-            await self._ctx_client.send_request(ctx_req, server=ctx_server, hooks=hooks)
+            try:
+                await self._ctx_client.send_request(ctx_req, server=ctx_server, hooks=hooks)
+            except Exception:
+                consume_task.cancel()
+                try:
+                    await consume_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                raise
 
             async def _yield_from_queue():
                 try:
