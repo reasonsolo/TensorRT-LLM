@@ -12,6 +12,8 @@ log_dir=${6}
 enable_nsys=${7}
 config_file=${8}
 cuda_devices=${9}
+server_role=${10}
+disagg_cluster_uri=${11}
 
 # Set CUDA_VISIBLE_DEVICES from script argument (srun --export cannot
 # reliably pass comma-separated values inside shared containers).
@@ -45,4 +47,6 @@ fi
 ${nsys_prefix} trtllm-llmapi-launch ${numa_bind_cmd} \
     trtllm-serve ${model_path} \
         --host $(hostname) --port ${port} \
-        --config ${config_file}
+        --config ${config_file} \
+        --server_role ${server_role} \
+        --disagg_cluster_uri ${disagg_cluster_uri}
