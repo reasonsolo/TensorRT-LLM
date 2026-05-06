@@ -499,11 +499,12 @@ def submit_job(config, log_dir, dry_run):
             'connector_worker_class': 'DynamoKVBMConnectorWorker',
         }
         worker_config['ctx']['kv_connector_config'] = kv_connector_cfg
-        worker_config['gen']['kv_connector_config'] = kv_connector_cfg
-        # Enable block reuse for kvbm
-        for role in ('ctx', 'gen'):
-            kv_cache_cfg = worker_config[role].setdefault('kv_cache_config', {})
-            kv_cache_cfg['enable_block_reuse'] = True
+        # KVBM requires block reuse on CTX to track computed positions
+        ctx_kv_cache_cfg = worker_config['ctx'].setdefault('kv_cache_config', {})
+        ctx_kv_cache_cfg['enable_block_reuse'] = True
+        # KVBM manages its own CPU cache (DYN_KVBM_CPU_CACHE_GB); TRT-LLM's
+        # native host_cache_size conflicts with KVBM block tracking and causes hangs.
+        ctx_kv_cache_cfg['host_cache_size'] = 0
 
     # Setup config file paths and save worker configs
     ctx_config_path = os.path.join(log_dir, 'ctx_config.yaml')
@@ -721,7 +722,7 @@ def submit_job(config, log_dir, dry_run):
         if benchmark_config.get('use_aiperf', False):
             benchmark_cmd = [
                 f"bash {os.path.join(script_dir, 'run_benchmark_aiperf.sh')}",
-                f"'{env_config['model_path']}' '{benchmark_config['dataset_file']}' {benchmark_config['multi_round']} {gen_num} '{benchmark_config['concurrency_list']}' {benchmark_config['streaming']} '{log_dir}' {disagg_server_hostname} {disagg_server_port} {ucx_warmup_requests}",
+                f"'{env_config['model_path']}' '{benchmark_config['dataset_file']}' {benchmark_config['multi_round']} {gen_num} '{benchmark_config['concurrency_list']}' {benchmark_config['streaming']} '{log_dir}' {disagg_server_hostname} {disagg_server_port} {ucx_warmup_requests} {benchmark_config.get('synthesis_max_isl', 0)}",
                 f"&> {log_dir}/6_bench.log"
             ]
             client_cmds.append(" ".join(benchmark_prefix + benchmark_cmd))

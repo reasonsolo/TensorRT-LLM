@@ -9,7 +9,7 @@ trap 'echo "Error occurred at line $LINENO"; exit 1' ERR
 
 if [ "$#" -lt 10 ]; then
     echo "Error: Missing required arguments, got $# arguments, args: $@"
-    echo "Usage: $0 model_name dataset_file multi_round num_gen_servers concurrency_list streaming log_path hostname port ucx_warmup_requests"
+    echo "Usage: $0 model_name dataset_file multi_round num_gen_servers concurrency_list streaming log_path hostname port ucx_warmup_requests [synthesis_max_isl]"
     exit 1
 fi
 
@@ -23,6 +23,7 @@ log_path=$7
 hostname=$8
 port=$9
 ucx_warmup_requests=${10}
+synthesis_max_isl=${11:-0}
 
 # check process id is not 0
 if [[ ${SLURM_PROCID} != "0" ]]; then
@@ -68,6 +69,11 @@ for concurrency in ${concurrency_list}; do
     echo "Benchmarking with concurrency ${concurrency} ... ${request_count} requests, duration ${benchmark_duration}s"
     mkdir -p ${log_path}/concurrency_${concurrency}
 
+    synthesis_args=""
+    if [ "${synthesis_max_isl}" -gt 0 ] 2>/dev/null; then
+        synthesis_args="--synthesis-max-isl ${synthesis_max_isl}"
+    fi
+
     aiperf profile \
         -m ${model_name} \
         --tokenizer ${model_name} \
@@ -87,7 +93,8 @@ for concurrency in ${concurrency_list}; do
         --profile-export-level records \
         --extra-inputs ignore_eos:true \
         --request-count ${request_count} \
-        --record-processors 8
+        --record-processors 8 \
+        ${synthesis_args}
 
     echo "Benchmark with concurrency ${concurrency} done"
 done

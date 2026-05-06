@@ -142,17 +142,27 @@ else
     echo "TensorRT-LLM environment variables saved to ${full_logdir}/env_vars.json"
 fi
 
-# Install kvbm if enabled
+# Install kvbm and Dynamo if kvbm is enabled
 if [ "${kvbm_enabled}" = "true" ]; then
-    echo "Installing kvbm package: ${kvbm_package}..."
+    echo "Installing kvbm==1.1.0..."
     if ! srun --container-name=${container_name} \
         --container-mounts=${container_mount} --no-container-mount-home \
         --mpi=pmix --overlap -N $SLURM_NNODES --ntasks-per-node=1 \
-        bash -c "pip install ${kvbm_package}" \
+        bash -c "pip install kvbm==1.1.0" \
         &> ${full_logdir}/2.1_kvbm_install.log; then
         cleanup_on_failure "kvbm installation failed. Check ${full_logdir}/2.1_kvbm_install.log for details"
     fi
     echo "kvbm installation completed successfully"
+
+    echo "Installing ai-dynamo[trtllm]..."
+    if ! srun --container-name=${container_name} \
+        --container-mounts=${container_mount} --no-container-mount-home \
+        --mpi=pmix --overlap -N $SLURM_NNODES --ntasks-per-node=1 \
+        bash -c "pip install --pre --extra-index-url https://pypi.nvidia.com 'ai-dynamo[trtllm]'" \
+        &> ${full_logdir}/2.2_dynamo_install.log; then
+        cleanup_on_failure "ai-dynamo installation failed. Check ${full_logdir}/2.2_dynamo_install.log for details"
+    fi
+    echo "ai-dynamo installation completed successfully"
 fi
 
 # Get node lists and replace the placeholder with the actual node names
