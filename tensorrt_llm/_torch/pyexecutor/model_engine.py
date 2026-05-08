@@ -4038,6 +4038,13 @@ class PyTorchModelEngine(ModelEngine):
                                 attn_metadata, saved_draft)
 
             if self.forward_pass_callable is not None:
+                if not hasattr(self, '_fpc_log_count'):
+                    self._fpc_log_count = 0
+                self._fpc_log_count += 1
+                if self._fpc_log_count <= 3 or self._fpc_log_count % 200 == 0:
+                    logger.info(
+                        f"KVBM_PROBE forward_pass_callable firing (call #{self._fpc_log_count})"
+                    )
                 self.forward_pass_callable()
 
             self._execute_logit_post_processors(scheduled_requests, outputs)

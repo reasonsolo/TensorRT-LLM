@@ -788,8 +788,15 @@ def create_py_executor(
             forward_pass_callable = connector_worker.register_forward_pass_callable(
             )
             if forward_pass_callable:
+                logger.info(
+                    "KVBM_PROBE: forward_pass_callable registered (offload via end-of-forward callback)"
+                )
                 model_engine.register_forward_pass_callable(
                     forward_pass_callable)
+            else:
+                logger.info(
+                    "KVBM_PROBE: no forward_pass_callable (offload via per-layer save_kv_layer)"
+                )
 
             kv_connector_manager = KvCacheConnectorManager(
                 connector_worker, connector_scheduler)

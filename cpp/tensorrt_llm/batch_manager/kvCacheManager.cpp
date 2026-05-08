@@ -1881,7 +1881,7 @@ SizeType32 WindowBlockManager::onboardAndAllocateBlocks(
     }
 
     auto const totalPrepopulatedLen = sequence.getCurrentPrepopulatedPromptLen() + numConnectorMatchedTokens;
-    TLLM_LOG_DEBUG("%s::onboardAndAllocateBlocks: Request %lu, prepopulatedPromptLen %d, numConnectorMatchedTokens %d",
+    TLLM_LOG_INFO("%s::onboardAndAllocateBlocks: Request %lu, prepopulatedPromptLen %d, numConnectorMatchedTokens %d",
         mLogPrefix.c_str(), llmRequest.mRequestId, sequence.getCurrentPrepopulatedPromptLen(),
         numConnectorMatchedTokens);
     return totalPrepopulatedLen;

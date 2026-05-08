@@ -81,7 +81,6 @@ class OpenAIDisaggregatedService(OpenAIService):
         self._gen_client = None
         self._disagg_cluster_manager = None
         self._schedule_style = DisaggScheduleStyle.CONTEXT_FIRST
-
         match self._config.schedule_style:
             case "generation_first":
                 self._send_disagg_request = self._send_disagg_request_gen_first
@@ -346,7 +345,6 @@ class OpenAIDisaggregatedService(OpenAIService):
             elif isinstance(request, ChatCompletionRequest):
                 request.prompt_token_ids = ctx_response.prompt_token_ids
         else:
-            # no ctx response, it's either a generation-only request or a generation-first disagg request
             request.disaggregated_params = DisaggregatedParams(
                 request_type="generation_only",
                 ctx_request_id=disagg_request_id,

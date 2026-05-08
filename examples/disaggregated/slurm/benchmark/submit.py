@@ -556,6 +556,11 @@ def submit_job(config, log_dir, dry_run):
         upsert_env_config(env_config, 'worker_env_var',
                           'DYN_KVBM_TRTLLM_ZMQ_PORT',
                           f'DYN_KVBM_TRTLLM_ZMQ_PORT={kvbm_zmq_port}')
+        # Limit NCCL MLA broadcast to 1 CTA to prevent deadlock with MoE EP
+        # all-to-all collectives (see KVBM_HANG_BUG.md).
+        upsert_env_config(env_config, 'worker_env_var',
+                          'DYN_KVBM_NCCL_MAX_CTAS',
+                          'DYN_KVBM_NCCL_MAX_CTAS=1')
         if sd_backend == 'etcd':
             etcd_endpoint = f"http://{disagg_server_hostname}:{etcd_port}"
             upsert_env_config(env_config, 'worker_env_var', 'ETCD_ENDPOINTS',

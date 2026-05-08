@@ -401,6 +401,7 @@ class PyExecutor:
                                                         KVCacheManagerV2)
         self.enable_kv_cache_events = self.kv_cache_manager is not None and self.kv_cache_manager.event_buffer_max_size > 0
         self.enable_kv_cache_reuse = self.kv_cache_manager is not None and self.kv_cache_manager.enable_block_reuse
+        self._connector_reused_blocks = 0
         self.enable_partial_reuse_for_disagg = (
             self.enable_kv_cache_reuse
             and self.kv_cache_manager.enable_partial_reuse)
@@ -1012,6 +1013,28 @@ class PyExecutor:
                 host_step_time = (end_time - start_time) * 1000  # milliseconds
                 formatted_timestamp = datetime.datetime.now().strftime(
                     "%Y-%m-%d %H:%M:%S")
+                kv_cache_log = ""
+                kv_mgr = self.resource_manager.resource_managers.get(
+                    ResourceManagerType.KV_CACHE_MANAGER
+                ) or self.kv_cache_manager
+                if kv_mgr is None:
+                    kv_cache_log = (
+                        f", kv_mgr=None"
+                        f", rm_keys={list(self.resource_manager.resource_managers.keys())}"
+                        f", self_kvcm={self.kv_cache_manager}"
+                    )
+                if kv_mgr is not None:
+                    kv_s = kv_mgr.get_kv_cache_stats()
+                    connector_blks = self._connector_reused_blocks
+                    total_reused = kv_s.reused_blocks + connector_blks
+                    total = total_reused + kv_s.missed_blocks
+                    overall_hit_rate = (total_reused / total) if total > 0 else 0.0
+                    kv_cache_log = (
+                        f", reused_blocks = {kv_s.reused_blocks}"
+                        f", connector_reused_blocks = {connector_blks}"
+                        f", missed_blocks = {kv_s.missed_blocks}"
+                        f", cache_hit_rate = {overall_hit_rate:.4f}"
+                    )
                 logger.info(
                     f"iter = {self.iter_counter}, "
                     f"global_rank = {self.global_rank}, "
@@ -1022,7 +1045,8 @@ class PyExecutor:
                     f"prev_device_step_time = {prev_device_step_time}, "
                     f"timestamp = {formatted_timestamp}, "
                     f"num_scheduled_requests: {self.num_scheduled_requests}, "
-                    f"states = {self.model_engine.iter_states}")
+                    f"states = {self.model_engine.iter_states}"
+                    f"{kv_cache_log}")
 
             it += 1
 
@@ -4083,9 +4107,16 @@ class PyExecutor:
         self.active_requests.extend(new_active_requests)
         # Request should be terminated after enqueueing response to ensure we can enqueue response successfully.
         self._enqueue_responses(new_responses)
+        all_finished = requests_to_terminate + requests_finished_by_transfer
+        if self.kv_cache_manager is not None:
+            tpb = self.kv_cache_manager.tokens_per_block
+            for req in all_finished:
+                matched = getattr(req, 'py_num_connector_matched_tokens', 0)
+                if matched > 0:
+                    self._connector_reused_blocks += matched // tpb
         for request in requests_to_terminate:
             self._terminate_request(request)
-        return requests_to_terminate + requests_finished_by_transfer
+        return all_finished
 
     def _await_any_response(self,
                             timeout: Optional[float] = None

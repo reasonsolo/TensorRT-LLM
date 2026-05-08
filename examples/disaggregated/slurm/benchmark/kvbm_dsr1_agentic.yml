@@ -35,8 +35,9 @@ environment:
   trtllm_repo: "/lustre/fsw/coreai_comparch_trtllm/lizhiz/trtllm_2"
   build_wheel: false
   trtllm_wheel_path: ""
+  log_dir: "/lustre/fsw/coreai_comparch_trtllm/lizhiz/trtllm_2/examples/disaggregated/slurm/benchmark/logs/kvbm1600_dsr1"
   work_dir: "/lustre/fsw/coreai_comparch_trtllm/lizhiz/trtllm_2/examples/disaggregated/slurm/benchmark"
-  worker_env_var: "TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=0 TRTLLM_WORKER_DISABLE_GC=0 TLLM_NUMA_AWARE_WORKER_AFFINITY=0 UCX_CUDA_IPC_ENABLE_MNNVL=n TLLM_LLM_ENABLE_DEBUG=0 DYN_KVBM_CPU_CACHE_GB=1024 DYN_KVBM_NCCL_MLA_MODE=true"
+  worker_env_var: "TLLM_LOG_LEVEL=DEBUG TRTLLM_SERVER_DISABLE_GC=0 TRTLLM_WORKER_DISABLE_GC=0 TLLM_NUMA_AWARE_WORKER_AFFINITY=0 UCX_CUDA_IPC_ENABLE_MNNVL=n TLLM_LLM_ENABLE_DEBUG=0 DYN_KVBM_CPU_CACHE_GB=1600 DYN_KVBM_NCCL_MLA_MODE=true DYN_KVBM_NCCL_MAX_CTAS=1 RUST_LOG=warn,dynamo_llm::block_manager=warn"
   server_env_var: ""
 
 # Profiling Configuration
