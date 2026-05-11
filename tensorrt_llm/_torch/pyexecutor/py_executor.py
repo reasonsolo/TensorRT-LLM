@@ -4027,6 +4027,13 @@ class PyExecutor:
             self._do_terminate_request(request)
 
     def _do_terminate_request(self, request: LlmRequest):
+        if request.py_resources_freed:
+            logger.warning(
+                f"Skipping duplicate resource cleanup for request {request.py_request_id}"
+            )
+            return
+        request.py_resources_freed = True
+
         self.resource_manager.free_resources(request)
 
         if self.gather_all_responses or self.dist.rank == 0:

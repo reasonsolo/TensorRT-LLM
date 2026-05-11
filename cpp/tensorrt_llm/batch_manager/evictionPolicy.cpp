@@ -182,6 +182,11 @@ void LRUEvictionPolicy::releaseBlock(BlockPtr block, bool toFront)
     }
     SizeType32 const cacheLevel = getCacheLevel(block);
     SizeType32 const id = block->getBlockId();
+    if (mFreeBlockIterators[id] != std::nullopt)
+    {
+        TLLM_LOG_WARNING("Block (id %d) is already in the eviction queue; skipping duplicate release", id);
+        return;
+    }
 
     // If there are no children, this is a leaf block. Insert into a queue.
     auto& q = mFreeQueues[cacheLevel][getPriorityIdx(block->getPriority())];

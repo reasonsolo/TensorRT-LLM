@@ -21,6 +21,7 @@
 #include <gtest/gtest.h>
 
 #include <memory>
+#include <set>
 #include <vector>
 
 namespace tk = tensorrt_llm::kernels;
@@ -116,6 +117,31 @@ TEST_F(LRUPolicyTest, ReleaseBlockTest)
     policy->releaseBlock(origPrimaryBlock);
 
     EXPECT_NE(origPrimaryBlock->getBlockId(), std::get<0>(policy->getFreeBlock(0))->getBlockId());
+}
+
+TEST_F(LRUPolicyTest, DuplicateReleaseBlockTest)
+{
+    auto block = std::get<0>(policy->getFreeBlock(0));
+    policy->claimBlock(block);
+
+    policy->releaseBlock(block);
+    EXPECT_EQ(NUM_PRIMARY_BLOCKS, policy->getNumFreeBlocks(0));
+
+    policy->releaseBlock(block);
+    EXPECT_EQ(NUM_PRIMARY_BLOCKS, policy->getNumFreeBlocks(0));
+    EXPECT_TRUE(policy->verifyQueueIntegrity());
+
+    std::set<KVCacheBlock::IdType> freeBlockIds;
+    for (int i = 0; i < NUM_PRIMARY_BLOCKS; i++)
+    {
+        auto nextBlock = std::get<0>(policy->getFreeBlock(0));
+        freeBlockIds.insert(nextBlock->getBlockId());
+        policy->claimBlock(nextBlock);
+    }
+
+    EXPECT_EQ(NUM_PRIMARY_BLOCKS, freeBlockIds.size());
+    EXPECT_EQ(1, freeBlockIds.count(block->getBlockId()));
+    EXPECT_EQ(0, policy->getNumFreeBlocks(0));
 }
 
 TEST_F(LRUPolicyTest, PooledPlaceholderReleaseReturnsToPlaceholderQueue)

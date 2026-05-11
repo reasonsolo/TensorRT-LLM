@@ -247,6 +247,25 @@ class TestDisaggTerminationGuard:
         req = _make_request(complete_state=True, transmission_state=False)
         assert _classify_termination(req, True, False, 2) == "stats_only"
 
+    def test_do_terminate_request_is_idempotent(self):
+        """Duplicate termination must not release KV blocks twice."""
+        executor = Mock()
+        executor.resource_manager = Mock()
+        executor.gather_all_responses = False
+        executor.dist = Mock(rank=0)
+        executor.result_wait_queues = {42: Mock()}
+
+        req = Mock()
+        req.py_request_id = 42
+        req.py_resources_freed = False
+
+        PyExecutor._do_terminate_request(executor, req)
+        PyExecutor._do_terminate_request(executor, req)
+
+        executor.resource_manager.free_resources.assert_called_once_with(req)
+        assert req.py_resources_freed
+        assert 42 not in executor.result_wait_queues
+
 
 # ---------------------------------------------------------------------------
 # Tests for _compute_scheduled_tokens with KV cache reuse chunk-shift logic
