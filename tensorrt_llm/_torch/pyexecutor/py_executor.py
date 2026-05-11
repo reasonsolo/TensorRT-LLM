@@ -220,6 +220,7 @@ class AsyncTransferManager:
                         resource_mgr_type].free_resources(request)
 
             request.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+            request.py_kv_transfer_cancelled = False
 
             if self.should_store_blocks:
                 block_id = self.kv_cache_manager.store_blocks_for_reuse(
@@ -672,10 +673,16 @@ class PyExecutor:
                 self._pending_transfer_responses.append(
                     (request.py_request_id, response))
             if self.async_transfer_manager.end_transfer(request):
+                request.py_kv_transfer_start_time = None
+                request.py_kv_transfer_timed_out = False
+                request.py_kv_transfer_cancelled = False
                 self.active_requests.remove(request)
                 self._terminate_request(request)
             return
         if self.async_transfer_manager.end_transfer(request):
+            request.py_kv_transfer_start_time = None
+            request.py_kv_transfer_timed_out = False
+            request.py_kv_transfer_cancelled = False
             # When should_store_blocks is True, _handle_responses already
             # terminated this request via the early-termination path
             # (enable_partial_reuse_for_disagg branch). Skip the redundant
@@ -3530,6 +3537,7 @@ class PyExecutor:
                 req.py_decoding_iter = 1
                 req.py_kv_transfer_start_time = None
                 req.py_kv_transfer_timed_out = False
+                req.py_kv_transfer_cancelled = False
                 first_gen_tokens = req.context_phase_params.first_gen_tokens
                 ctx_draft_tokens = req.context_phase_params.draft_tokens
                 req.py_draft_tokens = [] if ctx_draft_tokens is None else ctx_draft_tokens
@@ -3633,6 +3641,7 @@ class PyExecutor:
                 ) and not req.is_finished_due_to_cancellation:
                     # Order is important here: we need to start the transfer before responding
                     # to make sure the blocks are stored for reuse before they are sent.
+                    req.py_kv_transfer_cancelled = False
                     self.async_transfer_manager.start_transfer(req)
                     self.kv_cache_transceiver.respond_and_send_async(req)
 
@@ -3694,15 +3703,17 @@ class PyExecutor:
 
         for request_id in list(requests_in_transfer.keys()):
             request = requests_in_transfer[request_id]
-            if request.py_kv_transfer_timed_out and request_id not in completed_req_ids:
+            if (request.py_kv_transfer_timed_out
+                    and not request.py_kv_transfer_cancelled
+                    and request_id not in completed_req_ids):
                 is_cancelled = self.kv_cache_transceiver.cancel_request(request)
-                # If cancel is successful, mark as complete so it can be cleaned up
-                # Otherwise, try at next iteration
+                # Sender cancellation only cancels the queued transfer. The
+                # transceiver still owns a sender future for this request and
+                # will report it as completed/error on a later status check.
+                # Keep the request alive in AsyncTransferManager until then.
                 if is_cancelled:
                     request.py_kv_transfer_start_time = None
-                    request.state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
-
-                    self._end_transfer_and_maybe_terminate(request)
+                    request.py_kv_transfer_cancelled = True
 
         self._check_cache_transfer_errors("context requests")
 

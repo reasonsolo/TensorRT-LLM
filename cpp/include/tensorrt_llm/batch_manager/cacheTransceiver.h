@@ -270,13 +270,20 @@ public:
     virtual bool cancelRequest(LlmRequest* llmRequest) override;
 
 private:
+    struct ContextSenderFuture
+    {
+        LlmRequest::RequestIdType requestId;
+        LlmRequest* request;
+        std::future<void> future;
+    };
+
     void initializeCommState();
 
     void setContextState(LlmRequest* llmRequest);
 
     std::unique_ptr<CacheSender> mCacheSender;
     std::unique_ptr<CacheReceiver> mCacheReceiver;
-    std::vector<std::pair<LlmRequest*, std::future<void>>> mSenderFutures;
+    std::vector<ContextSenderFuture> mSenderFutures;
     std::vector<std::pair<LlmRequest*, std::future<void>>> mRequesterFutures;
     mpi::MpiComm const* mMpiWorldComm{nullptr};
 

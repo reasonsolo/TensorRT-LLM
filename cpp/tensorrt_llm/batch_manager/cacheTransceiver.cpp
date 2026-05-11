@@ -340,7 +340,7 @@ void CacheTransceiver::respondAndSendAsync(LlmRequest* llmRequest)
     }
     setContextState(llmRequest);
     auto future = mCacheSender->sendAsync(*llmRequest);
-    mSenderFutures.emplace_back(llmRequest, std::move(future));
+    mSenderFutures.push_back(ContextSenderFuture{llmRequest->mRequestId, llmRequest, std::move(future)});
 }
 
 void CacheTransceiver::respondAndSendLayerWise(
@@ -356,7 +356,8 @@ void CacheTransceiver::respondAndSendLayerWise(
         llmRequest->setState(LlmRequestState::kDISAGG_CONTEXT_INIT_AND_TRANS);
         setContextState(llmRequest.get());
         auto future = mCacheSender->sendAsync(*llmRequest);
-        mSenderFutures.emplace_back(llmRequest.get(), std::move(future));
+        mSenderFutures.push_back(
+            ContextSenderFuture{llmRequest->mRequestId, llmRequest.get(), std::move(future)});
     }
 }
 
@@ -494,11 +495,11 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
 
     auto syncComm = mCacheState->getParallelConfig().mEnableAttentionDP ? mGroupTPInDPComm : mGroupTensorParaComm;
     std::vector<LlmRequest::RequestIdType> contextCompleteRequestIds;
-    for (auto&& [request, future] : mSenderFutures)
+    for (auto& senderFuture : mSenderFutures)
     {
-        if (future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready)
+        if (senderFuture.future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready)
         {
-            contextCompleteRequestIds.push_back(request->mRequestId);
+            contextCompleteRequestIds.push_back(senderFuture.requestId);
         }
     }
 
@@ -537,8 +538,7 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
     for (auto it = mSenderFutures.begin();
          atLeastRequestNum.value_or(0) > static_cast<int>(toCompleteIdSet.size()) && it != mSenderFutures.end(); ++it)
     {
-        auto& [request, future] = *it;
-        toCompleteIdSet.insert(request->mRequestId);
+        toCompleteIdSet.insert(it->requestId);
     }
 
     RequestStatuses requestsStatus{};
@@ -546,8 +546,10 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
     // Complete all the requests in toCompleteIdSet
     for (auto it = mSenderFutures.begin(); it != mSenderFutures.end();)
     {
-        auto& [request, future] = *it;
-        if (blockAll || (toCompleteIdSet.find(request->mRequestId) != toCompleteIdSet.end()))
+        auto const requestId = it->requestId;
+        auto* request = it->request;
+        auto& future = it->future;
+        if (blockAll || (toCompleteIdSet.find(requestId) != toCompleteIdSet.end()))
         {
             try
             {
@@ -556,8 +558,8 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
                 if (status == std::future_status::ready || !senderFutureTimeoutMs.has_value())
                 {
                     future.get();
-                    requestsStatus.completedRequestIds.insert(request->mRequestId);
-                    if (markComplete)
+                    requestsStatus.completedRequestIds.insert(requestId);
+                    if (markComplete && request != nullptr)
                     {
                         request->setState(LlmRequestState::kDISAGG_CONTEXT_COMPLETE);
                     }
@@ -572,19 +574,17 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
                 else
                 {
                     TLLM_LOG_ERROR(
-                        "Future returned unexpected status for request %ld. Marking as error", request->mRequestId);
+                        "Future returned unexpected status for request %ld. Marking as error", requestId);
 
-                    request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
-                    requestsStatus.errorRequestIds.insert(request->mRequestId);
+                    requestsStatus.errorRequestIds.insert(requestId);
                     it = mSenderFutures.erase(it);
                 }
             }
             catch (std::exception const& e)
             {
                 TLLM_LOG_ERROR(
-                    "Error occurred during context transfer for request %ld: %s", request->mRequestId, e.what());
-                request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
-                requestsStatus.errorRequestIds.insert(request->mRequestId);
+                    "Error occurred during context transfer for request %ld: %s", requestId, e.what());
+                requestsStatus.errorRequestIds.insert(requestId);
                 it = mSenderFutures.erase(it);
             }
         }
