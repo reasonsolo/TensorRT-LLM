@@ -1,0 +1,119 @@
+# SLURM Configuration
+slurm:
+  script_file: "disaggr_torch.slurm"
+  partition: "gb200"
+  account: "coreai_comparch_trtllm"
+  job_time: "04:00:00"
+  job_name: "coreai_comparch_trtllm-lizhiz.bench"
+  numa_bind: true # Only enable for GB200 NVL72
+
+# Benchmark Mode
+benchmark:
+  mode: "e2e"  # Options: e2e, gen_only
+  use_nv_sa_benchmark: false
+  use_aiperf: true
+  multi_round: 8  # Number of benchmark rounds
+  benchmark_ratio: 1  # Benchmark ratio
+  streaming: true  # Enable streaming mode
+  concurrency_list: "64"
+  synthesis_max_isl: 120000
+  input_length: 1024
+  output_length: 1024
+  dataset_file: "/lustre/fsw/coreai_comparch_trtllm/lizhiz/trtllm_2/agentic_data/dataset_sample2000.jsonl"
+
+# Hardware Configuration
+hardware:
+  gpus_per_node: 4  # Modify this with your hardware configuration
+  num_ctx_servers: 1  # Number of context servers
+  num_gen_servers: 1  # Number of generation servers
+
+# Environment Configuration
+environment:
+  container_mount: "/lustre/fsw:/lustre/fsw,/lustre/share:/lustre/share,/raid/scratch:/raid/scratch"  # Format: path1:path1,path2:path2
+  container_image: "/lustre/fsw/coreai_comparch_trtllm/lizhiz/trtllm_2/build_images/5c5d922115/trtllm.sqsh"
+  model_path: "/lustre/fsw/coreai_comparch_trtllm/common/DeepSeek-R1-0528-FP4-v2"
+  trtllm_repo: "/lustre/fsw/coreai_comparch_trtllm/lizhiz/trtllm_2"
+  build_wheel: false
+  trtllm_wheel_path: ""
+  log_dir: "/lustre/fsw/coreai_comparch_trtllm/lizhiz/trtllm_2/examples/disaggregated/slurm/benchmark/logs/kvbm_dsr1_disk"
+  work_dir: "/lustre/fsw/coreai_comparch_trtllm/lizhiz/trtllm_2/examples/disaggregated/slurm/benchmark"
+  worker_env_var: "TLLM_LOG_LEVEL=DEBUG TRTLLM_SERVER_DISABLE_GC=0 TRTLLM_WORKER_DISABLE_GC=0 TLLM_NUMA_AWARE_WORKER_AFFINITY=0 UCX_CUDA_IPC_ENABLE_MNNVL=n TLLM_LLM_ENABLE_DEBUG=0 DYN_KVBM_CPU_CACHE_GB=1024 DYN_KVBM_DISK_CACHE_GB=512 DYN_KVBM_DISK_CACHE_DIR=/raid/scratch/kvbm_disk_cache DYN_KVBM_DISK_ZEROFILL_FALLBACK=false DYN_KVBM_DISK_DISABLE_O_DIRECT=true DYN_KVBM_DISK_ALLOCATOR_TYPE=default DYN_KVBM_NCCL_MLA_MODE=true DYN_KVBM_NCCL_MAX_CTAS=1 RUST_LOG=warn,dynamo_llm::block_manager=warn"
+  server_env_var: ""
+
+# Profiling Configuration
+profiling:
+  nsys_on: false  # Set to true to enable profiling
+
+# Service Discovery Configuration
+service_discovery:
+  backend: "etcd"
+
+# KVBM Configuration
+kvbm:
+  enabled: true
+  package: "kvbm"
+  zmq_port: 20083
+
+# Accuracy Configuration
+accuracy:
+  enable_accuracy_test: false
+
+worker_config:
+  gen:
+    tensor_parallel_size: 8
+    moe_expert_parallel_size: 8
+    enable_attention_dp: false
+    enable_lm_head_tp_in_adp: false
+    pipeline_parallel_size: 1
+    max_batch_size: 64
+    max_num_tokens: 256
+    max_seq_len: 149760
+    print_iter_log: true
+    kv_cache_config:
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.7
+      dtype: fp8
+    moe_config:
+      backend: CUTEDSL
+      use_low_precision_moe_combine: true
+    cache_transceiver_config:
+      max_tokens_in_buffer: 149760
+      backend: UCX
+    stream_interval: 100
+    num_postprocess_workers: 4
+    cuda_graph_config:
+      enable_padding: true
+      batch_sizes:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+    allreduce_strategy: MNNVL
+  ctx:
+    max_batch_size: 4
+    max_num_tokens: 8192
+    max_seq_len: 149760
+    enable_chunked_prefill: true
+    tensor_parallel_size: 8
+    moe_expert_parallel_size: 8
+    enable_attention_dp: false
+    pipeline_parallel_size: 1
+    print_iter_log: true
+    cuda_graph_config: null
+    disable_overlap_scheduler: true
+    moe_config:
+      backend: TRTLLM
+    kv_cache_config:
+      enable_block_reuse: false
+      enable_partial_reuse: false
+      free_gpu_memory_fraction: 0.8
+      dtype: fp8
+      host_cache_size: 0
+      secondary_offload_min_priority: 0
+      event_buffer_max_size: 1024
+    cache_transceiver_config:
+      max_tokens_in_buffer: 149760
+      backend: UCX

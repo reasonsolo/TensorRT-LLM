@@ -265,6 +265,8 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_llama31_8b_ucx.yaml",
         "mamba_conc_greater_than_mbs":
         f"{test_configs_root}/disagg_config_mamba_conc_greater_than_mbs.yaml",
+        "kvbm_disk_offload":
+        f"{test_configs_root}/disagg_config_kvbm_disk_offload.yaml",
     }
 
     if test_desc not in config_map:
@@ -2513,3 +2515,26 @@ def test_disaggregated_mamba_conc_greater_than_mbs(disaggregated_example_root,
     print(f"E2EL: {e2el} ms, TTFT: {ttft} ms")
 
     assert e2el > 0 and ttft > 0
+
+
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_kvbm_disk_offload(disaggregated_test_root,
+                                         disaggregated_example_root, llm_venv,
+                                         llama_model_root):
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+
+    env = llm_venv._new_env.copy()
+    env["DYN_KVBM_CPU_CACHE_GB"] = "16"
+    env["DYN_KVBM_DISK_CACHE_GB"] = "16"
+    env["DYN_KVBM_DISK_CACHE_DIR"] = "/tmp/kvbm_disk_cache_test"
+    env["DYN_KVBM_DISK_DISABLE_O_DIRECT"] = "true"
+    env["DYN_KVBM_DISK_ALLOCATOR_TYPE"] = "default"
+    env["DYN_KVBM_DISK_ZEROFILL_FALLBACK"] = "false"
+    env["DYN_KVBM_NCCL_MLA_MODE"] = "false"
+
+    run_disaggregated_test(disaggregated_example_root,
+                           "kvbm_disk_offload",
+                           env=env,
+                           cwd=llm_venv.get_working_directory())

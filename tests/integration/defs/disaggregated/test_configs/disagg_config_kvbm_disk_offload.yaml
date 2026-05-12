@@ -1,0 +1,31 @@
+hostname: localhost
+model: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+backend: pytorch
+cuda_graph_config: null
+disable_overlap_scheduler: true
+enable_autotuner: false
+context_servers:
+  num_instances: 1
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  kv_cache_config:
+    enable_block_reuse: true
+    free_gpu_memory_fraction: 0.2
+    host_cache_size: 0
+    secondary_offload_min_priority: 0
+    event_buffer_max_size: 1024
+  kv_connector_config:
+    connector_module: kvbm.trtllm_integration.connector
+    connector_scheduler_class: DynamoKVBMConnectorLeader
+    connector_worker_class: DynamoKVBMConnectorWorker
+  cache_transceiver_config:
+    backend: DEFAULT
+generation_servers:
+  num_instances: 1
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  kv_cache_config:
+    enable_block_reuse: false
+    free_gpu_memory_fraction: 0.2
+  cache_transceiver_config:
+    backend: DEFAULT
