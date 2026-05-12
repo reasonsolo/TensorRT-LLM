@@ -98,6 +98,12 @@ public:
     bool verifyQueueIntegrity() const override;
 
 private:
+    struct FreeBlockQueuePosition
+    {
+        SizeType32 cacheLevel;
+        SizeType32 priorityIdx;
+    };
+
     /// @brief A fixed-size container supporting both non-negative and negative indexing.
     ///        Non-negative IDs index directly into positive.
     ///        Negative IDs index into negative by absolute value, i.e. -1 → 1, -2 → 2, etc.
@@ -120,6 +126,8 @@ private:
     std::vector<std::vector<FreeBlocksQueue>> mFreeQueues;
     // Iterators to block entries in mFreeQueues, indexed by block ID
     BidirectionalVector<std::optional<FreeBlocksQueue::iterator>> mFreeBlockIterators;
+    // Queue location for each free-block iterator, indexed by block ID.
+    BidirectionalVector<std::optional<FreeBlockQueuePosition>> mFreeBlockIteratorPositions;
     // Amount of free blocks at each level
     std::vector<SizeType32> mNumFreeBlocksPerLevel;
     // Secondary offload threshold. Blocks below this priority won't be offloaded.

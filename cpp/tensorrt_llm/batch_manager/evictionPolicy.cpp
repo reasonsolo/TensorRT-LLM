@@ -63,6 +63,7 @@ void LRUEvictionPolicy::initialize(std::vector<BlockPtr>& mAllBlocksById, std::v
     // Create queues for all levels: primary, secondary, and placeholder (initially empty).
     mFreeQueues.resize(kPlaceholderLevel + 1, std::vector<FreeBlocksQueue>(kNumPriorities));
     mFreeBlockIterators.positive.resize(mAllBlocksById.size());
+    mFreeBlockIteratorPositions.positive.resize(mAllBlocksById.size());
     mNumFreeBlocksPerLevel.resize(kPlaceholderLevel + 1, 0);
 
     for (SizeType32 cacheLevel = 0; cacheLevel < kNumCacheLevels; cacheLevel++)
@@ -74,6 +75,7 @@ void LRUEvictionPolicy::initialize(std::vector<BlockPtr>& mAllBlocksById, std::v
             // Initialize all blocks to be the default priority level
             mFreeBlockIterators[startIdx + blockId]
                 = freeQueue.insert(freeQueue.end(), mAllBlocksById[startIdx + blockId]);
+            mFreeBlockIteratorPositions[startIdx + blockId] = FreeBlockQueuePosition{cacheLevel, defaultPriorityIdx};
         }
 
         mNumFreeBlocksPerLevel[cacheLevel] = sizes[cacheLevel];
@@ -90,6 +92,7 @@ void LRUEvictionPolicy::initializePlaceholders(std::vector<BlockPtr>& allPlaceho
     // Placeholder IDs -2, -3, ... map to indices 2, 3, ... via abs(id).
     // Indices 0 and 1 are unused (0 is invalid, 1 corresponds to kCachedBlocksRootId).
     mFreeBlockIterators.negative.resize(len);
+    mFreeBlockIteratorPositions.negative.resize(len);
 
     auto& freeQueue = mFreeQueues[kPlaceholderLevel][defaultPriorityIdx];
 
@@ -98,6 +101,8 @@ void LRUEvictionPolicy::initializePlaceholders(std::vector<BlockPtr>& allPlaceho
         if (block)
         {
             mFreeBlockIterators[block->getBlockId()] = freeQueue.insert(freeQueue.end(), block);
+            mFreeBlockIteratorPositions[block->getBlockId()]
+                = FreeBlockQueuePosition{kPlaceholderLevel, defaultPriorityIdx};
             mNumFreeBlocksPerLevel[kPlaceholderLevel]++;
         }
     }
@@ -106,7 +111,7 @@ void LRUEvictionPolicy::initializePlaceholders(std::vector<BlockPtr>& allPlaceho
 bool LRUEvictionPolicy::verifyQueueIntegrity() const
 {
     static char const* const levelToStr[] = {"primary", "secondary", "placeholder"};
-    static const std::function<bool(BlockPtr const&)> levelValidators[]
+    static std::function<bool(BlockPtr const&)> const levelValidators[]
         = {[](BlockPtr const& block) { return block->isPrimary(); },
             [](BlockPtr const& block) { return !block->isPrimary(); },
             [](BlockPtr const& block) { return block->isPlaceholder(); }};
@@ -147,6 +152,29 @@ std::tuple<BlockPtr, bool> LRUEvictionPolicy::getFreeBlock(SizeType32 cacheLevel
         if (!mFreeQueues[level][pri].empty())
         {
             auto block = mFreeQueues[level][pri].front();
+            TLLM_CHECK_WITH_INFO(block != nullptr,
+                "LRUEvictionPolicy free queue contains null block at level %d priorityIdx %d", level, pri);
+            auto const blockId = block->getBlockId();
+            TLLM_CHECK_WITH_INFO(mFreeBlockIterators[blockId] != std::nullopt,
+                "LRUEvictionPolicy free queue contains block %d at level %d priorityIdx %d without iterator", blockId,
+                level, pri);
+            auto const& position = mFreeBlockIteratorPositions[blockId];
+            TLLM_CHECK_WITH_INFO(position.has_value(),
+                "LRUEvictionPolicy free queue contains block %d at level %d priorityIdx %d without iterator position",
+                blockId, level, pri);
+            TLLM_CHECK_WITH_INFO(position->cacheLevel == level && position->priorityIdx == pri,
+                "LRUEvictionPolicy free queue front mismatch for block %d: queued at level %d priorityIdx %d but "
+                "iterator position says level %d priorityIdx %d",
+                blockId, level, pri, position->cacheLevel, position->priorityIdx);
+            auto const& iteratorBlock = **mFreeBlockIterators[blockId];
+            TLLM_CHECK_WITH_INFO(iteratorBlock != nullptr,
+                "LRUEvictionPolicy free queue iterator for block %d points to null block", blockId);
+            TLLM_CHECK_WITH_INFO(iteratorBlock.get() == block.get(),
+                "LRUEvictionPolicy free queue front mismatch for block %d: iterator points to block %d", blockId,
+                iteratorBlock->getBlockId());
+            TLLM_CHECK_WITH_INFO(!block->hasRefs(),
+                "LRUEvictionPolicy free queue contains referenced block %d at level %d priorityIdx %d", blockId, level,
+                pri);
 
             // mFreeQueues only contains leaf blocks, so no need to iterate through the next block pointers.
             // It's possible to have a primary block with children in secondary memory. We handle this
@@ -182,9 +210,17 @@ void LRUEvictionPolicy::releaseBlock(BlockPtr block, bool toFront)
     }
     SizeType32 const cacheLevel = getCacheLevel(block);
     SizeType32 const id = block->getBlockId();
+    SizeType32 const priorityIdx = getPriorityIdx(block->getPriority());
+
+    TLLM_CHECK_WITH_INFO(mFreeBlockIterators[id] == std::nullopt,
+        "LRUEvictionPolicy duplicate release for block %d: existing position level %d priorityIdx %d, new position "
+        "level %d priorityIdx %d, hasRefs=%d, isPrimary=%d, isPlaceholder=%d",
+        id, mFreeBlockIteratorPositions[id].has_value() ? mFreeBlockIteratorPositions[id]->cacheLevel : -1,
+        mFreeBlockIteratorPositions[id].has_value() ? mFreeBlockIteratorPositions[id]->priorityIdx : -1, cacheLevel,
+        priorityIdx, block->hasRefs(), block->isPlaceholder() ? 0 : block->isPrimary(), block->isPlaceholder());
 
     // If there are no children, this is a leaf block. Insert into a queue.
-    auto& q = mFreeQueues[cacheLevel][getPriorityIdx(block->getPriority())];
+    auto& q = mFreeQueues[cacheLevel][priorityIdx];
     if (toFront)
     {
         mFreeBlockIterators[id] = q.insert(q.begin(), block);
@@ -193,6 +229,7 @@ void LRUEvictionPolicy::releaseBlock(BlockPtr block, bool toFront)
     {
         mFreeBlockIterators[id] = q.insert(q.end(), block);
     }
+    mFreeBlockIteratorPositions[id] = FreeBlockQueuePosition{cacheLevel, priorityIdx};
 
     mNumFreeBlocksPerLevel[cacheLevel]++;
 
@@ -220,14 +257,45 @@ void LRUEvictionPolicy::claimBlock(BlockPtr block, std::optional<executor::Reten
 {
     SizeType32 const id = block->getBlockId();
     SizeType32 const cacheLevel = getCacheLevel(block);
+    SizeType32 const priorityIdx = getPriorityIdx(block->getPriority());
 
     if (mFreeBlockIterators[id] != std::nullopt)
     {
-        mFreeQueues[cacheLevel][getPriorityIdx(block->getPriority())].erase(*mFreeBlockIterators[id]);
-        mNumFreeBlocksPerLevel[cacheLevel] -= 1;
+        TLLM_CHECK_WITH_INFO(mFreeBlockIteratorPositions[id].has_value(),
+            "LRUEvictionPolicy iterator for block %d has no recorded queue position", id);
+        auto const position = *mFreeBlockIteratorPositions[id];
+        if (position.cacheLevel != cacheLevel || position.priorityIdx != priorityIdx)
+        {
+            TLLM_LOG_WARNING(
+                "LRUEvictionPolicy queue position mismatch while claiming block %d: recorded level %d priorityIdx %d, "
+                "current level %d priorityIdx %d. Erasing from recorded queue.",
+                id, position.cacheLevel, position.priorityIdx, cacheLevel, priorityIdx);
+        }
+        TLLM_CHECK_WITH_INFO(mNumFreeBlocksPerLevel[position.cacheLevel] > 0,
+            "LRUEvictionPolicy free-block counter underflow while claiming block %d: recorded level %d priorityIdx %d",
+            id, position.cacheLevel, position.priorityIdx);
+        auto const& iteratorBlock = **mFreeBlockIterators[id];
+        TLLM_CHECK_WITH_INFO(iteratorBlock != nullptr,
+            "LRUEvictionPolicy iterator for block %d points to null block at recorded level %d priorityIdx %d", id,
+            position.cacheLevel, position.priorityIdx);
+        TLLM_CHECK_WITH_INFO(iteratorBlock.get() == block.get(),
+            "LRUEvictionPolicy iterator mismatch while claiming block %d: iterator points to block %d at recorded "
+            "level %d priorityIdx %d",
+            id, iteratorBlock->getBlockId(), position.cacheLevel, position.priorityIdx);
+        TLLM_LOG_DEBUG(
+            "LRUEvictionPolicy claiming block %d from level %d priorityIdx %d: queueSize=%zu freeCount=%d "
+            "currentLevel=%d "
+            "currentPriorityIdx=%d hasRefs=%d isPrimary=%d isPlaceholder=%d",
+            id, position.cacheLevel, position.priorityIdx,
+            mFreeQueues[position.cacheLevel][position.priorityIdx].size(), mNumFreeBlocksPerLevel[position.cacheLevel],
+            cacheLevel, priorityIdx, block->hasRefs(), block->isPlaceholder() ? 0 : block->isPrimary(),
+            block->isPlaceholder());
+        mFreeQueues[position.cacheLevel][position.priorityIdx].erase(*mFreeBlockIterators[id]);
+        mNumFreeBlocksPerLevel[position.cacheLevel] -= 1;
     }
 
     mFreeBlockIterators[id] = std::nullopt;
+    mFreeBlockIteratorPositions[id] = std::nullopt;
 
     if (priority.has_value())
     {
@@ -261,9 +329,20 @@ void LRUEvictionPolicy::refresh()
         if (mFreeBlockIterators[id] != std::nullopt)
         {
             // This is already in another queue. Delete it, and bring it down to the default queue
-            mFreeQueues[level][getPriorityIdx(block->getPriority())].erase(*mFreeBlockIterators[id]);
+            TLLM_CHECK_WITH_INFO(mFreeBlockIteratorPositions[id].has_value(),
+                "LRUEvictionPolicy expiring block %d has iterator but no recorded queue position", id);
+            auto const position = *mFreeBlockIteratorPositions[id];
+            if (position.cacheLevel != level || position.priorityIdx != getPriorityIdx(block->getPriority()))
+            {
+                TLLM_LOG_WARNING(
+                    "LRUEvictionPolicy queue position mismatch while expiring block %d: recorded level %d priorityIdx "
+                    "%d, current level %d priorityIdx %d. Erasing from recorded queue.",
+                    id, position.cacheLevel, position.priorityIdx, level, getPriorityIdx(block->getPriority()));
+            }
+            mFreeQueues[position.cacheLevel][position.priorityIdx].erase(*mFreeBlockIterators[id]);
             auto& q = mFreeQueues[level][defaultPriorityIdx];
             mFreeBlockIterators[id] = q.insert(q.end(), block);
+            mFreeBlockIteratorPositions[id] = FreeBlockQueuePosition{level, defaultPriorityIdx};
         }
         block->setPriority(kDefaultPriority);
     }

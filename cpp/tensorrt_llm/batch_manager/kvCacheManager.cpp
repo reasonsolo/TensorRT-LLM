@@ -1265,6 +1265,12 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
         block->detachFromLookupNode();
     }
     // Claim the block in primary block queue
+    TLLM_LOG_DEBUG(
+        "%s::getFreeBlock - Claiming block %d for request %lu: wantPlaceholder=%d priority=%d mode=%d directory=%s "
+        "hasRefs=%d isPrimary=%d isPlaceholder=%d",
+        mLogPrefix.c_str(), block->getBlockId(), sequence.getRequestId(), wantPlaceholder, priority,
+        static_cast<int>(mode), directory.c_str(), block->hasRefs(), block->isPlaceholder() ? 0 : block->isPrimary(),
+        block->isPlaceholder());
     mEvictionPolicy->claimBlock(block, priority, durationMs);
     TLLM_LOG_DEBUG("%s::getFreeBlock - Block %d is now acquired by sequence %d", mLogPrefix.c_str(),
         block->getBlockId(), sequence.getRequestId());
