@@ -1105,6 +1105,12 @@ class OpenAIServer(_VideoRoutesMixin):
                 gather_generation_logits,
                 reasoning_parser=self.generator.args.reasoning_parser,
                 backend=self.generator.args.backend)
+            # Mirror the /v1/completions gate at line ~1386 so the
+            # /perf_metrics deque is populated for chat requests too.
+            # Without this, server-level `return_perf_metrics: true` is
+            # ignored on this path and /perf_metrics returns [].
+            if len(os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", "")) > 0:
+                sampling_params.return_perf_metrics = True
             if self.tool_parser and request.tools:
                 tool_parser_cls = ToolParserFactory.parsers.get(
                     self.tool_parser.lower())
@@ -1533,16 +1539,34 @@ class OpenAIServer(_VideoRoutesMixin):
 
         async def create_streaming_generator(promise: RequestOutput,
                                              postproc_params: PostprocParams):
-            async for res in promise:
+            try:
                 if not self.postproc_worker_enabled:
                     post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
-                    pp_results = post_processor(res, args)
-                else:
-                    pp_results = res.outputs[0]._postprocess_result
+                # Stamp server_first_token_time on the first response and call
+                # _extract_metrics after [DONE], mirroring chat_stream_generator
+                # in `openai_chat`. Without this, the /perf_metrics deque is
+                # never populated for harmony chat requests because the metrics
+                # entry is only appended inside _extract_metrics.
+                first_response = await anext(promise)
+                raw_request.state.server_first_token_time = (
+                    get_steady_clock_now_in_seconds())
+                pp_results = (first_response.outputs[0]._postprocess_result if
+                              self.postproc_worker_enabled else post_processor(
+                                  first_response, args))
                 for pp_res in pp_results:
                     yield pp_res
-
-            yield "data: [DONE]\n\n"
+                res = first_response
+                async for res in promise:
+                    pp_results = (res.outputs[0]._postprocess_result
+                                  if self.postproc_worker_enabled else
+                                  post_processor(res, args))
+                    for pp_res in pp_results:
+                        yield pp_res
+                yield "data: [DONE]\n\n"
+                await self._extract_metrics(res, raw_request)
+            except:
+                logger.error(traceback.format_exc())
+                raise
 
         try:
             # Initialize HarmonyAdapter
@@ -1560,17 +1584,28 @@ class OpenAIServer(_VideoRoutesMixin):
             # Get tool_choice from request
             tool_choice = getattr(request, 'tool_choice', None)
 
-            try:
-                harmony_tokens = self.harmony_adapter.openai_to_harmony_tokens(
-                    request.messages,
-                    tools_dict,
-                    reasoning_effort=reasoning_effort,
-                    tool_choice=tool_choice)
-            except Exception as e:
-                logger.error(f"messages_dict: {request.messages}")
-                logger.error(f"tools_dict: {tools_dict}")
-                logger.error(f"request: {request}")
-                raise e
+            # Disagg: when the ctx worker has already harmony-tokenized the
+            # messages, `_get_gen_request` forwards those token IDs as
+            # `prompt_token_ids` on the gen request (see
+            # openai_disagg_service.py::_get_gen_request and
+            # openai_server.py::_create_chat_response which attaches
+            # `promise.prompt_token_ids` to the ctx response when
+            # `request_type == "context_only"`). Re-running the harmony
+            # adapter on gen would duplicate that work, so skip it.
+            if request.prompt_token_ids is not None:
+                harmony_tokens = request.prompt_token_ids
+            else:
+                try:
+                    harmony_tokens = self.harmony_adapter.openai_to_harmony_tokens(
+                        request.messages,
+                        tools_dict,
+                        reasoning_effort=reasoning_effort,
+                        tool_choice=tool_choice)
+                except Exception as e:
+                    logger.error(f"messages_dict: {request.messages}")
+                    logger.error(f"tools_dict: {tools_dict}")
+                    logger.error(f"request: {request}")
+                    raise e
 
             # Get harmony stop tokens
             harmony_stop_tokens = self.harmony_adapter.get_stop_tokens()
@@ -1582,6 +1617,12 @@ class OpenAIServer(_VideoRoutesMixin):
             sampling_params = request.to_sampling_params(
                 vocab_size=self._vocab_size, reasoning_parser="gpt_oss")
             sampling_params.detokenize = False  # Harmony adapter handles detokenization
+            # Mirror the /v1/completions gate at line ~1386 so the
+            # /perf_metrics deque is populated for chat (harmony) requests
+            # too. Without this, server-level `return_perf_metrics: true`
+            # is ignored on this path and /perf_metrics returns [].
+            if len(os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", "")) > 0:
+                sampling_params.return_perf_metrics = True
             disaggregated_params = to_llm_disaggregated_params(
                 request.disaggregated_params)
             trace_headers = (None if raw_request is None else
