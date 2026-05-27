@@ -10,9 +10,11 @@ to PyExecutor, including:
 """
 
 import types
+from contextlib import nullcontext
 from unittest.mock import Mock
 
 import pytest
+import torch
 
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     SHUTDOWN_REQUEST_ID,
@@ -248,6 +250,82 @@ class TestDisaggTerminationGuard:
         """PP > 1 disables partial reuse path, falling back to normal logic."""
         req = _make_request(complete_state=True, transmission_state=False)
         assert _classify_termination(req, True, False, 2) == "stats_only"
+
+
+class _ContextUpdateOrderingExecutor:
+    def __init__(self):
+        self.events = []
+        self._scheduler_manages_kv_suspend = True
+        self.kv_cache_transceiver = object()
+        self.kv_cache_manager = Mock()
+        self.kv_cache_manager.update_context_resources.side_effect = (
+            lambda _scheduled: self.events.append("context_resources"))
+        self.resource_manager = Mock()
+        self.resource_manager.update_resources.side_effect = (
+            lambda *_args: self.events.append("resource_update"))
+        self.model_engine = types.SimpleNamespace()
+        self.async_transfer_manager = Mock()
+        self.async_transfer_manager.has_any_inflight_requests.return_value = False
+        self._disagg_pp_termination_handler = None
+        self.enable_iter_perf_stats = False
+        self.active_requests = []
+        self.dist = Mock()
+        self.dist.pp_size = 1
+
+    def _update_context_resources_before_kv_send(self, scheduled_batch):
+        return PyExecutor._update_context_resources_before_kv_send(
+            self, scheduled_batch)
+
+    def _update_requests(self, *_args):
+        self.events.append("update_requests")
+
+    def _send_kv_async(self, _requests):
+        self.events.append("send_kv")
+
+    def _flush_pending_transfer_responses(self):
+        self.events.append("flush_transfer_responses")
+
+    def _handle_canceled_requests(self):
+        self.events.append("handle_canceled")
+
+    def _handle_responses(self):
+        self.events.append("handle_responses")
+        return []
+
+    def _check_disagg_ctx_cache_transfer_status(self, _at_least_request_num):
+        self.events.append("check_ctx_transfer")
+
+    def _remove_inflight_ids(self, _scheduled_requests):
+        self.events.append("remove_inflight")
+
+    def _check_kv_transfer_timeout(self):
+        self.events.append("check_timeout")
+
+    def _handle_kv_transfer_timeouts_synced(self):
+        self.events.append("handle_timeouts_synced")
+
+    def _flush_iter_stats_synced(self):
+        self.events.append("flush_iter_stats")
+
+
+def test_handle_executed_batch_updates_context_resources_before_kv_send(
+        monkeypatch):
+    monkeypatch.setattr(torch.cuda.nvtx, "range", lambda _name: nullcontext())
+    executor = _ContextUpdateOrderingExecutor()
+    scheduled_requests = Mock()
+    scheduled_requests.context_requests_last_chunk = [Mock()]
+    executed_batch = Mock()
+    executed_batch.sample_state = Mock()
+    executed_batch.scheduled_requests = scheduled_requests
+
+    PyExecutor._handle_executed_batch(executor, executed_batch)
+
+    assert executor.events.index("context_resources") < executor.events.index(
+        "send_kv")
+    assert executor.events.index("context_resources") < executor.events.index(
+        "resource_update")
+    executor.kv_cache_manager.update_context_resources.assert_called_once_with(
+        scheduled_requests)
 
 
 # ---------------------------------------------------------------------------

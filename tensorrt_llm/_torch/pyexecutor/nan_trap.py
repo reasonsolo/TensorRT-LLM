@@ -12,18 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# CUDA-graph-safe NaN/Inf trap for diagnosing where bad values originate inside a model.
+# CUDA-graph-safe NaN trap for diagnosing where bad values first appear.
 #
-# Design:
-#   - Walk the model's named_modules() once at attach time and assign each module a slot in a
-#     persistent device-resident bool tensor (the 'flags').
-#   - Register a forward hook per module that does ONLY device-side ops: torch.isnan + torch.isinf
-#     OR-ed into the module's flag slot via logical_or_. No .item(), no .cpu(), no print inside
-#     the hook -> safe to run inside captured CUDA graphs.
-#   - check_and_log() is called from the executor driver loop AFTER model.forward returns
-#     (outside the captured region). It copies flags to host and logs the earliest True slot.
+# Enable: TRTLLM_NAN_TRAP=1
+# Tune depth: TRTLLM_NAN_TRAP_DEPTH=2 (default; hooks individual decoder layers)
+# Focus: TRTLLM_NAN_TRAP_FOCUS=model.layers.0,model.layers.1 (hook ALL children)
+# Sub-modules: TRTLLM_NAN_TRAP_SUB=self_attn,mlp (hook these children of depth layers)
+# ModuleList/Sequential containers don't count toward depth.
 #
-# Enable with env var TRTLLM_NAN_TRAP=1.
+# Hooks use device-side flag tensor + armed gate (bypasses warmup).
+# Cost: 2 kernels per hooked layer (isnan+any, then logical_or_ into flags).
 
 from __future__ import annotations
 
@@ -34,24 +32,21 @@ import torch
 
 from tensorrt_llm.logger import logger
 
-# Dtypes for which torch.isnan / torch.isinf are implemented in this PyTorch build.
-# Sub-byte dtypes like Float4_e2m1fn_x2 (NVFP4) do NOT support these ops, so we
-# silently skip them in the hook.
 _CHECKABLE_DTYPES = {
     torch.float16,
     torch.bfloat16,
     torch.float32,
     torch.float64,
 }
-# FP8 dtypes are present in modern torch; guard via getattr because older builds
-# may not expose them.
-for _name in ("float8_e4m3fn", "float8_e5m2", "float8_e4m3fnuz", "float8_e5m2fnuz"):
+for _name in ("float8_e4m3fn", "float8_e5m2", "float8_e4m3fnuz",
+              "float8_e5m2fnuz"):
     _dt = getattr(torch, _name, None)
     if _dt is not None:
         _CHECKABLE_DTYPES.add(_dt)
 
 
 def _walk_floating_tensors(obj):
+    """Yield all checkable floating tensors from a module output."""
     if isinstance(obj, torch.Tensor):
         if obj.is_floating_point() and obj.dtype in _CHECKABLE_DTYPES:
             yield obj
@@ -64,54 +59,26 @@ def _walk_floating_tensors(obj):
         for x in obj.values():
             yield from _walk_floating_tensors(x)
         return
+    if hasattr(obj, "__dict__"):
+        for x in vars(obj).values():
+            yield from _walk_floating_tensors(x)
 
 
 class NanTrap:
+
     def __init__(self, names: List[str], device: torch.device):
         self.names = names
-        # One bool slot per module. Persistent device buffer -> captureable.
         self.flags = torch.zeros(len(names), dtype=torch.bool, device=device)
+        self._armed = torch.zeros(1, dtype=torch.bool, device=device)
         self._step = 0
 
-    @classmethod
-    def create_and_attach(cls, model: torch.nn.Module) -> "NanTrap":
-        device = next(
-            (p.device for p in model.parameters() if p.device.type == "cuda"), torch.device("cuda")
-        )
-        names: List[str] = []
-        modules = []
-        for name, mod in model.named_modules():
-            if name == "":
-                continue
-            names.append(name)
-            modules.append(mod)
-        trap = cls(names, device)
-        for i, mod in enumerate(modules):
-
-            def make_hook(slot):
-                def hook(_m, _inp, out):
-                    try:
-                        flag = None
-                        for t in _walk_floating_tensors(out):
-                            bad = torch.isnan(t).any() | torch.isinf(t).any()
-                            flag = bad if flag is None else (flag | bad)
-                        if flag is not None:
-                            # In-place OR into persistent flag tensor (pure device op).
-                            trap.flags[slot].logical_or_(flag)
-                    except (NotImplementedError, RuntimeError):
-                        # Some exotic dtypes (e.g. Float4_e2m1fn_x2) don't support
-                        # isnan/isinf. Skip silently rather than killing the worker.
-                        pass
-
-                return hook
-
-            mod.register_forward_hook(make_hook(i))
-        logger.info(f"[NaN-TRAP] attached {len(names)} module hooks")
-        return trap
+    def arm(self):
+        self._armed.fill_(True)
 
     def check_and_log(self, rank: int) -> None:
-        # Host-side; call OUTSIDE the captured region (once per model.forward).
         self._step += 1
+        if not self._armed.item():
+            return
         try:
             flags_host = self.flags.to("cpu", non_blocking=False)
         except RuntimeError:
@@ -123,12 +90,98 @@ class NanTrap:
         all_names = [self.names[i] for i in bad[:16]]
         logger.error(
             f"[NaN-TRAP] rank={rank} step={self._step} first_nan_module={first!r} "
-            f"num_flagged={len(bad)} flagged_modules={all_names}"
-        )
+            f"num_flagged={len(bad)} flagged_modules={all_names}")
         self.flags.zero_()
 
 
-def maybe_create_nan_trap(model: torch.nn.Module) -> Optional[NanTrap]:
+def maybe_attach_nan_trap(model: torch.nn.Module) -> Optional[NanTrap]:
     if os.environ.get("TRTLLM_NAN_TRAP", "0") != "1":
         return None
-    return NanTrap.create_and_attach(model)
+    max_depth = int(os.environ.get("TRTLLM_NAN_TRAP_DEPTH", "2"))
+    focus_raw = os.environ.get("TRTLLM_NAN_TRAP_FOCUS", "")
+    focus_prefixes = (
+        [p.strip() for p in focus_raw.split(",") if p.strip()]
+        if focus_raw else None
+    )
+    sub_raw = os.environ.get("TRTLLM_NAN_TRAP_SUB", "")
+    sub_names = (
+        [s.strip() for s in sub_raw.split(",") if s.strip()]
+        if sub_raw else None
+    )
+
+    device = next(
+        (p.device for p in model.parameters() if p.device.type == "cuda"),
+        torch.device("cuda"),
+    )
+
+    container_prefixes: set = set()
+    for name, mod in model.named_modules():
+        if isinstance(mod, (torch.nn.ModuleList, torch.nn.Sequential)):
+            container_prefixes.add(name)
+
+    names: List[str] = []
+    modules = []
+    for name, mod in model.named_modules():
+        if name == "":
+            continue
+        if isinstance(mod, (torch.nn.ModuleList, torch.nn.Sequential)):
+            continue
+        if focus_prefixes:
+            in_focus = any(
+                name == fp or name.startswith(fp + ".")
+                for fp in focus_prefixes
+            )
+            if in_focus:
+                names.append(name)
+                modules.append(mod)
+                continue
+        parts = name.split(".")
+        depth = sum(1 for i, _ in enumerate(parts)
+                    if ".".join(parts[:i + 1]) not in container_prefixes)
+        if depth > max_depth:
+            continue
+        names.append(name)
+        modules.append(mod)
+
+    if sub_names and not focus_prefixes:
+        hooked_set = set(names)
+        for name, mod in model.named_modules():
+            if name == "" or isinstance(
+                    mod, (torch.nn.ModuleList, torch.nn.Sequential)):
+                continue
+            if name in hooked_set:
+                continue
+            tail = name.rsplit(".", 1)[-1]
+            if tail not in sub_names:
+                continue
+            parent = name.rsplit(".", 1)[0] if "." in name else ""
+            if parent in hooked_set:
+                names.append(name)
+                modules.append(mod)
+
+    trap = NanTrap(names, device)
+    for i, mod in enumerate(modules):
+
+        def make_hook(slot):
+
+            def hook(_m, _inp, out):
+                try:
+                    last = None
+                    for t in _walk_floating_tensors(out):
+                        last = t
+                    if last is not None:
+                        has_nan = torch.any(torch.isnan(last))
+                        trap.flags[slot].logical_or_(
+                            trap._armed.squeeze() & has_nan)
+                except (NotImplementedError, RuntimeError):
+                    pass
+
+            return hook
+
+        mod.register_forward_hook(make_hook(i))
+
+    logger.info(
+        f"[NaN-TRAP] attached {len(names)} hooks (max_depth={max_depth})"
+        f"{f' focus={focus_prefixes}' if focus_prefixes else ''}"
+        f"{f' sub={sub_names}' if sub_names else ''}")
+    return trap

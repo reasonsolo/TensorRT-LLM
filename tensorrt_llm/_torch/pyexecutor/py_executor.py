@@ -2011,6 +2011,10 @@ class PyExecutor:
                 self._update_requests(executed_batch.sample_state)
 
                 scheduled_requests = executed_batch.scheduled_requests
+                sample_state_scheduled_requests = executed_batch.scheduled_requests
+                context_resources_updated = (
+                    self._update_context_resources_before_kv_send(
+                        sample_state_scheduled_requests))
                 if self.kv_cache_transceiver:
                     finished_ctx_reqs = scheduled_requests.context_requests_last_chunk
                     self._send_kv_async(finished_ctx_reqs)
@@ -2022,13 +2026,13 @@ class PyExecutor:
                 # _handle_responses sees the request before it is terminated.
                 if self.kv_cache_transceiver:
                     self._check_disagg_ctx_cache_transfer_status(0)
-                sample_state_scheduled_requests = executed_batch.scheduled_requests
                 attn_metadata = getattr(self.model_engine, 'attn_metadata',
                                         None)
                 kv_cache_dtype_byte_size = getattr(self.model_engine,
                                                    'kv_cache_dtype_byte_size',
                                                    None)
-                if self._scheduler_manages_kv_suspend:
+                if (self._scheduler_manages_kv_suspend
+                        and not context_resources_updated):
                     self.kv_cache_manager.update_context_resources(
                         sample_state_scheduled_requests)
                 self.resource_manager.update_resources(
@@ -2588,6 +2592,9 @@ class PyExecutor:
                     self._update_request_states(scheduled_batch)
                     self._update_requests(sample_state, self.resource_manager)
 
+                    context_resources_updated = (
+                        self._update_context_resources_before_kv_send(
+                            scheduled_batch))
                     self._send_kv_async(scheduled_batch.all_requests())
                     self._flush_pending_transfer_responses()
 
@@ -2605,7 +2612,8 @@ class PyExecutor:
                                             None)
                     kv_cache_dtype_byte_size = getattr(
                         self.model_engine, 'kv_cache_dtype_byte_size', None)
-                    if self._scheduler_manages_kv_suspend:
+                    if (self._scheduler_manages_kv_suspend
+                        and not context_resources_updated):
                         self.kv_cache_manager.update_context_resources(
                             scheduled_batch)
                     self.resource_manager.update_resources(
@@ -3825,6 +3833,19 @@ class PyExecutor:
         self._check_disagg_gen_cache_transfer_status(1 if block_transfer else 0)
 
         return
+
+    def _update_context_resources_before_kv_send(
+            self, scheduled_batch: ScheduledRequests) -> bool:
+        """Commit context KV metadata before async KV transfer snapshots it."""
+        if not (self._scheduler_manages_kv_suspend
+                and self.kv_cache_transceiver):
+            return False
+
+        # KVCacheManagerV2 block reuse may rebase uncommitted pages onto
+        # existing radix-tree pages and release their original slots. Commit
+        # before the transceiver snapshots slot IDs for async transfer.
+        self.kv_cache_manager.update_context_resources(scheduled_batch)
+        return True
 
     @nvtx_range("_send_kv_async")
     def _send_kv_async(self, scheduled_requests: List[LlmRequest]):

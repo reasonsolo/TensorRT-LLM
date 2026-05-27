@@ -67,7 +67,7 @@ from .layerwise_nvtx_marker import LayerwiseNvtxMarker
 from .llm_request import LlmRequest, get_draft_token_length
 from .mamba_cache_manager import MambaHybridCacheManager
 from .model_loader import ModelLoader, _construct_checkpoint_loader
-from .nan_trap import maybe_create_nan_trap
+from .nan_trap import maybe_attach_nan_trap
 from .resource_manager import (BaseResourceManager, KVCacheManager,
                                KVCacheManagerV2, PeftCacheManager,
                                ResourceManager, ResourceManagerType)
@@ -287,7 +287,7 @@ class PyTorchModelEngine(ModelEngine):
         else:
             self.model_is_wrapped = False
         # Optional NaN/Inf forward-hook trap (env TRTLLM_NAN_TRAP=1). CUDA-graph-safe.
-        self._nan_trap = maybe_create_nan_trap(self.model)
+        self._nan_trap = maybe_attach_nan_trap(self.model)
         self.sparse_attention_config = self.model.model_config.sparse_attention_config
         # In case that some tests use stub models and override `_load_model`.
         if not hasattr(self.model, 'extra_attrs'):
@@ -392,6 +392,8 @@ class PyTorchModelEngine(ModelEngine):
             raise e
 
         self.is_warmup = False
+        if self._nan_trap is not None:
+            self._nan_trap.arm()
         self.previous_request_ids = []
         self.has_previous_device_draft = False
         self.previous_accepted_tokens_cuda = torch.empty((self.batch_size, ),

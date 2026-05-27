@@ -503,6 +503,73 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             self._compress_ratios_sorted,
         )
 
+    def _validate_block_tables(self):
+        """Check all block table groups for BAD_PAGE_INDEX entries.
+
+        Validates SWA sliding_block_tables and each compress_block_tables group.
+        Enable via TRTLLM_VALIDATE_BLOCK_TABLE=1.
+        """
+        from tensorrt_llm.logger import logger
+        from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
+
+        num_seqs = self.num_seqs
+        num_contexts = self.num_contexts
+        tokens_per_block = self.kv_cache_manager.tokens_per_block
+
+        if num_seqs <= num_contexts:
+            return
+
+        cached = self.cached_token_lens_cpu[:num_seqs]
+        bad_found = False
+
+        # --- SWA block table ---
+        window_size = self.sparse_attention_config.window_size
+        sbt = self.sliding_block_tables  # [num_layers, num_attn_types, num_seqs, max_blocks]
+        for seq_idx in range(num_contexts, num_seqs):
+            history = int(cached[seq_idx].item())
+            if history == 0:
+                continue
+            first_token_in_window = max(0, history - window_size + 1)
+            first_block = first_token_in_window // tokens_per_block
+            last_block = history // tokens_per_block
+            block_entries = sbt[0, 0, seq_idx, first_block:last_block + 1].cpu()
+            bad_mask = block_entries == BAD_PAGE_INDEX
+            if bad_mask.any():
+                bad_positions = bad_mask.nonzero(as_tuple=False).flatten() + first_block
+                logger.error(
+                    f"[BLOCK-TABLE-VALIDATE] group=SWA seq_idx={seq_idx} "
+                    f"history={history} window_blocks=[{first_block},{last_block}] "
+                    f"BAD_PAGE_INDEX at block_ords={bad_positions.tolist()}"
+                )
+                bad_found = True
+
+        # --- Compress block tables (compress4, compress128, etc.) ---
+        for compress_ratio, cbt in self.compress_block_tables.items():
+            # cbt shape: [num_seqs, max_blocks]
+            compressed_tpb = tokens_per_block * compress_ratio
+            for seq_idx in range(num_contexts, num_seqs):
+                history = int(cached[seq_idx].item())
+                if history == 0:
+                    continue
+                last_block = history // compressed_tpb
+                block_entries = cbt[seq_idx, :last_block + 1].cpu()
+                bad_mask = block_entries == BAD_PAGE_INDEX
+                if bad_mask.any():
+                    bad_positions = bad_mask.nonzero(as_tuple=False).flatten()
+                    logger.error(
+                        f"[BLOCK-TABLE-VALIDATE] group=compress{compress_ratio} "
+                        f"seq_idx={seq_idx} history={history} "
+                        f"blocks=[0,{last_block}] "
+                        f"BAD_PAGE_INDEX at block_ords={bad_positions.tolist()}"
+                    )
+                    bad_found = True
+
+        if bad_found:
+            logger.error(
+                "[BLOCK-TABLE-VALIDATE] INVALID BLOCK REFERENCES DETECTED! "
+                "Kernel will read garbage memory from these blocks."
+            )
+
     @staticmethod
     @maybe_compile(dynamic=True, options={"max-autotune": True})
     def _prepare_deepseek_v4_indices_compiled(
@@ -632,6 +699,12 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
 
         # For DeepSeek-V4 indices
         self.prepare_for_deepseek_v4_indices()
+
+        # DEBUG: validate block table references after both block tables and
+        # SWA indices are ready.
+        import os
+        if os.environ.get("TRTLLM_VALIDATE_BLOCK_TABLE", "0") == "1":
+            self._validate_block_tables()
 
         # Prepare metadata for indexer (only needed when sparse layers exist)
         if has_sparse_layers:
