@@ -950,6 +950,7 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                  tokens_per_block: int = 32,
                  custom_tokenizer: Optional[str] = None,
                  backfill_block_hashes_on_finish: bool = False,
+                 use_remote_kv_events: bool = True,
                  **kwargs):
         super().__init__(server_role, servers, metadata_server_cfg,
                          metadata_server, **kwargs)
@@ -959,7 +960,8 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         self._max_batch_size = max_batch_size
         # Opt-in workaround for the disagg-gen path that doesn't emit
         # kv_cache_events. Stash hashes at routing, inject on finish.
-        self._backfill_block_hashes_on_finish = backfill_block_hashes_on_finish
+        self._use_remote_kv_events = use_remote_kv_events
+        self._backfill_block_hashes_on_finish = backfill_block_hashes_on_finish or not use_remote_kv_events
         self._pending_block_hashes: dict[int, tuple[list, str]] = {}
 
     def _create_server_state(self, server: str) -> KvCacheAwareServerState:
@@ -1065,7 +1067,9 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                                for h in hash_list)
                 self._server_state[server].add_blocks(flat_hashes,
                                                       hash_algo=hash_algo)
-            await self._server_state[server].poll_and_update(session)
+            if self._use_remote_kv_events:
+                asyncio.create_task(
+                    self._server_state[server].poll_and_update(session))
 
     def _on_servers_updated(self, old_servers, new_servers):
         new_state = {}
