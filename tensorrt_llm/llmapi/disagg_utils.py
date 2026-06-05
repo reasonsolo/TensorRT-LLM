@@ -94,6 +94,16 @@ class DisaggServerConfig():
     # the orchestrator relays a string instead of materializing the token-id list
     # on its event loop. Text-only, non-harmony deployments (see _get_ctx_request).
     gen_tokids_ctxbytes: bool = False
+    # Number of uvicorn disagg-server worker processes to fork on the public port.
+    # >1 means a fleet of delegating servers behind one coordinator. Replaces the
+    # WEB_CONCURRENCY env var (explicit config over implicit env).
+    num_workers: int = 1
+    # URL of an already-running coordinator (e.g. "http://host:8332"). When set,
+    # this process does NOT start a coordinator -- the fleet delegates to this
+    # external one. When absent and num_workers>1, an implicit coordinator is
+    # started in-process. When absent and num_workers==1, a single self-contained
+    # server with a local (in-process) coordinator is run.
+    disagg_coordinator_url: Optional[str] = None
 
 
 @dataclass
@@ -145,6 +155,8 @@ def extract_disagg_cfg(hostname: str = 'localhost',
                            'generation_first'] = 'context_first',
                        gen_strip_message_history: bool = False,
                        gen_tokids_ctxbytes: bool = False,
+                       num_workers: int = 1,
+                       disagg_coordinator_url: Optional[str] = None,
                        **kwargs: Any) -> DisaggServerConfig:
     context_servers = context_servers or {}
     generation_servers = generation_servers or {}
@@ -194,6 +206,8 @@ def extract_disagg_cfg(hostname: str = 'localhost',
         config.schedule_style = schedule_style
     config.gen_strip_message_history = gen_strip_message_history
     config.gen_tokids_ctxbytes = gen_tokids_ctxbytes
+    config.num_workers = num_workers
+    config.disagg_coordinator_url = disagg_coordinator_url
     return config
 
 
