@@ -1231,11 +1231,41 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             server = self._req_routing_table.pop(id(request), None)
             if server is not None and server in self._server_state:
                 await self._server_state[server].decrement_load(request)
+        # Peek at pending backfill blocks before they are consumed
+        pending_entry = self._pending_routed_blocks.get(id(request))
+        flat_hashes_set = None
+        if pending_entry is not None:
+            flat_hashes_set = set(pending_entry[0])
+        # Snapshot before backfill for block diff comparison
+        if (server is not None and server in self._server_state
+                and flat_hashes_set is not None):
+            state = self._server_state[server]
+            block_table_before = set(
+                state._block_table(state._kv_cache_hash_algo))
+        else:
+            block_table_before = None
+
         self._apply_routed_blocks_on_finish(request, server, success)
+
         if (server is not None and server in self._server_state
                 and self._events_aligned(server)):
-            # Fire-and-forget; poll runs in background and coalesces per server.
-            self._server_state[server].schedule_poll_and_update(session)
+            state = self._server_state[server]
+            # Synchronous poll + block diff debug logging
+            await state.poll_and_update(session or self.session)
+            if block_table_before is not None and flat_hashes_set is not None:
+                block_table_after = set(
+                    state._block_table(state._kv_cache_hash_algo))
+                remote_new = block_table_after - block_table_before
+                backfill_only = flat_hashes_set - block_table_after
+                remote_only = remote_new - flat_hashes_set
+                if backfill_only or remote_only:
+                    logger.info(
+                        f"KvCacheAwareRouter: block diff for server={server} "
+                        f"backfill_blocks={len(flat_hashes_set)} "
+                        f"remote_new_blocks={len(remote_new)} "
+                        f"backfill_only(not in remote)={len(backfill_only)} "
+                        f"remote_only(not in backfill)={len(remote_only)}"
+                    )
 
     def _on_servers_updated(self, old_servers, new_servers):
         new_state = {}
