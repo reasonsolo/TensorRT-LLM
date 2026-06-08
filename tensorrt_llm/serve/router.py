@@ -1063,13 +1063,31 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             # Inject just-served block_hashes into server state — see __init__ note.
             if pending is not None:
                 block_hashes, hash_algo = pending
-                flat_hashes = (h for hash_list in block_hashes
-                               for h in hash_list)
-                self._server_state[server].add_blocks(flat_hashes,
+                flat_hashes_set = set(h for hash_list in block_hashes
+                                      for h in hash_list)
+                self._server_state[server].add_blocks(flat_hashes_set,
                                                       hash_algo=hash_algo)
             if self._use_remote_kv_events:
-                asyncio.create_task(
-                    self._server_state[server].poll_and_update(session))
+                state = self._server_state[server]
+                # Snapshot blocks before polling to compare
+                block_table_before = set(
+                    state._block_table(state._kv_cache_hash_algo))
+                await state.poll_and_update(session or self.session)
+                block_table_after = set(
+                    state._block_table(state._kv_cache_hash_algo))
+                # Compare remote (polled) blocks with local backfill blocks
+                if pending is not None:
+                    remote_new = block_table_after - block_table_before
+                    backfill_only = flat_hashes_set - block_table_after
+                    remote_only = remote_new - flat_hashes_set
+                    if backfill_only or remote_only:
+                        logger.info(
+                            f"KvCacheAwareRouter: block diff for server={server} "
+                            f"backfill_blocks={len(flat_hashes_set)} "
+                            f"remote_new_blocks={len(remote_new)} "
+                            f"backfill_only(not in remote)={len(backfill_only)} "
+                            f"remote_only(not in backfill)={len(remote_only)}"
+                        )
 
     def _on_servers_updated(self, old_servers, new_servers):
         new_state = {}
