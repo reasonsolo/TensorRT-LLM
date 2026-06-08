@@ -1258,14 +1258,22 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                 remote_new = block_table_after - block_table_before
                 backfill_only = flat_hashes_set - block_table_after
                 remote_only = remote_new - flat_hashes_set
-                if backfill_only or remote_only:
-                    logger.info(
-                        f"KvCacheAwareRouter: block diff for server={server} "
-                        f"backfill_blocks={len(flat_hashes_set)} "
-                        f"remote_new_blocks={len(remote_new)} "
-                        f"backfill_only(not in remote)={len(backfill_only)} "
-                        f"remote_only(not in backfill)={len(remote_only)}"
-                    )
+                logger.info(
+                    f"KvCacheAwareRouter: block diff for server={server} "
+                    f"backfill_blocks={len(flat_hashes_set)} "
+                    f"remote_new_blocks={len(remote_new)} "
+                    f"backfill_only(not in remote)={len(backfill_only)} "
+                    f"remote_only(not in backfill)={len(remote_only)} "
+                    f"total_blocks_after={len(block_table_after)}"
+                )
+            else:
+                block_table_after = set(
+                    state._block_table(state._kv_cache_hash_algo))
+                logger.info(
+                    f"KvCacheAwareRouter: poll matched for server={server} "
+                    f"blocks_before={len(block_table_before) if block_table_before else 0} "
+                    f"blocks_after={len(block_table_after)}"
+                )
 
     def _on_servers_updated(self, old_servers, new_servers):
         new_state = {}
