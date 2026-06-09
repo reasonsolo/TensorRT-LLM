@@ -136,6 +136,9 @@ class KvCacheAwareServerState(ServerState):
         }
         self._kv_cache_hash_algo = KV_CACHE_HASH_ALGO_DEFAULT
         self._tokens_per_block = tokens_per_block
+        import time
+        self._block_remote_arrival: dict[BlockHash, float] = {}
+        self._time = time
 
     @property
     def hash_algo(self) -> str:
@@ -179,6 +182,7 @@ class KvCacheAwareServerState(ServerState):
 
     def update_with_events(self, events: Iterable[dict]):
         # event_raw: {"id": <id>, "data": <event body>}
+        t_now = self._time.monotonic()
         for event_raw in events:
             if "data" in event_raw:
                 event = event_raw["data"]
@@ -190,10 +194,16 @@ class KvCacheAwareServerState(ServerState):
             if event["type"] == "created":
                 self.set_hash_algo(hash_algo)
             if event["type"] == "stored":
+                for block in event["blocks"]:
+                    bh = block["block_hash"]
+                    if bh not in self._block_remote_arrival:
+                        self._block_remote_arrival[bh] = t_now
                 self.add_blocks(
                     (block["block_hash"] for block in event["blocks"]),
                     hash_algo=hash_algo)
             elif event["type"] == "removed":
+                for bh in event["block_hashes"]:
+                    self._block_remote_arrival.pop(bh, None)
                 self.remove_blocks(event["block_hashes"], hash_algo=hash_algo)
 
     async def poll_events(self, session: aiohttp.ClientSession):
@@ -1060,6 +1070,8 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             if server is not None and server in self._server_state:
                 await self._server_state[server].decrement_load(request)
         if server is not None and server in self._server_state:
+            import time
+            t_start = time.monotonic()
             # Inject just-served block_hashes into server state — see __init__ note.
             if pending is not None:
                 block_hashes, hash_algo = pending
@@ -1067,12 +1079,14 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                                       for h in hash_list)
                 self._server_state[server].add_blocks(flat_hashes_set,
                                                       hash_algo=hash_algo)
+            t_backfill = time.monotonic()
             if self._use_remote_kv_events:
                 state = self._server_state[server]
                 # Snapshot blocks before polling to compare
                 block_table_before = set(
                     state._block_table(state._kv_cache_hash_algo))
                 await state.poll_and_update(session or self.session)
+                t_poll = time.monotonic()
                 block_table_after = set(
                     state._block_table(state._kv_cache_hash_algo))
                 # Compare remote (polled) blocks with local backfill blocks
@@ -1080,19 +1094,45 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                     remote_new = block_table_after - block_table_before
                     backfill_only = flat_hashes_set - block_table_after
                     remote_only = remote_new - flat_hashes_set
+                    already_in_remote = flat_hashes_set & block_table_before
+                    # Per-block delay: how early/late remote had each
+                    # backfill block relative to t_backfill
+                    delays = []
+                    for bh in flat_hashes_set:
+                        remote_t = state._block_remote_arrival.get(bh)
+                        if remote_t is not None:
+                            # negative = remote was earlier, positive = remote was later
+                            delays.append((remote_t - t_backfill) * 1000)
+                    if delays:
+                        delays.sort()
+                        n = len(delays)
+                        d_min = delays[0]
+                        d_max = delays[-1]
+                        d_med = delays[n // 2]
+                        d_avg = sum(delays) / n
+                        d_p95 = delays[int(n * 0.95)]
+                    else:
+                        d_min = d_max = d_med = d_avg = d_p95 = float('nan')
                     logger.info(
                         f"KvCacheAwareRouter: block diff for server={server} "
                         f"backfill_blocks={len(flat_hashes_set)} "
+                        f"already_in_remote={len(already_in_remote)} "
                         f"remote_new_blocks={len(remote_new)} "
                         f"backfill_only(not in remote)={len(backfill_only)} "
                         f"remote_only(not in backfill)={len(remote_only)} "
-                        f"total_blocks_after={len(block_table_after)}"
+                        f"total_blocks_after={len(block_table_after)} "
+                        f"backfill_time_ms={((t_backfill - t_start) * 1000):.2f} "
+                        f"poll_time_ms={((t_poll - t_backfill) * 1000):.2f} "
+                        f"block_delay_ms(min/med/avg/p95/max)="
+                        f"{d_min:.1f}/{d_med:.1f}/{d_avg:.1f}/{d_p95:.1f}/{d_max:.1f} "
+                        f"delay_samples={len(delays)}"
                     )
                 else:
                     logger.info(
                         f"KvCacheAwareRouter: poll matched for server={server} "
                         f"blocks_before={len(block_table_before)} "
-                        f"blocks_after={len(block_table_after)}"
+                        f"blocks_after={len(block_table_after)} "
+                        f"poll_time_ms={((t_poll - t_backfill) * 1000):.2f}"
                     )
 
     def _on_servers_updated(self, old_servers, new_servers):
