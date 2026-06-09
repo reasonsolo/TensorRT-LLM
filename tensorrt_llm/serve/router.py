@@ -1072,6 +1072,12 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         if server is not None and server in self._server_state:
             import time
             t_start = time.monotonic()
+            state = self._server_state[server]
+            # Snapshot block table BEFORE backfill to measure what remote
+            # already had independently of backfill
+            block_table_pre_backfill = set(
+                state._block_table(state._kv_cache_hash_algo)
+            ) if self._use_remote_kv_events and pending is not None else None
             # Inject just-served block_hashes into server state — see __init__ note.
             if pending is not None:
                 block_hashes, hash_algo = pending
@@ -1081,9 +1087,8 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                                                       hash_algo=hash_algo)
             t_backfill = time.monotonic()
             if self._use_remote_kv_events:
-                state = self._server_state[server]
-                # Snapshot blocks before polling to compare
-                block_table_before = set(
+                # Snapshot after backfill but before poll
+                block_table_before_poll = set(
                     state._block_table(state._kv_cache_hash_algo))
                 await state.poll_and_update(session or self.session)
                 t_poll = time.monotonic()
@@ -1091,10 +1096,13 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                     state._block_table(state._kv_cache_hash_algo))
                 # Compare remote (polled) blocks with local backfill blocks
                 if pending is not None:
-                    remote_new = block_table_after - block_table_before
+                    remote_new = block_table_after - block_table_before_poll
+                    # blocks that backfill has but remote never got (even after poll)
                     backfill_only = flat_hashes_set - block_table_after
+                    # blocks that remote got this poll but aren't in backfill
                     remote_only = remote_new - flat_hashes_set
-                    already_in_remote = flat_hashes_set & block_table_before
+                    # blocks remote already had BEFORE backfill added them
+                    already_in_remote = flat_hashes_set & block_table_pre_backfill
                     # Per-block delay: how early/late remote had each
                     # backfill block relative to t_backfill
                     delays = []
@@ -1130,7 +1138,7 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                 else:
                     logger.info(
                         f"KvCacheAwareRouter: poll matched for server={server} "
-                        f"blocks_before={len(block_table_before)} "
+                        f"blocks_before={len(block_table_before_poll)} "
                         f"blocks_after={len(block_table_after)} "
                         f"poll_time_ms={((t_poll - t_backfill) * 1000):.2f}"
                     )
