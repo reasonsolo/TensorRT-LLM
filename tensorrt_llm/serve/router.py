@@ -147,6 +147,15 @@ class KvCacheAwareServerState(ServerState):
         self._poll_session = None
         self._block_remote_arrival: dict[BlockHash, float] = {}
         self._time = time
+        # Track blocks that backfill added but remote didn't have yet
+        # Maps block_hash -> timestamp when backfill added it
+        self._backfill_only_pending: dict[BlockHash, float] = {}
+        self._backfill_only_resolved: int = 0  # later arrived via remote
+        self._backfill_only_resolve_delays: list[float] = []  # ms delays
+        # Track block origin: blocks present in remote events
+        self._blocks_from_remote: set[BlockHash] = set()
+        # Blocks only from backfill (not yet seen in remote)
+        self._blocks_from_backfill_only: set[BlockHash] = set()
 
     @property
     def hash_algo(self) -> str:
@@ -204,12 +213,24 @@ class KvCacheAwareServerState(ServerState):
                     bh = block["block_hash"]
                     if bh not in self._block_remote_arrival:
                         self._block_remote_arrival[bh] = t_now
+                    # Check if this resolves a backfill-only block
+                    if bh in self._backfill_only_pending:
+                        backfill_t = self._backfill_only_pending.pop(bh)
+                        self._backfill_only_resolved += 1
+                        self._backfill_only_resolve_delays.append(
+                            (t_now - backfill_t) * 1000)
+                    # Track origin
+                    self._blocks_from_remote.add(bh)
+                    self._blocks_from_backfill_only.discard(bh)
                 self.add_blocks(
                     (block["block_hash"] for block in event["blocks"]),
                     hash_algo=hash_algo)
             elif event["type"] == "removed":
                 for bh in event["block_hashes"]:
                     self._block_remote_arrival.pop(bh, None)
+                    self._backfill_only_pending.pop(bh, None)
+                    self._blocks_from_remote.discard(bh)
+                    self._blocks_from_backfill_only.discard(bh)
                 self.remove_blocks(event["block_hashes"], hash_algo=hash_algo)
 
     async def poll_events(self, session: aiohttp.ClientSession):
@@ -1221,6 +1242,32 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                 affinity.popitem(last=False)
         hash_algo = hash_algo_by_server[server]
         block_hashes = block_hashes_by_algo[hash_algo]
+        # Log per-request block origin breakdown for winner
+        winner_state = self._server_state[server]
+        total_req_blocks = sum(len(hl) for hl in block_hashes)
+        matched_from_remote = 0
+        matched_from_backfill_only = 0
+        matched_total = 0
+        for hash_list in block_hashes:
+            for bh in hash_list:
+                if bh in winner_state._block_table(hash_algo):
+                    matched_total += 1
+                    if bh in winner_state._blocks_from_remote:
+                        matched_from_remote += 1
+                    elif bh in winner_state._blocks_from_backfill_only:
+                        matched_from_backfill_only += 1
+                else:
+                    break
+        logger.info(
+            f"KvCacheAwareRouter: route request to server={server} "
+            f"total_blocks={total_req_blocks} "
+            f"matched={matched_total} "
+            f"matched_from_remote={matched_from_remote} "
+            f"matched_from_backfill_only={matched_from_backfill_only} "
+            f"match_rate={matched_total/max(total_req_blocks,1):.4f} "
+            f"remote_match_rate={matched_from_remote/max(total_req_blocks,1):.4f} "
+            f"backfill_only_match_rate={matched_from_backfill_only/max(total_req_blocks,1):.4f}"
+        )
         async with self._lock:
             await self._register_request(server, request)
             self._stash_routed_blocks_on_route(request, block_hashes, hash_algo)
@@ -1246,14 +1293,19 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         flat_hashes_set = None
         if pending_entry is not None:
             flat_hashes_set = set(pending_entry[0])
-        # Snapshot before backfill for block diff comparison
+        # Snapshot block table BEFORE backfill to measure what remote
+        # already had independently of backfill
         if (server is not None and server in self._server_state
                 and flat_hashes_set is not None):
             state = self._server_state[server]
-            block_table_before_backfill = set(
+            block_table_pre_backfill = set(
                 state._block_table(state._kv_cache_hash_algo))
+            # Mark new blocks as backfill-only origin
+            for bh in flat_hashes_set:
+                if bh not in state._blocks_from_remote:
+                    state._blocks_from_backfill_only.add(bh)
         else:
-            block_table_before_backfill = None
+            block_table_pre_backfill = None
 
         self._apply_routed_blocks_on_finish(request, server, success)
         t_backfill = time.monotonic()
@@ -1269,11 +1321,19 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             t_poll = time.monotonic()
             block_table_after = set(
                 state._block_table(state._kv_cache_hash_algo))
-            if flat_hashes_set is not None and block_table_before_backfill is not None:
+            if flat_hashes_set is not None and block_table_pre_backfill is not None:
                 remote_new = block_table_after - block_table_before_poll
+                # blocks that backfill has but remote never got (even after poll)
                 backfill_only = flat_hashes_set - block_table_after
+                # blocks that remote got this poll but aren't in backfill
                 remote_only = remote_new - flat_hashes_set
-                already_in_remote = flat_hashes_set & block_table_before_backfill
+                # blocks remote already had BEFORE backfill added them
+                already_in_remote = flat_hashes_set & block_table_pre_backfill
+                # Register backfill-only blocks for delayed arrival tracking
+                for bh in (flat_hashes_set - block_table_pre_backfill):
+                    if bh not in state._backfill_only_pending and \
+                       bh not in state._block_remote_arrival:
+                        state._backfill_only_pending[bh] = t_backfill
                 # Per-block delay: how early/late remote had each
                 # backfill block relative to t_backfill
                 delays = []
@@ -1292,6 +1352,16 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                     d_p95 = delays[int(n * 0.95)]
                 else:
                     d_min = d_max = d_med = d_avg = d_p95 = float('nan')
+                # Resolve delays stats
+                rd = state._backfill_only_resolve_delays
+                if rd:
+                    rd.sort()
+                    rd_min = rd[0]
+                    rd_med = rd[len(rd) // 2]
+                    rd_avg = sum(rd) / len(rd)
+                    rd_max = rd[-1]
+                else:
+                    rd_min = rd_med = rd_avg = rd_max = float('nan')
                 logger.info(
                     f"KvCacheAwareRouter: block diff for server={server} "
                     f"backfill_blocks={len(flat_hashes_set)} "
@@ -1304,7 +1374,11 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                     f"poll_time_ms={((t_poll - t_backfill) * 1000):.2f} "
                     f"block_delay_ms(min/med/avg/p95/max)="
                     f"{d_min:.1f}/{d_med:.1f}/{d_avg:.1f}/{d_p95:.1f}/{d_max:.1f} "
-                    f"delay_samples={len(delays)}"
+                    f"delay_samples={len(delays)} "
+                    f"backfill_only_still_pending={len(state._backfill_only_pending)} "
+                    f"backfill_only_resolved_by_remote={state._backfill_only_resolved} "
+                    f"resolve_delay_ms(min/med/avg/max)="
+                    f"{rd_min:.1f}/{rd_med:.1f}/{rd_avg:.1f}/{rd_max:.1f}"
                 )
             else:
                 logger.info(
