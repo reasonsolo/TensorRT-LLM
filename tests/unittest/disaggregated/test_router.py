@@ -7,10 +7,12 @@ from unittest import mock
 import aiohttp
 import pytest
 
+from tensorrt_llm.llmapi.block_hash import (
+    KV_CACHE_HASH_ALGO_V1, KV_CACHE_HASH_ALGO_V2,
+    KV_CACHE_HASH_ALGO_V2_SHA256_64, block_key_hasher,
+    compute_token_ids_block_hashes, get_cache_salt_id, hash_v1_block_key,
+    truncate_sha256_hash_to_int64)
 from tensorrt_llm.llmapi.disagg_utils import RouterConfig
-from tensorrt_llm.runtime.kv_cache_hash import (get_cache_salt_id,
-                                                hash_v1_block_key,
-                                                truncate_sha256_hash_to_int64)
 from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import (
     ReuseScope, sequence_to_blockchain_keys)
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
@@ -19,13 +21,10 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 DisaggregatedParams,
                                                 FunctionDefinition)
 # yapf: disable
-from tensorrt_llm.serve.router import (KV_CACHE_HASH_ALGO_V1,
-                                       KV_CACHE_HASH_ALGO_V2,
-                                       KV_CACHE_HASH_ALGO_V2_SHA256_64,
-                                       ConversationRouter, KvCacheAwareRouter,
+from tensorrt_llm.serve.router import (ConversationRouter, KvCacheAwareRouter,
                                        KvCacheAwareServerState,
                                        LoadBalancingRouter, RoundRobinRouter,
-                                       block_key_hasher, create_router)
+                                       create_router)
 
 # yapf: enable
 
@@ -54,6 +53,19 @@ def test_native_block_key_hasher_matches_python_v1():
         assert h == hash_v1_block_key(
             toks[t:t_end], parent_hash=0 if parent is None else parent)
         parent = h
+
+
+def test_llmapi_compute_token_ids_block_hashes_matches_chained_v1():
+    token_lists = [[11, 12, 13, 14, 15, 16, 17, 18, 19]]
+    expected = []
+    parent = None
+    for t in range(0, len(token_lists[0]) - 1, 4):
+        t_end = min(t + 4, len(token_lists[0]) - 1)
+        parent = block_key_hasher(token_lists[0][t:t_end], parent)
+        expected.append(parent)
+
+    assert compute_token_ids_block_hashes(
+        token_lists, 4, hash_algo=KV_CACHE_HASH_ALGO_V1) == [expected]
 
 
 def _make_mock_aiohttp_session(return_value=None):

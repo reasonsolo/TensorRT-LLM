@@ -18,15 +18,15 @@ from disagg_test_utils import (HEARTBEAT_INTERVAL, INACTIVE_TIMEOUT,
 from transformers import AutoTokenizer
 
 from tensorrt_llm import logger
+from tensorrt_llm.llmapi.block_hash import (KV_CACHE_HASH_ALGO_V1,
+                                            KV_CACHE_HASH_ALGO_V2,
+                                            block_key_hasher,
+                                            v2_sha256_block_hasher)
 from tensorrt_llm.serve.openai_client import OpenAIHttpClient
 from tensorrt_llm.serve.openai_protocol import (CompletionRequest,
                                                 DisaggregatedParams)
-from tensorrt_llm.serve.router import (KV_CACHE_HASH_ALGO_V1,
-                                       KV_CACHE_HASH_ALGO_V2,
-                                       ConversationRouter,
-                                       KvCacheAwareRouter,
-                                       KvCacheAwareServerState, ServerRole,
-                                       block_key_hasher, v2_sha256_block_hasher)
+from tensorrt_llm.serve.router import (ConversationRouter, KvCacheAwareRouter,
+                                       KvCacheAwareServerState, ServerRole)
 
 
 def build_worker_config(base_config, server_type_config, disagg_cluster):
