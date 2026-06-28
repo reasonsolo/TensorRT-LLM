@@ -83,8 +83,8 @@ class DisaggServerConfig():
     perf_metrics_max_requests: int = 0
     disagg_cluster_config: Optional[DisaggClusterConfig] = None
     node_id: int = uuid.getnode(
-    ) % 1021  # Assuming only one disagg-server is running on a machine, moding mac by the largest 10-bit prime
-    # If this causes collisions, users can set node_id manually within range [0, 1023] in config
+    ) % 251  # Assuming only one disagg-server is running on a machine, moding mac by the largest prime below the 8-bit node_id space (256) so it fits the snowflake node_id field
+    # If this causes collisions, users can set node_id manually within range [0, 256) in config
     schedule_style: Literal['context_first',
                             'generation_first'] = 'context_first'
     # Drop conversation history from generation_only requests to shrink the gen

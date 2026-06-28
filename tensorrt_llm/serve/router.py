@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import json
 import os
 import time
 from abc import ABC, abstractmethod
@@ -20,10 +21,9 @@ from collections import OrderedDict
 from typing import Awaitable, Callable, Dict, Iterable, List, Optional, Union
 
 import aiohttp
-import orjson
 
-# Content-Type for orjson-serialized bodies sent to the coordinator (we pass
-# data=bytes, so aiohttp doesn't set the json content type itself).
+# Content-Type for the json-serialized bodies sent to the coordinator (we pass
+# data=str, so aiohttp doesn't set the json content type itself).
 _JSON_HEADERS = {"Content-Type": "application/json"}
 
 from tensorrt_llm.llmapi.disagg_utils import (MetadataServerConfig,
@@ -1711,23 +1711,23 @@ class CoordinatorDelegatingRouter(Router):
         payload = {"role": self._role, "routing_key": key,
                    "req_id": self._request_id(request),
                    "exclude_server": exclude_server}
-        # orjson.dumps (bytes) instead of aiohttp json= (stdlib dumps): the
-        # routing_key is hundreds of int64, and this is the hot fleet->coordinator
-        # call. Parse the response with orjson too. X-Client-Send-Time (wall clock)
-        # lets the coordinator echo timing headers back for the IPC breakdown.
+        # json.dumps (str) via data= instead of aiohttp json= so we control the
+        # body encoding on this hot fleet->coordinator call. X-Client-Send-Time
+        # (wall clock) lets the coordinator echo timing headers back for the IPC
+        # breakdown.
         from tensorrt_llm.serve.coordinator_server import HDR_CLIENT_SEND
         _t0 = time.monotonic()
         _send_wall = time.time()
         hdrs = {**_JSON_HEADERS, HDR_CLIENT_SEND: repr(_send_wall)}
         async with self.session.post(
-                f"{self._coordinator_url}/select", data=orjson.dumps(payload),
+                f"{self._coordinator_url}/select", data=json.dumps(payload),
                 headers=hdrs,
                 timeout=self._request_timeout_s) as resp:
             if resp.status != 200:
                 raise ValueError(
                     f"coordinator /select returned {resp.status}: "
                     f"{await resp.text()}")
-            body = orjson.loads(await resp.read())
+            body = json.loads(await resp.read())
             self._record_ipc(self._select_ipc, _send_wall, time.time(), resp)
         self._select_lat.record(time.monotonic() - _t0)
         info = body.get("info") or {}
@@ -1756,9 +1756,9 @@ class CoordinatorDelegatingRouter(Router):
         try:
             async with self.session.post(
                     f"{self._coordinator_url}/finish",
-                    data=orjson.dumps({"role": self._role,
-                                       "req_id": req_id,
-                                       "success": success}),
+                    data=json.dumps({"role": self._role,
+                                     "req_id": req_id,
+                                     "success": success}),
                     headers=hdrs,
                     timeout=self._request_timeout_s) as resp:
                 if resp.status != 200:
