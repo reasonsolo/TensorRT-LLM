@@ -1627,16 +1627,20 @@ class CoordinatorDelegatingRouter(Router):
 
     def _request_id(self, request: OpenAIRequest) -> int:
         """The request's disagg id -- the sole cross-process key for select/finish.
-        Context requests carry disagg_request_id; generation requests inherit it
-        as ctx_request_id. OpenAIDisaggregatedService always sets it before
-        routing, so a missing id is a bug -- assert, don't paper over."""
+        Context requests carry disagg_request_id; generation requests inherit the
+        SAME id as ctx_request_id (set by OpenAIDisaggregatedService before
+        routing). This id is what the ctx worker registered its KV-transfer
+        TxSession under, so the gen request MUST keep it -- never re-issue a new
+        id here, or the gen transceiver waits on a key the ctx side never
+        registered (transfer never completes -> DISAGG_GENERATION_TRANS_IN_PROGRESS
+        fills the gen IndexMapper and throughput collapses)."""
         dp = request.disaggregated_params
         assert dp is not None, "delegated routing requires disaggregated_params"
-        rid = dp.disagg_request_id
-        if self._role != "generation":
-            assert rid is not None, (
-                f"delegated {self._role} routing requires a disagg request id "
-                f"(disagg_request_id/ctx_request_id) on the request")
+        rid = (dp.disagg_request_id if self._role == "context"
+               else dp.ctx_request_id)
+        assert rid is not None, (
+            f"delegated {self._role} routing requires a disagg request id "
+            f"(disagg_request_id/ctx_request_id) on the request")
         return rid
 
     async def get_next_server(
@@ -1644,12 +1648,12 @@ class CoordinatorDelegatingRouter(Router):
             request: OpenAIRequest,
             exclude_server: Optional[str] = None) -> tuple[str, dict]:
         key = self._local.routing_key(request)
-        # Send the disagg request id as the sole cross-process request key; the
-        # coordinator keys its pending-request state by it for /finish.
-        req_id = (None if self._role == "generation"
-                  else self._request_id(request))
+        # Send the request's existing disagg id as the sole cross-process key; the
+        # coordinator keys its pending-request state by it for /finish. Placement
+        # (server selection) must NOT change the id -- the ctx<->gen KV transfer is
+        # keyed by it and was registered ctx-side before this call.
         payload = {"role": self._role, "routing_key": key,
-                   "req_id": req_id,
+                   "req_id": self._request_id(request),
                    "exclude_server": exclude_server}
         async with self.session.post(
                 f"{self._coordinator_url}/select", json=payload,
@@ -1660,11 +1664,6 @@ class CoordinatorDelegatingRouter(Router):
                     f"{await resp.text()}")
             body = await resp.json()
         info = body.get("info") or {}
-        if self._role == "generation":
-            coordinator_req_id = body.get("req_id")
-            if coordinator_req_id is None:
-                raise ValueError("coordinator did not return a generation disagg_request_id")
-            request.disaggregated_params.disagg_request_id = coordinator_req_id
         return body["server"], info
 
     async def finish_request(self,
