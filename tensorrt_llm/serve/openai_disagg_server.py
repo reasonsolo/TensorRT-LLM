@@ -32,8 +32,7 @@ from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.executor import CppExecutorError
 from tensorrt_llm.llmapi import tracing
 from tensorrt_llm.llmapi.disagg_utils import (DisaggServerConfig,
-                                              MetadataServerConfig, ServerRole,
-                                              get_global_disagg_request_id)
+                                              MetadataServerConfig, ServerRole)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.cluster_storage import (HttpClusterStorageServer,
                                                 create_cluster_storage)
@@ -154,10 +153,11 @@ class OpenAIDisaggServer:
         self.register_routes()
 
     def _create_client(self, router: Router, role: ServerRole, max_retries: int = 1) -> OpenAIClient:
-        node_id = self._config.node_id
+        async def disagg_id_generator():
+            return await self._coordinator.get_disagg_request_id()
         client = OpenAIHttpClient(
             router, role, self._req_timeout_secs, max_retries,
-            disagg_id_generator=lambda: get_global_disagg_request_id(node_id))
+            disagg_id_generator=disagg_id_generator)
         self._perf_metrics_collector.add_client(client)
         return client
 

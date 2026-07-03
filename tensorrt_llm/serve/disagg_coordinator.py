@@ -42,7 +42,8 @@ import aiohttp
 
 from tensorrt_llm.llmapi.disagg_utils import (DisaggServerConfig,
                                               MetadataServerConfig, ServerRole,
-                                              get_ctx_gen_server_addrs)
+                                              get_ctx_gen_server_addrs,
+                                              get_global_disagg_request_id)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.cluster_storage import (ClusterStorage, WatchEventType,
                                                 create_cluster_storage)
@@ -90,6 +91,12 @@ class DisaggCoordinator(ABC):
         ...
 
     async def stop(self) -> None:
+        ...
+
+
+
+    @abstractmethod
+    async def get_disagg_request_id(self) -> int:
         ...
 
 
@@ -162,8 +169,14 @@ class DisaggCoordinatorService(DisaggCoordinator):
     async def select(self, role: str, routing_key, req_id,
                      exclude_server: Optional[str]) -> Tuple[str, dict, Optional[str]]:
         router = self._router_for_role(role)
+        if req_id is None:
+            # The coordinator owns IDs absent from generation requests.
+            req_id = get_global_disagg_request_id(self._config.node_id)
         return await router.get_next_server_by_key(routing_key, req_id=req_id,
                                                    exclude_server=exclude_server)
+
+    async def get_disagg_request_id(self) -> int:
+        return get_global_disagg_request_id(self._config.node_id)
 
     async def finish(self, role: str, req_id,
                      success: bool = True) -> None:
@@ -395,6 +408,16 @@ class CoordinatorClient(DisaggCoordinator):
             logger.info(f"CoordinatorClient: waiting for coordinator at "
                         f"{self._remote_url} (attempt {attempt}, {last_err})")
             await asyncio.sleep(2.0)
+
+    async def get_disagg_request_id(self) -> int:
+        async with self.session.get(
+                f"{self._remote_url}/disagg_request_id",
+                timeout=self._request_timeout_s) as resp:
+            if resp.status != 200:
+                raise RuntimeError(
+                    f"coordinator /disagg_request_id returned {resp.status}")
+            body = await resp.json()
+        return body["disagg_request_id"]
 
     async def is_ready(self) -> bool:
         try:

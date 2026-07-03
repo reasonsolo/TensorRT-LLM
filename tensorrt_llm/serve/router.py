@@ -490,6 +490,7 @@ class Router(ABC):
             exclude_server: Optional[str] = None) -> tuple[str, dict]:
         '''Select server by request and return some intermediate information, exclude_server is a server to exclude from the selection'''
 
+
     @abstractmethod
     async def finish_request(self,
                              request: OpenAIRequest,
@@ -1631,11 +1632,11 @@ class CoordinatorDelegatingRouter(Router):
         routing, so a missing id is a bug -- assert, don't paper over."""
         dp = request.disaggregated_params
         assert dp is not None, "delegated routing requires disaggregated_params"
-        rid = (dp.disagg_request_id if self._role == "context"
-               else dp.ctx_request_id)
-        assert rid is not None, (
-            f"delegated {self._role} routing requires a disagg request id "
-            f"(disagg_request_id/ctx_request_id) on the request")
+        rid = dp.disagg_request_id
+        if self._role != "generation":
+            assert rid is not None, (
+                f"delegated {self._role} routing requires a disagg request id "
+                f"(disagg_request_id/ctx_request_id) on the request")
         return rid
 
     async def get_next_server(
@@ -1645,8 +1646,10 @@ class CoordinatorDelegatingRouter(Router):
         key = self._local.routing_key(request)
         # Send the disagg request id as the sole cross-process request key; the
         # coordinator keys its pending-request state by it for /finish.
+        req_id = (None if self._role == "generation"
+                  else self._request_id(request))
         payload = {"role": self._role, "routing_key": key,
-                   "req_id": self._request_id(request),
+                   "req_id": req_id,
                    "exclude_server": exclude_server}
         async with self.session.post(
                 f"{self._coordinator_url}/select", json=payload,
@@ -1657,6 +1660,11 @@ class CoordinatorDelegatingRouter(Router):
                     f"{await resp.text()}")
             body = await resp.json()
         info = body.get("info") or {}
+        if self._role == "generation":
+            coordinator_req_id = body.get("req_id")
+            if coordinator_req_id is None:
+                raise ValueError("coordinator did not return a generation disagg_request_id")
+            request.disaggregated_params.disagg_request_id = coordinator_req_id
         return body["server"], info
 
     async def finish_request(self,

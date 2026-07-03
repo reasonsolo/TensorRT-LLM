@@ -16,7 +16,7 @@
 import asyncio
 import traceback
 from abc import ABC, abstractmethod
-from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple, Type
+from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, List, Optional, Tuple, Type
 
 import aiohttp
 
@@ -103,7 +103,7 @@ class OpenAIHttpClient(OpenAIClient):
         max_retries: int = 1,
         retry_interval_sec: int = 1,
         session: Optional[aiohttp.ClientSession] = None,
-        disagg_id_generator: Optional[Callable[[], int]] = None,
+        disagg_id_generator: Optional[Callable[[], Awaitable[int]]] = None,
     ):
         self._router = router
         self._role = role
@@ -180,7 +180,7 @@ class OpenAIHttpClient(OpenAIClient):
             if attempt > 0 and self._disagg_id_generator is not None:
                 dp = getattr(request, "disaggregated_params", None)
                 if dp is not None and getattr(dp, "disagg_request_id", None) is not None:
-                    dp.disagg_request_id = self._disagg_id_generator()
+                    dp.disagg_request_id = await self._disagg_id_generator()
             # Serialize once on the orchestrator's single event-loop thread:
             # model_dump_json (pydantic-core) is ~2.3x faster than
             # model_dump(mode="json") + aiohttp json= (json.dumps). Decodes to
