@@ -42,24 +42,6 @@ ROUTE_AFFINITY_CACHE_SIZE = 50000
 ROUTE_AFFINITY_TOKEN_PREFIX = 256
 
 
-def _inject_route_hint(request: OpenAIRequest, dp_rank: int) -> None:
-    """Set ``disaggregated_params.route_hint.dp_rank`` on *request*.
-
-    Shared by the in-process centralized router and the remote HTTP client so
-    the worker ADP router honors the router's per-rank choice.
-    """
-    from tensorrt_llm.serve.openai_protocol import (
-        DisaggregatedParams as ProtoDisaggParams,
-        RouteHint as ProtoRouteHint)
-    if request.disaggregated_params is None:
-        request.disaggregated_params = ProtoDisaggParams(
-            request_type="context_only",
-            route_hint=ProtoRouteHint(dp_rank=dp_rank))
-    else:
-        request.disaggregated_params.route_hint = ProtoRouteHint(
-            dp_rank=dp_rank)
-
-
 class ServerState:
 
     def __init__(
@@ -1599,9 +1581,9 @@ class CentralizedKVCacheRouter(BlockHashMixin, LoadBalancingMixin, Router):
     """Thin Router adaptor over the centralized KV-cache router core.
 
     Translates the ``Router`` API into core calls: tokenize + block-hash the
-    request, ask the core for a placement, inject the per-rank ``route_hint``,
-    and record timing. All routing state (selection, load, address bookkeeping)
-    plus the single ZMQ ingest server live in :class:`CentralizedKVCacheRouterCore`.
+    request, ask the core for an instance-level placement, and record timing.
+    All routing state (selection, load, address bookkeeping) plus the single ZMQ
+    ingest server live in :class:`CentralizedKVCacheRouterCore`.
 
     There is exactly ONE namespace-aware core per deployment, owned by the
     coordinator, which injects the same core object into both the ctx and gen
@@ -1612,8 +1594,8 @@ class CentralizedKVCacheRouter(BlockHashMixin, LoadBalancingMixin, Router):
     touches the core or binds the ingest port.
 
     Note: block-hashing knobs (tokens_per_block, tokenizer) live on the surface;
-    routing knobs (router_port, load_weight, rank_routing_algo, ...) live on the
-    core and are consumed by the builder, not here.
+    routing knobs (router_port, load_weight, ...) live on the core and are
+    consumed by the builder, not here.
     """
 
     def __init__(self,
@@ -1630,9 +1612,7 @@ class CentralizedKVCacheRouter(BlockHashMixin, LoadBalancingMixin, Router):
         # Swallow core-only routing knobs (router_port, load_weight, etc.) that
         # create_router forwards from router_args: the builder uses them to make
         # the core; the surface does not.
-        for core_only in ("router_port", "load_weight", "rank_routing_algo",
-                          "fair_share_multiplier", "match_rate_threshold",
-                          "stale_timeout_s"):
+        for core_only in ("router_port", "load_weight", "stale_timeout_s"):
             kwargs.pop(core_only, None)
         super().__init__(server_role, servers, metadata_server_cfg,
                          metadata_server, **kwargs)
@@ -1689,16 +1669,16 @@ class CentralizedKVCacheRouter(BlockHashMixin, LoadBalancingMixin, Router):
     def select_by_block_hashes(
             self, block_hashes: List[BlockHash],
             exclude_server: Optional[str] = None
-    ) -> tuple[str, int, Optional[int]]:
+    ) -> tuple[str, int]:
         """Placement from pre-computed block hashes (no tokenization).
 
         The hashing is done by the caller (the orchestrator surface, or a
         worker via ``routing_key``), so this is the pure selection
         step: pick the best server for ``block_hashes`` among the currently
         prepared servers, round-robining as fallback. Returns
-        ``(server, matched_blocks, dp_rank)``. Raises ``ValueError`` when no
-        server is available. Safe to call directly (in-process) or from the
-        HTTP server handler.
+        ``(server, matched_blocks)``. Raises ``ValueError`` when no server is
+        available. Safe to call directly (in-process) or from the HTTP server
+        handler.
         """
         assert self._core is not None, \
             "no core: placement runs on the coordinator, not a delegating client"
@@ -1711,10 +1691,10 @@ class CentralizedKVCacheRouter(BlockHashMixin, LoadBalancingMixin, Router):
         # counter) into the core's scoring, replacing worker-reported load.
         self._core.set_instance_load(
             {s: self._get_server_load(s) for s in servers})
-        server, matched, dp_rank, _ = self._core.select_address(
+        server, matched, _ = self._core.select_address(
             self._namespace, block_hashes, servers, self._rr_counter)
         self._rr_counter += 1
-        return server, matched, dp_rank
+        return server, matched
 
     async def get_next_server(
             self,
@@ -1729,15 +1709,11 @@ class CentralizedKVCacheRouter(BlockHashMixin, LoadBalancingMixin, Router):
         flat_hashes = [h for hl in block_hashes for h in hl]
 
         async with self._lock:
-            server, matched, dp_rank = self.select_by_block_hashes(
+            server, matched = self.select_by_block_hashes(
                 flat_hashes, exclude_server)
             # Count this routed request as load on the chosen server (shared
             # counter); finish_request decrements it. Keyed by id(request).
             await self._register_request(server, request)
-
-        # Inject route_hint when per-rank routing selected a specific dp_rank.
-        if dp_rank is not None:
-            _inject_route_hint(request, dp_rank)
 
         self._record_route_timing(time.monotonic() - _rt_t0)
         return server, {"matched_blocks": matched,
@@ -1765,7 +1741,7 @@ class CentralizedKVCacheRouter(BlockHashMixin, LoadBalancingMixin, Router):
                                      req_id=None):
         block_hashes = routing_key or []
         async with self._lock:
-            server, matched, dp_rank = self.select_by_block_hashes(
+            server, matched = self.select_by_block_hashes(
                 block_hashes, exclude_server)
             # Count routed load on the chosen server, keyed by the disagg req_id
             # (id(request) doesn't cross the HTTP hop). finish_request_by_id
@@ -1773,7 +1749,7 @@ class CentralizedKVCacheRouter(BlockHashMixin, LoadBalancingMixin, Router):
             if req_id is not None and server in self._server_state:
                 await self._server_state[server].increment_load(None)
                 self._req_routing_table[req_id] = server
-        return server, {"matched_blocks": matched, "dp_rank": dp_rank}, req_id
+        return server, {"matched_blocks": matched}, req_id
 
     async def finish_request_by_id(self, req_id, success=True):
         # Decrement the routed-load counter for req_id's server (same counter as
@@ -1889,9 +1865,6 @@ class CoordinatorDelegatingRouter(Router):
                     f"{await resp.text()}")
             body = await resp.json()
         info = body.get("info") or {}
-        dp_rank = info.get("dp_rank")
-        if dp_rank is not None:
-            _inject_route_hint(request, dp_rank)
         return body["server"], info
 
     async def finish_request(self,
@@ -1985,9 +1958,8 @@ def _build_centralized_core(router_config: RouterConfig):
     hmac_key = base64.b64decode(hmac_key_b64) if hmac_key_b64 else None
     core_kwargs = {
         k: args[k]
-        for k in ("tokens_per_block", "load_weight", "rank_routing_algo",
-                  "fair_share_multiplier", "match_rate_threshold",
-                  "stale_timeout_s") if k in args
+        for k in ("tokens_per_block", "load_weight", "stale_timeout_s")
+        if k in args
     }
     return CentralizedKVCacheRouterCore(
         ingest_address=f"tcp://0.0.0.0:{router_port}",

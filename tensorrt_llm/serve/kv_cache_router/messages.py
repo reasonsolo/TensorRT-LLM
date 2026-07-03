@@ -87,4 +87,3 @@ class Selection:
     worker_id: str
     address: Optional[str] = None
     matched_blocks: int = 0
-    dp_rank: Optional[int] = None

@@ -235,56 +235,21 @@ class CentralizedKVCacheRouterCore:
         clock: Injectable time source (seconds); defaults to ``time.monotonic``.
     """
 
-    #: Selectable phase-2 (per-rank) routing algorithms.
-    RANK_ALGO_INSTANCE = "instance"  # same scoring as phase-1 instance routing
-    RANK_ALGO_ADP = "adp"            # same scoring as the kvcache ADP router
-    RANK_ALGO_NONE = "none"          # instance-only: no rank pick, no route_hint;
-                                     # the worker's own ADP router selects the rank
-                                     # (per-rank events still feed instance scoring,
-                                     # but the host-side allgather is eliminated).
-
     def __init__(self,
                  tokens_per_block: int = 32,
                  load_weight: float = 0.25,
-                 rank_routing_algo: str = RANK_ALGO_INSTANCE,
-                 fair_share_multiplier: float = 2.0,
-                 match_rate_threshold: float = 0.1,
                  stale_timeout_s: float = 30.0,
                  clock=time.monotonic,
                  ingest_address: Optional[str] = None,
                  ingest_hmac_key: Optional[bytes] = None) -> None:
         self._tokens_per_block = tokens_per_block
         self._load_weight = load_weight
-        # Phase-2 rank-selection algorithm (tunable):
-        #   "instance" -> identical scoring to phase-1 instance routing
-        #                 (matched - load_weight * workload, argmax, RR tie-break)
-        #   "adp"      -> identical scoring to the worker KVCacheAwareADPRouter
-        #                 (fair-share cap + cache-affinity gate + normalized load,
-        #                  via the shared score_kv_aware_candidates).
-        if rank_routing_algo not in (self.RANK_ALGO_INSTANCE,
-                                     self.RANK_ALGO_ADP,
-                                     self.RANK_ALGO_NONE):
-            raise ValueError(
-                f"rank_routing_algo must be one of "
-                f"{self.RANK_ALGO_INSTANCE!r}, {self.RANK_ALGO_ADP!r}, "
-                f"{self.RANK_ALGO_NONE!r}; got {rank_routing_algo!r}")
-        self._rank_routing_algo = rank_routing_algo
-        # In "none" mode phase-2 is skipped, so the per-rank tries (rs.trie) are
-        # NEVER queried -- only the instance combined_trie is. Skip maintaining
-        # them on every event to halve event-ingest write work (and shorten the
-        # lock-hold that contends with select_worker queries). The combined_trie
-        # and all refcounts are still maintained.
-        self._skip_rank_trie = (rank_routing_algo == self.RANK_ALGO_NONE)
-        # ADP-algo knobs (used only when rank_routing_algo == "adp").
-        self._fair_share_multiplier = max(1.0, float(fair_share_multiplier))
-        self._match_rate_threshold = match_rate_threshold
-        # Diagnostic: when TLLM_LOG_ROUTE_SCORES=1, log the per-rank cache-term
-        # vs load-term breakdown of every Nth phase-2 decision, to root-cause
-        # why a balance metric moves. Counter-gated to avoid log spam.
-        import os
-        self._log_route_scores = (
-            os.environ.get("TLLM_LOG_ROUTE_SCORES", "0") == "1")
-        self._score_log_n = 0
+        # Routing is instance-level only: the coordinator picks the instance
+        # (combined trie + routed-request load) and the worker's own ADP router
+        # picks the rank. The per-rank tries (rs.trie) are therefore never
+        # queried, so they are not maintained on ingest -- only the instance
+        # combined_trie and its refcounts are. Per-rank *event reporting* still
+        # feeds the combined trie; only per-rank *routing* is gone.
         # Routing diagnostics accumulated by select_address (moved off the
         # surface adaptor). Periodic summary logged every _diag_log_every calls.
         self._diag = {"total": 0, "fallback": 0, "matched_0": 0,
@@ -606,108 +571,12 @@ class CentralizedKVCacheRouterCore:
                 address=address,
                 matched_blocks=legacy_matched.get(winner_id, 0))
 
-        # Phase 2: Select rank within the chosen instance, under its own lock.
-        return self._select_rank_in_instance(
-            inst_ref, block_hashes, now, inst_matched, address)
-
-    def _select_rank_in_instance(
-            self, inst: _InstanceState, block_hashes: List[int],
-            now: float, inst_matched: int, address: Optional[str]) -> Selection:
-        """Phase 2: pick the best rank within *inst*.
-
-        Dispatches on the configured ``rank_routing_algo``:
-          * ``"none"``     -- instance-only: return the chosen instance with
-            ``dp_rank=None`` so NO route_hint is injected; the worker's own
-            ADP router selects the rank. (Per-rank events still drive instance
-            scoring, but the host-side allgather is eliminated.)
-          * ``"instance"`` -- identical scoring to phase-1 instance routing.
-          * ``"adp"``      -- identical scoring to the worker
-            ``KVCacheAwareADPRouter`` (shared ``score_kv_aware_candidates``).
-
-        Both rank-picking modes gather per-rank ``(rank, matched_blocks, load)``
-        candidates (skipping stale-load ranks) and break ties round-robin.
-        """
-        # Instance-only mode: defer rank selection to the worker's ADP router.
-        if self._rank_routing_algo == self.RANK_ALGO_NONE:
-            return Selection(
-                worker_id=inst.instance_id,
-                address=address,
-                matched_blocks=inst_matched)
-
-        # Gather (rank, matched_blocks, load) for fresh ranks (common to both),
-        # reading this instance's rank tries/loads under its own lock.
-        tpb = self._tokens_per_block
-        adp = self._rank_routing_algo == self.RANK_ALGO_ADP
-        candidates: List[Tuple[int, int, float]] = []
-        # Per-rank load is no longer reported by workers; the coordinator only
-        # knows instance-level routed load. Split it evenly across the instance's
-        # ranks as an approximation so adp/instance rank scoring still balances.
-        inst_load = self._address_load(self._worker_address.get(inst.instance_id))
-        with inst.lock:
-            n_ranks = max(len(inst.ranks), 1)
-            per_rank_load = inst_load / n_ranks
-            for rank, rs in inst.ranks.items():
-                if block_hashes:
-                    matched_blocks = rs.trie.match_one(
-                        f"{inst.instance_id}:rank{rank}", block_hashes)
-                else:
-                    matched_blocks = 0
-                load = per_rank_load * tpb if adp else per_rank_load
-                # ADP scores in tokens (match in tokens, load in tokens);
-                # instance algo scores in blocks (match in blocks, load in
-                # request count) to stay identical to phase-1.
-                matched = matched_blocks * tpb if adp else matched_blocks
-                candidates.append((rank, matched, load))
-
-        if adp:
-            # ADP-router algorithm (cap + gate + normalized load), token units.
-            dbg = {} if self._log_route_scores else None
-            best_ranks = score_kv_aware_candidates(
-                candidates,
-                load_weight=self._load_weight,
-                fair_share_multiplier=self._fair_share_multiplier,
-                match_rate_threshold=self._match_rate_threshold,
-                total_units=len(block_hashes) * tpb,
-                debug_out=dbg,
-            )
-            if dbg is not None:
-                self._score_log_n += 1
-                if self._score_log_n % 100 == 0:
-                    logger.info(
-                        f"[route_score] inst={inst.instance_id[:16]} "
-                        f"req_tok={len(block_hashes)*tpb} cache_active={dbg['cache_active']} "
-                        f"cap={dbg['cap']:.0f} mean_load={dbg['mean_load']:.0f} "
-                        f"winners={dbg['winners']} rows={dbg['rows']}")
-        else:
-            # Instance-routing algorithm: score = matched - load_weight*load,
-            # argmax (identical to phase-1 select_worker scoring).
-            best_score = None
-            best_ranks = []
-            for rank, matched, load in candidates:
-                score = matched - self._load_weight * load
-                if best_score is None or score > best_score:
-                    best_score = score
-                    best_ranks = [rank]
-                elif score == best_score:
-                    best_ranks.append(rank)
-
-        if not best_ranks:
-            # All ranks suspended; return instance-level selection without rank.
-            return Selection(
-                worker_id=inst.instance_id,
-                address=address,
-                matched_blocks=inst_matched)
-
-        # Round-robin tie-break (mirrors phase-1 instance tie-break). rr_counter
-        # is instance state -- bump it under the instance lock.
-        with inst.lock:
-            chosen_rank = best_ranks[inst.rr_counter % len(best_ranks)]
-            inst.rr_counter += 1
+        # Instance-level selection: the coordinator routes to the instance; the
+        # worker's own ADP router picks the rank. No per-rank routing here.
         return Selection(
-            worker_id=inst.instance_id,
+            worker_id=inst_ref.instance_id,
             address=address,
-            matched_blocks=inst_matched,
-            dp_rank=chosen_rank)
+            matched_blocks=inst_matched)
 
     def select_worker_from_tokens(self, namespace: str,
                                   token_ids: List[int]) -> Optional[Selection]:
@@ -727,23 +596,21 @@ class CentralizedKVCacheRouterCore:
 
     def select_address(self, namespace: str, block_hashes: List[int],
                        candidate_servers: List[str],
-                       rr_counter: int) -> Tuple[str, int, Optional[int], Optional[str]]:
+                       rr_counter: int) -> Tuple[str, int, Optional[str]]:
         """High-level placement for the surface adaptor.
 
         Runs :meth:`select_worker`, validates the chosen address against
         *candidate_servers*, and falls back to round-robin over the candidates
         when the router returns nothing usable. Also accumulates routing
         diagnostics (periodically logged). Returns
-        ``(server, matched_blocks, dp_rank, fallback_reason)`` where
-        ``fallback_reason`` is None on a cache-aware hit.
+        ``(server, matched_blocks, fallback_reason)`` where ``fallback_reason``
+        is None on a cache-aware hit.
         """
         selection = self.select_worker(namespace, block_hashes)
         fallback_reason = None
-        dp_rank = None
         if selection is not None and selection.address in candidate_servers:
             server = selection.address
             matched = selection.matched_blocks
-            dp_rank = selection.dp_rank
         else:
             server = candidate_servers[rr_counter % len(candidate_servers)]
             matched = 0
@@ -751,7 +618,7 @@ class CentralizedKVCacheRouterCore:
                                else f"addr_not_in_servers({selection.address})")
         self._record_routing_diag(namespace, len(block_hashes), matched,
                                   fallback_reason, server)
-        return server, matched, dp_rank, fallback_reason
+        return server, matched, fallback_reason
 
     def _record_routing_diag(self, namespace: str, num_hashes: int,
                              matched: int, fallback_reason: Optional[str],
@@ -836,10 +703,9 @@ class CentralizedKVCacheRouterCore:
                         f"hashes[:5]={block_hashes[:5]} "
                         f"types={[type(h).__name__ for h in block_hashes[:3]]} "
                         f"raw_blocks={data.get('blocks', [])[:2]}")
-                # Rank trie is skipped in "none" mode (never queried); owned_hashes
-                # is always tracked and drives combined-trie refcounting.
-                if not self._skip_rank_trie:
-                    rs.trie.add(worker_id, block_hashes)
+                # The per-rank trie is never queried (routing is instance-level),
+                # so it is not maintained; owned_hashes is always tracked and
+                # drives combined-trie refcounting.
                 # combined_refcount = number of ranks holding each block; bump
                 # once per rank that newly acquires it (owned_hashes de-dups the
                 # re-emitted-per-layer-group stores), symmetric with removal.
@@ -858,8 +724,6 @@ class CentralizedKVCacheRouterCore:
                 actually_removed = [h for h in removed_hashes
                                     if h in rs.owned_hashes]
                 if actually_removed:
-                    if not self._skip_rank_trie:
-                        rs.trie.remove(worker_id, actually_removed)
                     rs.owned_hashes.difference_update(actually_removed)
                     # Drop from combined trie only when the last rank evicts.
                     combined_removed = []
