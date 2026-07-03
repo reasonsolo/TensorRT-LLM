@@ -1994,6 +1994,14 @@ class ResponseHooks(ABC):
     def on_req_begin(self, request: UCompletionRequest):
         pass
 
+    def on_ctx_dispatch(self, request: UCompletionRequest):
+        """Fired the instant the disagg service starts placing the request on a
+        ctx server (before routing / the ctx HTTP send). arrival->here measures
+        the pre-ctx wait in the orchestrator/fleet (accept queue + event loop +
+        pipeline), which dominates TTFT under high fleet concurrency. Default
+        no-op so non-instrumented hook implementations are unaffected."""
+        pass
+
     @abstractmethod
     def on_ctx_resp(self, ctx_server: str, response: UCompletionResponse):
         pass

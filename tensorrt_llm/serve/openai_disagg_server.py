@@ -61,10 +61,16 @@ class RawRequestResponseHooks(ResponseHooks):
         self.gen_server = ""
         self.request_arrival_time = raw_req.state.server_arrival_time
         self.server_first_token_time = 0
+        # Timestamp when the service starts placing the request on a ctx server;
+        # arrival->this = pre-ctx orchestrator/fleet wait. 0 until on_ctx_dispatch.
+        self.ctx_dispatch_time = 0
         self.perf_metrics_collector = perf_metrics_collector
 
     def on_req_begin(self, request: UCompletionRequest):
         self.perf_metrics_collector.queue_latency_seconds.observe(get_steady_clock_now_in_seconds() - self.request_arrival_time)
+
+    def on_ctx_dispatch(self, request: UCompletionRequest):
+        self.ctx_dispatch_time = get_steady_clock_now_in_seconds()
 
     def on_ctx_resp(self, ctx_server: str, response: UCompletionResponse):
         self.ctx_server = ctx_server
@@ -76,7 +82,7 @@ class RawRequestResponseHooks(ResponseHooks):
     def on_resp_done(self, gen_server: str, request: UCompletionRequest, response: UCompletionResponse = None):
         if request.disaggregated_params:
             ctx_req_id = request.disaggregated_params.ctx_request_id
-            asyncio.create_task(self.perf_metrics_collector.add_per_request_metrics(self.ctx_server, gen_server, ctx_req_id, self.raw_req.state.server_arrival_time, self.server_first_token_time))
+            asyncio.create_task(self.perf_metrics_collector.add_per_request_metrics(self.ctx_server, gen_server, ctx_req_id, self.raw_req.state.server_arrival_time, self.server_first_token_time, self.ctx_dispatch_time))
 
 
 class OpenAIDisaggServer:

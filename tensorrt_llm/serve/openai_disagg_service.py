@@ -130,6 +130,10 @@ class OpenAIDisaggregatedService(OpenAIService):
         gen_req = request
         disagg_request_id = await self._coordinator.get_disagg_request_id()
         if need_ctx:
+            # Mark ctx-dispatch start: arrival->here is the pre-ctx wait in the
+            # orchestrator/fleet (accept queue + event loop + pipeline).
+            if hooks:
+                hooks.on_ctx_dispatch(request)
             ctx_req = self._get_ctx_request(request, disagg_request_id)
             # ctx generator is empty
             ctx_server, _ = await self._ctx_router.get_next_server(
@@ -483,6 +487,9 @@ class OpenAIDisaggregatedService(OpenAIService):
         # the coordinator so fleet workers never mint colliding ids.
         disagg_request_id = await self._coordinator.get_disagg_request_id()
         if need_ctx:
+            # arrival->here = pre-ctx wait in the orchestrator/fleet.
+            if hooks:
+                hooks.on_ctx_dispatch(request)
             ctx_server, ctx_server_info = await self._ctx_router.get_next_server(
                 request)
             ctx_req = self._get_ctx_request(request, disagg_request_id)
