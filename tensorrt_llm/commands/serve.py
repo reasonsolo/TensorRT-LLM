@@ -1323,6 +1323,9 @@ def _launch_disagg_fleet(disagg_cfg, config_file, metadata_server_config_file,
     child_env[DisaggWorkerEnvs.TLLM_DISAGG_REQUEST_TIMEOUT] = str(request_timeout)
     child_env[DisaggWorkerEnvs.TLLM_DISAGG_SERVER_START_TIMEOUT] = str(
         server_start_timeout)
+    # Propagate the parent's log level so fleet workers' INFO logs (e.g. the
+    # per-request [ttft_split] / [coord_api] breakdowns) are not dropped.
+    child_env[DisaggWorkerEnvs.TLLM_DISAGG_LOG_LEVEL] = logger.level
     cmd = [sys.executable, "-m", "uvicorn", "--factory",
            "--host", str(public_host), "--port", str(public_port),
            "--workers", str(num_workers), "--timeout-keep-alive", "10",
@@ -1417,6 +1420,14 @@ def create_disagg_server_app():
     os.environ.pop("WEB_CONCURRENCY", None)
     if os.getenv("TRTLLM_DISAGG_SERVER_DISABLE_GC", "1") == "1":
         gc.disable()
+
+    # This is a fresh Python process (python -m uvicorn), so the TRT-LLM logger
+    # defaults to WARNING and would drop the workers' INFO logs (per-request
+    # [ttft_split] / [coord_api]). Restore the parent's level.
+    _worker_log_level = os.environ.get(
+        DisaggWorkerEnvs.TLLM_DISAGG_LOG_LEVEL)
+    if _worker_log_level:
+        logger.set_level(_worker_log_level)
 
     # All N fleet workers share one stdout; tag every trtllm log line from this
     # worker with its PID so interleaved fleet output is attributable.
@@ -1552,6 +1563,9 @@ class DisaggWorkerEnvs(StrEnum):
     TLLM_DISAGG_METADATA_CONFIG_FILE = "TRTLLM_DISAGG_METADATA_CONFIG_FILE"
     TLLM_DISAGG_REQUEST_TIMEOUT = "TRTLLM_DISAGG_REQUEST_TIMEOUT"
     TLLM_DISAGG_SERVER_START_TIMEOUT = "TRTLLM_DISAGG_SERVER_START_TIMEOUT"
+    # Parent's logger level; the forked uvicorn fleet is a fresh process that
+    # otherwise defaults to WARNING and drops the workers' INFO logs.
+    TLLM_DISAGG_LOG_LEVEL = "TRTLLM_DISAGG_LOG_LEVEL"
 
 
 def _launch_disaggregated_server(disagg_config_file: str, llm_args: dict):
