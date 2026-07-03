@@ -22,7 +22,6 @@ from tensorrt_llm.llmapi.disagg_utils import (
     ConditionalDisaggConfig,
     DisaggServerConfig,
     ServerRole,
-    get_global_disagg_request_id,
 )
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.openai_client import OpenAIClient
@@ -61,7 +60,7 @@ class OpenAIDisaggregatedService(OpenAIService):
         # finish_request uniformly -- so serving is identical whether the router
         # is the real one (single-process) or a CoordinatorDelegatingRouter that
         # forwards placement to a remote coordinator (worker).
-        self._cluster = coordinator
+        self._coordinator = coordinator
         self._ctx_router = coordinator.ctx_router
         self._gen_router = coordinator.gen_router
         self._client_factory = client_factory
@@ -129,7 +128,7 @@ class OpenAIDisaggregatedService(OpenAIService):
         need_ctx = need_ctx and not await self._check_gen_only_disagg(request)
         ctx_response = None
         gen_req = request
-        disagg_request_id = get_global_disagg_request_id(self._config.node_id)
+        disagg_request_id = await self._coordinator.get_disagg_request_id()
         if need_ctx:
             ctx_req = self._get_ctx_request(request, disagg_request_id)
             # ctx generator is empty
@@ -417,7 +416,7 @@ class OpenAIDisaggregatedService(OpenAIService):
         # Per-request readiness gate for the /v1/ handlers (the server's /health
         # and /cluster_info hook the coordinator directly). Cluster topology
         # (cluster_info) is the coordinator's concern, not the request service's.
-        return await self._cluster.is_ready()
+        return await self._coordinator.is_ready()
 
     @property
     def conditional_disagg_config(self) -> Optional[ConditionalDisaggConfig]:
@@ -435,14 +434,14 @@ class OpenAIDisaggregatedService(OpenAIService):
             self._gen_router, ServerRole.GENERATION,
             self._config.max_retries
         )
-        if hasattr(self._cluster, "set_clients"):
-            self._cluster.set_clients(self._ctx_client, self._gen_client)
-        await self._cluster.start()
+        if hasattr(self._coordinator, "set_clients"):
+            self._coordinator.set_clients(self._ctx_client, self._gen_client)
+        await self._coordinator.start()
 
     async def teardown(self) -> None:
         await self._ctx_client.shutdown()
         await self._gen_client.shutdown()
-        await self._cluster.stop()
+        await self._coordinator.stop()
 
     async def _verify_ctx_response(self, ctx_response: UCompletionResponse) -> None:
         if ctx_response:
@@ -480,7 +479,9 @@ class OpenAIDisaggregatedService(OpenAIService):
         ctx_server, gen_server = None, None
         ctx_server_info = None
         ctx_req, gen_req = None, None
-        disagg_request_id = get_global_disagg_request_id(self._config.node_id)
+        # Single-issuer disagg id (see _send_disagg_request_ctx_first): fetch from
+        # the coordinator so fleet workers never mint colliding ids.
+        disagg_request_id = await self._coordinator.get_disagg_request_id()
         if need_ctx:
             ctx_server, ctx_server_info = await self._ctx_router.get_next_server(
                 request)
