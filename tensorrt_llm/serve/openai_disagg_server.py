@@ -61,9 +61,14 @@ class RawRequestResponseHooks(ResponseHooks):
         self.gen_server = ""
         self.request_arrival_time = raw_req.state.server_arrival_time
         self.server_first_token_time = 0
-        # Timestamp when the service starts placing the request on a ctx server;
-        # arrival->this = pre-ctx orchestrator/fleet wait. 0 until on_ctx_dispatch.
+        # Orchestrator-side TTFT timeline (all get_steady_clock_now_in_seconds):
+        #   arrival -> ctx_dispatch : pre-ctx wait in this fleet worker (accept
+        #                             queue + event loop + pipeline before routing)
+        #   ctx_dispatch -> ctx_resp: ctx routing + ctx HTTP round-trip (prefill)
+        #   ctx_resp -> first_token : KV transfer + gen routing + gen first token
+        # 0 until the corresponding hook fires.
         self.ctx_dispatch_time = 0
+        self.ctx_resp_time = 0
         self.perf_metrics_collector = perf_metrics_collector
 
     def on_req_begin(self, request: UCompletionRequest):
@@ -74,12 +79,28 @@ class RawRequestResponseHooks(ResponseHooks):
 
     def on_ctx_resp(self, ctx_server: str, response: UCompletionResponse):
         self.ctx_server = ctx_server
+        self.ctx_resp_time = get_steady_clock_now_in_seconds()
 
     def on_first_token(self, gen_server: str, request: UCompletionRequest, response: UCompletionResponse = None):
         self.gen_server = gen_server
         self.server_first_token_time = get_steady_clock_now_in_seconds()
 
     def on_resp_done(self, gen_server: str, request: UCompletionRequest, response: UCompletionResponse = None):
+        # Log the orchestrator-side TTFT breakdown per request so it is captured
+        # in fleet mode regardless of the per-worker /perf_metrics scrape (which
+        # only reaches one uvicorn worker). Aggregate [ttft_split] offline.
+        arr = self.request_arrival_time
+        disp = self.ctx_dispatch_time
+        cresp = self.ctx_resp_time
+        ft = self.server_first_token_time
+        if arr and ft:
+            pre_ctx = (disp - arr) * 1000 if disp else -1.0
+            ctx_phase = (cresp - disp) * 1000 if (disp and cresp) else -1.0
+            xfer_gen = (ft - cresp) * 1000 if cresp else -1.0
+            total = (ft - arr) * 1000
+            logger.info(
+                f"[ttft_split] pre_ctx_ms={pre_ctx:.1f} ctx_phase_ms={ctx_phase:.1f} "
+                f"xfer_gen_ms={xfer_gen:.1f} total_ms={total:.1f}")
         if request.disaggregated_params:
             ctx_req_id = request.disaggregated_params.ctx_request_id
             asyncio.create_task(self.perf_metrics_collector.add_per_request_metrics(self.ctx_server, gen_server, ctx_req_id, self.raw_req.state.server_arrival_time, self.server_first_token_time, self.ctx_dispatch_time))

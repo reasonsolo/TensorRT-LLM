@@ -1610,6 +1610,12 @@ class CoordinatorDelegatingRouter(Router):
         self._role = role  # "context" | "generation"
         self._request_timeout_s = request_timeout_s
         self._session: Optional[aiohttp.ClientSession] = None
+        # Coordinator HTTP-client API latency (includes network round-trip to the
+        # coordinator + its in-process handler). Compare against the owner-side
+        # [coord_api] to isolate the fleet /select|/finish HTTP overhead.
+        from tensorrt_llm.serve.responses_utils import PeriodicLatencyLogger
+        self._select_lat = PeriodicLatencyLogger(f"client.select[{role}]")
+        self._finish_lat = PeriodicLatencyLogger(f"client.finish[{role}]")
 
     def __getattr__(self, name):
         # servers / prepare_servers / num_prepared_servers / start_server_monitoring
@@ -1655,6 +1661,7 @@ class CoordinatorDelegatingRouter(Router):
         payload = {"role": self._role, "routing_key": key,
                    "req_id": self._request_id(request),
                    "exclude_server": exclude_server}
+        _t0 = time.monotonic()
         async with self.session.post(
                 f"{self._coordinator_url}/select", json=payload,
                 timeout=self._request_timeout_s) as resp:
@@ -1663,6 +1670,7 @@ class CoordinatorDelegatingRouter(Router):
                     f"coordinator /select returned {resp.status}: "
                     f"{await resp.text()}")
             body = await resp.json()
+        self._select_lat.record(time.monotonic() - _t0)
         info = body.get("info") or {}
         return body["server"], info
 
@@ -1671,6 +1679,7 @@ class CoordinatorDelegatingRouter(Router):
                              session: Optional[aiohttp.ClientSession] = None,
                              success: bool = True):
         del session
+        _t0 = time.monotonic()
         try:
             async with self.session.post(
                     f"{self._coordinator_url}/finish",
@@ -1681,6 +1690,7 @@ class CoordinatorDelegatingRouter(Router):
                 if resp.status != 200:
                     logger.warning(
                         f"coordinator /finish returned {resp.status}")
+            self._finish_lat.record(time.monotonic() - _t0)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"CoordinatorDelegatingRouter finish failed: {e}")
 

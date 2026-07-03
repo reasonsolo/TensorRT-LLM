@@ -35,6 +35,7 @@ Two implementations for the coordinator/worker deployment:
 """
 
 import asyncio
+import time
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional, Tuple
 
@@ -166,21 +167,37 @@ class DisaggCoordinatorService(DisaggCoordinator):
 
     # -- coordinator-path placement (workers call these via the HTTP server) --
 
+    def _api_lat(self, name: str):
+        """Lazily create a per-API PeriodicLatencyLogger. Measures the coordinator
+        owner's in-process handler time (excludes the fleet->coordinator HTTP hop,
+        which is captured client-side as [coord_api] client.*)."""
+        cache = self.__dict__.setdefault("_coord_api_lat", {})
+        if name not in cache:
+            from tensorrt_llm.serve.responses_utils import \
+                PeriodicLatencyLogger
+            cache[name] = PeriodicLatencyLogger(f"owner.{name}")
+        return cache[name]
+
     async def select(self, role: str, routing_key, req_id,
                      exclude_server: Optional[str]) -> Tuple[str, dict, Optional[str]]:
+        _t0 = time.monotonic()
         router = self._router_for_role(role)
         if req_id is None:
             # The coordinator owns IDs absent from generation requests.
             req_id = get_global_disagg_request_id(self._config.node_id)
-        return await router.get_next_server_by_key(routing_key, req_id=req_id,
-                                                   exclude_server=exclude_server)
+        result = await router.get_next_server_by_key(
+            routing_key, req_id=req_id, exclude_server=exclude_server)
+        self._api_lat(f"select[{role}]").record(time.monotonic() - _t0)
+        return result
 
     async def get_disagg_request_id(self) -> int:
         return get_global_disagg_request_id(self._config.node_id)
 
     async def finish(self, role: str, req_id,
                      success: bool = True) -> None:
+        _t0 = time.monotonic()
         await self._router_for_role(role).finish_request_by_id(req_id, success)
+        self._api_lat(f"finish[{role}]").record(time.monotonic() - _t0)
 
     def _router_for_role(self, role: str) -> Router:
         return (self._ctx_router

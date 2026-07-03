@@ -1985,6 +1985,33 @@ class ServerArrivalTimeMiddleware:
         await self.app(scope, receive, send)
 
 
+class PeriodicLatencyLogger:
+    """Accumulates per-call latencies for a named coordinator API and logs
+    percentiles every ``window`` calls. Cheap, lock-free (single asyncio loop),
+    and self-resetting. Used to profile the coordinator surface on both the
+    in-process owner (DisaggCoordinatorService) and the HTTP client
+    (CoordinatorDelegatingRouter / CoordinatorClient) without per-call log spam."""
+
+    def __init__(self, name: str, window: int = 500):
+        self._name = name
+        self._window = window
+        self._samples: List[float] = []
+        self._n = 0
+
+    def record(self, dt_s: float) -> None:
+        self._samples.append(dt_s * 1000.0)  # ms
+        self._n += 1
+        if self._n % self._window == 0:
+            s = sorted(self._samples)
+            m = len(s)
+            p = lambda q: s[min(int(q * m), m - 1)]
+            logger.info(
+                f"[coord_api] {self._name} n={self._n} ms: "
+                f"mean={sum(s)/m:.2f} p50={p(0.5):.2f} p90={p(0.9):.2f} "
+                f"p99={p(0.99):.2f} max={s[-1]:.2f}")
+            self._samples = []
+
+
 class ResponseHooks(ABC):
     """
     Hooks for response processing and (disagg) service perf observability.
