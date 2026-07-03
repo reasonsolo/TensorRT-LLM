@@ -1605,7 +1605,13 @@ class CoordinatorDelegatingRouter(Router):
                  request_timeout_s: float = 5.0):
         # Intentionally NOT calling Router.__init__: this is a thin proxy whose
         # server-pool state lives on the wrapped local router (see __getattr__).
-        self._coordinator_url = coordinator_url.rstrip("/")
+        # coordinator_url may be a TCP URL or unix:/path (UDS avoids the TCP
+        # loopback stack for the hot /select,/finish calls). Resolve the request
+        # base URL now; the session (with UnixConnector when applicable) is made
+        # lazily so it binds to the running event loop.
+        from tensorrt_llm.serve.disagg_coordinator import coordinator_base_url
+        self._coordinator_url_raw = coordinator_url
+        self._coordinator_url = coordinator_base_url(coordinator_url)
         self._local = local_router
         self._role = role  # "context" | "generation"
         self._request_timeout_s = request_timeout_s
@@ -1625,7 +1631,9 @@ class CoordinatorDelegatingRouter(Router):
     @property
     def session(self) -> aiohttp.ClientSession:
         if self._session is None:
-            self._session = aiohttp.ClientSession()
+            from tensorrt_llm.serve.disagg_coordinator import \
+                make_coordinator_session
+            self._session = make_coordinator_session(self._coordinator_url_raw)
         return self._session
 
     def _on_servers_updated(self, old_servers, new_servers):

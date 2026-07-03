@@ -33,6 +33,7 @@ the ZMQ ingest bind for centralized mode.
 
 import asyncio
 from contextlib import asynccontextmanager
+from typing import Optional
 
 import uvicorn
 from fastapi import FastAPI, Request
@@ -114,13 +115,32 @@ class CoordinatorServer:
     async def version(self) -> Response:
         return JSONResponse(content={"version": VERSION})
 
-    async def __call__(self, host: str, port: int) -> None:
+    async def __call__(self, host: str, port: int,
+                       uds: Optional[str] = None) -> None:
         # Single-process by design: owns routing state + the centralized ZMQ
         # ingest bind. workers=1 forced so a leaked WEB_CONCURRENCY can't fork it.
-        config = uvicorn.Config(self.app, host=host, port=port, workers=1,
-                                log_level="info",
-                                timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
-        await uvicorn.Server(config).serve()
+        # When ``uds`` is given, also bind a Unix domain socket: the fleet is
+        # co-located with the implicit coordinator, and UDS avoids the TCP
+        # loopback stack (connection/backlog/parse overhead that dominated the
+        # per-request /select,/finish latency vs the ~0.1ms handler). The TCP
+        # port stays bound too (health checks, external/cross-node clients).
+        kwargs = dict(workers=1, log_level="info",
+                      timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
+        if uds:
+            # Bind UDS for the fleet; keep the TCP port for health/external use
+            # by serving both on one Server via a shared socket list is not
+            # supported by uvicorn.Config, so prefer UDS when set (the fleet is
+            # the only hot client; health probes use the same UDS-less URL only
+            # pre-startup). uvicorn binds uds XOR host:port per Config, so run
+            # two Servers concurrently: one UDS (hot path), one TCP (health).
+            import asyncio as _asyncio
+            uds_cfg = uvicorn.Config(self.app, uds=uds, **kwargs)
+            tcp_cfg = uvicorn.Config(self.app, host=host, port=port, **kwargs)
+            await _asyncio.gather(uvicorn.Server(uds_cfg).serve(),
+                                  uvicorn.Server(tcp_cfg).serve())
+        else:
+            config = uvicorn.Config(self.app, host=host, port=port, **kwargs)
+            await uvicorn.Server(config).serve()
 
 
 def serve_coordinator(host: str, port: int,

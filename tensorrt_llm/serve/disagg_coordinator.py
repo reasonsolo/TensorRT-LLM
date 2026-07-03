@@ -310,6 +310,33 @@ class DisaggCoordinatorService(DisaggCoordinator):
                 f"{worker_info.worker_id} event: {event_type.name}")
 
 
+COORDINATOR_UDS_SCHEME = "unix:"
+
+
+def coordinator_base_url(remote_url: str) -> str:
+    """The URL prefix to build request URLs against.
+
+    ``remote_url`` is either a TCP URL (``http://host:port``) or a Unix domain
+    socket (``unix:/abs/path.sock``). For UDS the socket path routes, so the HTTP
+    host is a dummy ``http://localhost`` (aiohttp still needs a valid http URL)."""
+    if remote_url.startswith(COORDINATOR_UDS_SCHEME):
+        return "http://localhost"
+    return remote_url.rstrip("/")
+
+
+def make_coordinator_session(remote_url: str) -> aiohttp.ClientSession:
+    """aiohttp session for the coordinator endpoint. Uses a UnixConnector for a
+    ``unix:/path`` URL -- UDS avoids the TCP loopback stack that dominated the
+    fleet's per-request /select,/finish latency (~hundreds of ms queueing vs a
+    ~0.1ms handler), since the fleet is co-located with the implicit coordinator.
+    Created lazily by callers so it binds to the running event loop."""
+    if remote_url.startswith(COORDINATOR_UDS_SCHEME):
+        sock_path = remote_url[len(COORDINATOR_UDS_SCHEME):]
+        return aiohttp.ClientSession(
+            connector=aiohttp.UnixConnector(path=sock_path))
+    return aiohttp.ClientSession()
+
+
 class CoordinatorClient(DisaggCoordinator):
     """Worker-side coordinator: delegate stateful routing to the coordinator.
 
@@ -332,7 +359,11 @@ class CoordinatorClient(DisaggCoordinator):
                  metadata_config: Optional[MetadataServerConfig] = None,
                  request_timeout_s: float = 5.0,
                  startup_timeout_s: float = 180.0):
-        self._remote_url = remote_url.rstrip("/")
+        # remote_url may be a TCP URL or unix:/path. Resolve to a request base
+        # URL now; the session (with the right connector) is created lazily so it
+        # binds to the running event loop.
+        self._remote_url_raw = remote_url
+        self._remote_url = coordinator_base_url(remote_url)
         self._request_timeout_s = request_timeout_s
         self._startup_timeout_s = startup_timeout_s
         self._session: Optional[aiohttp.ClientSession] = None
@@ -352,9 +383,10 @@ class CoordinatorClient(DisaggCoordinator):
 
     def _maybe_delegate(self, local_router: Router, role: str) -> Router:
         # Stateful routers expose get_next_server_by_key -> delegate placement to
-        # the coordinator; stateless ones place locally (used unchanged).
+        # the coordinator; stateless ones place locally (used unchanged). Pass the
+        # RAW url so the delegating router picks the UDS connector when applicable.
         if hasattr(local_router, "get_next_server_by_key"):
-            return CoordinatorDelegatingRouter(self._remote_url, local_router,
+            return CoordinatorDelegatingRouter(self._remote_url_raw, local_router,
                                                role, self._request_timeout_s)
         return local_router
 
@@ -369,7 +401,7 @@ class CoordinatorClient(DisaggCoordinator):
     @property
     def session(self) -> aiohttp.ClientSession:
         if self._session is None:
-            self._session = aiohttp.ClientSession()
+            self._session = make_coordinator_session(self._remote_url_raw)
         return self._session
 
     async def start(self) -> None:

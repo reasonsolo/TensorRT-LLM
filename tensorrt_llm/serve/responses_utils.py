@@ -1980,9 +1980,37 @@ class ServerArrivalTimeMiddleware:
             scope["state"] = {}
             scope["state"][
                 "server_arrival_time"] = get_steady_clock_now_in_seconds()
+            # Measure client-send -> server-accept latency: the network + HTTP
+            # accept-queue backlog BEFORE the handler runs (invisible to per-
+            # request server metrics, which start at server_arrival_time). The
+            # client stamps x-client-send-time (wall-clock epoch s); compare to
+            # our wall clock (NTP-synced hosts). Only /v1/ request paths.
+            path = scope.get("path", "")
+            if path.startswith("/v1/"):
+                for k, v in scope.get("headers", ()):  # raw ASGI header pairs
+                    if k == b"x-client-send-time":
+                        try:
+                            sent = float(v.decode())
+                            _accept_latency_logger().record(
+                                max(0.0, time.time() - sent))
+                        except (ValueError, UnicodeDecodeError):
+                            pass
+                        break
 
         # Pass through the original receive/send - no wrapping!
         await self.app(scope, receive, send)
+
+
+_ACCEPT_LAT = None
+
+
+def _accept_latency_logger():
+    """Lazy singleton for the client-send -> server-accept latency logger
+    (PeriodicLatencyLogger is defined below this class)."""
+    global _ACCEPT_LAT
+    if _ACCEPT_LAT is None:
+        _ACCEPT_LAT = PeriodicLatencyLogger("accept.client_send_to_arrival")
+    return _ACCEPT_LAT
 
 
 class PeriodicLatencyLogger:

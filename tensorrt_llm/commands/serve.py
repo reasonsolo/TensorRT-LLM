@@ -1380,13 +1380,22 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
     from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinatorService
 
     public_host, public_port = disagg_cfg.hostname, disagg_cfg.port
-    coord_port = int(os.environ.get("TLLM_DISAGG_COORDINATOR_PORT",
-                                    public_port - 1))
-    coord_url = f"http://{public_host}:{coord_port}"
+    coord_port = int(os.environ.get(
+        DisaggWorkerEnvs.TLLM_DISAGG_COORDINATOR_PORT, public_port - 1))
+    # The fleet is co-located with the implicit coordinator, so route its hot
+    # /select,/finish over a Unix domain socket (avoids the TCP loopback stack
+    # that dominated per-request latency). Opt-out via the UDS env = "0".
+    use_uds = os.environ.get(
+        DisaggWorkerEnvs.TLLM_DISAGG_COORDINATOR_UDS, "1") == "1"
+    coord_uds = (f"/tmp/trtllm_disagg_coord_{public_port}.sock"  # nosec B108
+                 if use_uds else None)
+    # Fleet points at the UDS when enabled; the TCP port stays up for health.
+    coord_url = f"unix:{coord_uds}" if coord_uds else \
+        f"http://{public_host}:{coord_port}"
 
     # 1. Launch the delegating fleet pointed at the implicit coordinator we start
-    #    below (port-1). Workers hold CoordinatorClients (no core), so they can't
-    #    race the coordinator's single ZMQ ingest bind.
+    #    below (port-1 for TCP; UDS for the hot path). Workers hold
+    #    CoordinatorClients (no core), so they can't race the ZMQ ingest bind.
     _launch_disagg_fleet(disagg_cfg, config_file, metadata_server_config_file,
                          request_timeout, server_start_timeout, num_workers,
                          coord_url)
@@ -1403,8 +1412,9 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
         metadata_config=metadata_server_cfg,
         server_start_timeout_secs=server_start_timeout)
     logger.info(f"Coordinator serving on {public_host}:{coord_port} "
-                f"(fleet on public port {public_port})")
-    asyncio.run(CoordinatorServer(coordinator)(public_host, coord_port))
+                f"(uds={coord_uds}) (fleet on public port {public_port})")
+    asyncio.run(CoordinatorServer(coordinator)(public_host, coord_port,
+                                               uds=coord_uds))
 
 
 def create_disagg_server_app():
@@ -1566,6 +1576,12 @@ class DisaggWorkerEnvs(StrEnum):
     # Parent's logger level; the forked uvicorn fleet is a fresh process that
     # otherwise defaults to WARNING and drops the workers' INFO logs.
     TLLM_DISAGG_LOG_LEVEL = "TRTLLM_DISAGG_LOG_LEVEL"
+    # Coordinator transport knobs (read in _serve_coordinator_and_fleet):
+    #   PORT: override the coordinator's TCP port (default public_port-1).
+    #   UDS:  "1" (default) routes the co-located fleet's hot /select,/finish over
+    #         a Unix domain socket instead of TCP loopback; "0" to force TCP.
+    TLLM_DISAGG_COORDINATOR_PORT = "TRTLLM_DISAGG_COORDINATOR_PORT"
+    TLLM_DISAGG_COORDINATOR_UDS = "TRTLLM_DISAGG_COORDINATOR_UDS"
 
 
 def _launch_disaggregated_server(disagg_config_file: str, llm_args: dict):
