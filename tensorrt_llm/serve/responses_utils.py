@@ -2002,6 +2002,7 @@ class ServerArrivalTimeMiddleware:
 
 
 _ACCEPT_LAT = None
+_TTFT_SPLIT = None
 
 
 def _accept_latency_logger():
@@ -2011,6 +2012,17 @@ def _accept_latency_logger():
     if _ACCEPT_LAT is None:
         _ACCEPT_LAT = PeriodicLatencyLogger("accept.client_send_to_arrival")
     return _ACCEPT_LAT
+
+
+def ttft_split_logger():
+    """Lazy singleton aggregating the per-request TTFT breakdown (pre_ctx /
+    ctx_phase / xfer_gen / total), logged periodically instead of per request."""
+    global _TTFT_SPLIT
+    if _TTFT_SPLIT is None:
+        _TTFT_SPLIT = PeriodicBreakdownLogger(
+            "orchestrator",
+            ["pre_ctx_ms", "ctx_phase_ms", "xfer_gen_ms", "total_ms"])
+    return _TTFT_SPLIT
 
 
 class PeriodicLatencyLogger:
@@ -2038,6 +2050,39 @@ class PeriodicLatencyLogger:
                 f"mean={sum(s)/m:.2f} p50={p(0.5):.2f} p90={p(0.9):.2f} "
                 f"p99={p(0.99):.2f} max={s[-1]:.2f}")
             self._samples = []
+
+
+class PeriodicBreakdownLogger:
+    """Like PeriodicLatencyLogger but for a multi-field breakdown: accumulates a
+    dict of named ms values per sample and logs p50/p95 of EACH field once every
+    ``window`` samples. Used for the per-request TTFT split so we get the
+    breakdown WITHOUT a synchronous log write per request (that per-request
+    logging inflated TTFT ~3s on the single-loop disagg server -- observer
+    effect). Negative values (stage not reached) are dropped per field."""
+
+    def __init__(self, name: str, fields, window: int = 1000):
+        self._name = name
+        self._fields = list(fields)
+        self._window = window
+        self._samples = {f: [] for f in self._fields}
+        self._n = 0
+
+    def record(self, values: dict) -> None:
+        self._n += 1
+        for f in self._fields:
+            v = values.get(f)
+            if v is not None and v >= 0:
+                self._samples[f].append(v)
+        if self._n % self._window == 0:
+            parts = []
+            for f in self._fields:
+                s = sorted(self._samples[f])
+                if s:
+                    p = lambda q: s[min(int(q * len(s)), len(s) - 1)]
+                    parts.append(f"{f}(p50={p(0.5):.0f},p95={p(0.95):.0f})")
+                self._samples[f] = []
+            logger.info(f"[ttft_split] {self._name} n={self._n} " +
+                        " ".join(parts))
 
 
 class ResponseHooks(ABC):

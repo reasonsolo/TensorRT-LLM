@@ -47,7 +47,8 @@ from tensorrt_llm.serve.openai_protocol import (UCompletionRequest,
                                                 UCompletionResponse)
 from tensorrt_llm.serve.perf_metrics import DisaggPerfMetricsCollector
 from tensorrt_llm.serve.responses_utils import (ServerArrivalTimeMiddleware,
-                                                get_steady_clock_now_in_seconds)
+                                                get_steady_clock_now_in_seconds,
+                                                ttft_split_logger)
 from tensorrt_llm.serve.router import Router
 from tensorrt_llm.version import __version__ as VERSION
 
@@ -86,21 +87,21 @@ class RawRequestResponseHooks(ResponseHooks):
         self.server_first_token_time = get_steady_clock_now_in_seconds()
 
     def on_resp_done(self, gen_server: str, request: UCompletionRequest, response: UCompletionResponse = None):
-        # Log the orchestrator-side TTFT breakdown per request so it is captured
-        # in fleet mode regardless of the per-worker /perf_metrics scrape (which
-        # only reaches one uvicorn worker). Aggregate [ttft_split] offline.
+        # Feed the orchestrator-side TTFT breakdown into a periodic aggregator
+        # (NOT one log line per request -- per-request logging on the single
+        # disagg event loop inflated TTFT ~3s, an observer effect). The aggregator
+        # logs p50/p95 of each stage every N requests.
         arr = self.request_arrival_time
         disp = self.ctx_dispatch_time
         cresp = self.ctx_resp_time
         ft = self.server_first_token_time
         if arr and ft:
-            pre_ctx = (disp - arr) * 1000 if disp else -1.0
-            ctx_phase = (cresp - disp) * 1000 if (disp and cresp) else -1.0
-            xfer_gen = (ft - cresp) * 1000 if cresp else -1.0
-            total = (ft - arr) * 1000
-            logger.info(
-                f"[ttft_split] pre_ctx_ms={pre_ctx:.1f} ctx_phase_ms={ctx_phase:.1f} "
-                f"xfer_gen_ms={xfer_gen:.1f} total_ms={total:.1f}")
+            ttft_split_logger().record({
+                "pre_ctx_ms": (disp - arr) * 1000 if disp else -1.0,
+                "ctx_phase_ms": (cresp - disp) * 1000 if (disp and cresp) else -1.0,
+                "xfer_gen_ms": (ft - cresp) * 1000 if cresp else -1.0,
+                "total_ms": (ft - arr) * 1000,
+            })
         if request.disaggregated_params:
             ctx_req_id = request.disaggregated_params.ctx_request_id
             asyncio.create_task(self.perf_metrics_collector.add_per_request_metrics(self.ctx_server, gen_server, ctx_req_id, self.raw_req.state.server_arrival_time, self.server_first_token_time, self.ctx_dispatch_time))

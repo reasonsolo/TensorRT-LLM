@@ -179,11 +179,6 @@ class KvCacheAwareServerState(ServerState):
         async with session.post(
                 f"{self._base_url}/kv_cache_events") as response:
             events_raw = await response.json()
-        # DIAG: confirm which servers actually get polled and how many events
-        # each returns (diagnoses single-server block-table population).
-        logger.info(
-            f"POLL_DIAG server={self._server} "
-            f"n_events={len(events_raw) if events_raw is not None else 'None'}")
         return events_raw
 
     _event_match_log_counter = 0
