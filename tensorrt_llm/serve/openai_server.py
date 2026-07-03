@@ -1926,9 +1926,6 @@ class OpenAIServer(_VideoRoutesMixin):
 
     async def get_server_info(self) -> JSONResponse:
         content = {"disaggregated_params": self.generator.disaggregated_params}
-        llm_id = getattr(self.generator, "llm_id", None)
-        if llm_id is not None:
-            content["worker_id"] = llm_id
         args = getattr(self.generator, "args", None)
         if args is not None:
             if args.max_batch_size is not None:

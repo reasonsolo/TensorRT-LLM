@@ -4230,12 +4230,6 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype",
     )
 
-    llm_id: Optional[str] = Field(
-        default=None,
-        description="Stable instance identifier propagated to all ranks via MPI broadcast.",
-        status="prototype",
-    )
-
     # PrivateVars
     _quant_config: Optional[QuantConfig] = PrivateAttr(default=None)
 
