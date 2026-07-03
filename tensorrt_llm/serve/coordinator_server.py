@@ -60,6 +60,8 @@ class CoordinatorServer:
         self.app = FastAPI(lifespan=lifespan)
         self.app.add_api_route("/select", self.select, methods=["POST"])
         self.app.add_api_route("/finish", self.finish, methods=["POST"])
+        self.app.add_api_route("/disagg_request_id",
+                               self.disagg_request_id, methods=["GET"])
         self.app.add_api_route("/cluster_info", self.cluster_info,
                                methods=["GET"])
         self.app.add_api_route("/health", self.health, methods=["GET"])
@@ -97,6 +99,10 @@ class CoordinatorServer:
                                        body.get("req_id"),
                                        body.get("success", True))
         return JSONResponse(content={})
+
+    async def disagg_request_id(self) -> Response:
+        return JSONResponse(content={"disagg_request_id":
+                                      await self._coordinator.get_disagg_request_id()})
 
     async def cluster_info(self) -> Response:
         return JSONResponse(content=await self._coordinator.cluster_info())

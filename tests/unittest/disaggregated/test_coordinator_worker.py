@@ -243,5 +243,37 @@ def test_conversation_coordinator_sticky_by_conv_id():
                 f"conv-A must be sticky, got first={first} repeats={repeats}"
 
 
+def test_coordinator_owns_generation_disagg_request_id():
+    """Generation routing receives its request ID from the coordinator."""
+    from tensorrt_llm.serve.router import CoordinatorDelegatingRouter
+
+    with _FakeWorker() as ctx0, _FakeWorker() as gen0:
+        config = _make_config([ctx0.url], [gen0.url], "round_robin",
+                              "conversation")
+        with _CoordinatorThread(config) as coord:
+            assert asyncio.run(_wait_coord_ready(coord.url))
+
+            async def drive():
+                remote = CoordinatorClient(coord.url, config)
+                assert isinstance(remote.gen_router,
+                                  CoordinatorDelegatingRouter)
+                request = CompletionRequest(
+                    model="m",
+                    prompt="hello",
+                    disaggregated_params=DisaggregatedParams(
+                        request_type="generation_only",
+                        ctx_request_id=123,
+                        disagg_request_id=None,
+                        conversation_id="conv-A"))
+                await remote.gen_router.get_next_server(request)
+                assigned_id = request.disaggregated_params.disagg_request_id
+                await remote.gen_router.finish_request(request)
+                await remote.stop()
+                return assigned_id
+
+            assigned_id = asyncio.run(drive())
+            assert assigned_id is not None and assigned_id != 123
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v", "-s"]))
