@@ -20,6 +20,11 @@ from collections import OrderedDict
 from typing import Awaitable, Callable, Dict, Iterable, List, Optional, Union
 
 import aiohttp
+import orjson
+
+# Content-Type for orjson-serialized bodies sent to the coordinator (we pass
+# data=bytes, so aiohttp doesn't set the json content type itself).
+_JSON_HEADERS = {"Content-Type": "application/json"}
 
 from tensorrt_llm.llmapi.disagg_utils import (MetadataServerConfig,
                                               RouterConfig, ServerRole)
@@ -1664,15 +1669,19 @@ class CoordinatorDelegatingRouter(Router):
         payload = {"role": self._role, "routing_key": key,
                    "req_id": self._request_id(request),
                    "exclude_server": exclude_server}
+        # orjson.dumps (bytes) instead of aiohttp json= (stdlib dumps): the
+        # routing_key is hundreds of int64, and this is the hot fleet->coordinator
+        # call. Parse the response with orjson too.
         _t0 = time.monotonic()
         async with self.session.post(
-                f"{self._coordinator_url}/select", json=payload,
+                f"{self._coordinator_url}/select", data=orjson.dumps(payload),
+                headers=_JSON_HEADERS,
                 timeout=self._request_timeout_s) as resp:
             if resp.status != 200:
                 raise ValueError(
                     f"coordinator /select returned {resp.status}: "
                     f"{await resp.text()}")
-            body = await resp.json()
+            body = orjson.loads(await resp.read())
         self._select_lat.record(time.monotonic() - _t0)
         info = body.get("info") or {}
         return body["server"], info
@@ -1686,9 +1695,10 @@ class CoordinatorDelegatingRouter(Router):
         try:
             async with self.session.post(
                     f"{self._coordinator_url}/finish",
-                    json={"role": self._role,
-                          "req_id": self._request_id(request),
-                          "success": success},
+                    data=orjson.dumps({"role": self._role,
+                                       "req_id": self._request_id(request),
+                                       "success": success}),
+                    headers=_JSON_HEADERS,
                     timeout=self._request_timeout_s) as resp:
                 if resp.status != 200:
                     logger.warning(

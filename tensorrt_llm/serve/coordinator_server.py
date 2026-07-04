@@ -35,13 +35,22 @@ import asyncio
 from contextlib import asynccontextmanager
 from typing import Optional
 
+import orjson
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import ORJSONResponse, Response
 
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinatorService
 from tensorrt_llm.version import __version__ as VERSION
+
+# The coordinator is a single event loop serving /select,/finish for the whole
+# fleet; each /select body carries a routing_key (a flat list of block hashes,
+# hundreds of int64 for long prompts). stdlib json parse+serialize on that hot
+# path keeps the loop busy and lengthens the queue (client-observed /select was
+# ~hundreds of ms while the handler itself is ~0.1ms). orjson is 2-5x faster at
+# both ends, freeing the loop sooner. JSONResponse -> ORJSONResponse and
+# request bodies parsed with orjson.loads (bytes, no text decode).
 
 TIMEOUT_KEEP_ALIVE = 10  # seconds
 
@@ -70,12 +79,12 @@ class CoordinatorServer:
 
     async def select(self, raw_req: Request) -> Response:
         try:
-            body = await raw_req.json()
+            body = orjson.loads(await raw_req.body())
         except Exception as e:
-            return JSONResponse(status_code=400,
+            return ORJSONResponse(status_code=400,
                                 content={"error": f"invalid JSON body: {e}"})
         if not isinstance(body, dict) or "role" not in body:
-            return JSONResponse(
+            return ORJSONResponse(
                 status_code=400,
                 content={"error": "body must include 'role' and 'routing_key'"})
         try:
@@ -83,37 +92,37 @@ class CoordinatorServer:
                 body["role"], body.get("routing_key"), body.get("req_id"),
                 body.get("exclude_server"))
         except ValueError as e:
-            return JSONResponse(status_code=503, content={"error": str(e)})
+            return ORJSONResponse(status_code=503, content={"error": str(e)})
         except Exception as e:  # noqa: BLE001
             logger.error(f"CoordinatorServer.select failed: {e}")
-            return JSONResponse(status_code=500, content={"error": str(e)})
-        return JSONResponse(content={"server": server, "info": info,
+            return ORJSONResponse(status_code=500, content={"error": str(e)})
+        return ORJSONResponse(content={"server": server, "info": info,
                                      "req_id": req_id})
 
     async def finish(self, raw_req: Request) -> Response:
         try:
-            body = await raw_req.json()
+            body = orjson.loads(await raw_req.body())
         except Exception as e:
-            return JSONResponse(status_code=400,
+            return ORJSONResponse(status_code=400,
                                 content={"error": f"invalid JSON body: {e}"})
         await self._coordinator.finish(body.get("role", "gen"),
                                        body.get("req_id"),
                                        body.get("success", True))
-        return JSONResponse(content={})
+        return ORJSONResponse(content={})
 
     async def disagg_request_id(self) -> Response:
-        return JSONResponse(content={"disagg_request_id":
+        return ORJSONResponse(content={"disagg_request_id":
                                       await self._coordinator.get_disagg_request_id()})
 
     async def cluster_info(self) -> Response:
-        return JSONResponse(content=await self._coordinator.cluster_info())
+        return ORJSONResponse(content=await self._coordinator.cluster_info())
 
     async def health(self) -> Response:
         return Response(status_code=200 if await self._coordinator.is_ready()
                         else 503)
 
     async def version(self) -> Response:
-        return JSONResponse(content={"version": VERSION})
+        return ORJSONResponse(content={"version": VERSION})
 
     async def __call__(self, host: str, port: int,
                        uds: Optional[str] = None) -> None:
