@@ -64,12 +64,9 @@ class RawRequestResponseHooks(ResponseHooks):
         self.gen_server = ""
         self.request_arrival_time = raw_req.state.server_arrival_time
         self.server_first_token_time = 0
-        # Orchestrator-side TTFT timeline (all get_steady_clock_now_in_seconds):
-        #   arrival -> ctx_dispatch : pre-ctx wait in this fleet worker (accept
-        #                             queue + event loop + pipeline before routing)
-        #   ctx_dispatch -> ctx_resp: ctx routing + ctx HTTP round-trip (prefill)
-        #   ctx_resp -> first_token : KV transfer + gen routing + gen first token
-        # 0 until the corresponding hook fires.
+        # Orchestrator-side TTFT timeline stamps: arrival -> ctx_dispatch (pre-ctx
+        # wait) -> ctx_resp (ctx routing + prefill) -> first_token (KV transfer +
+        # gen). 0 until the corresponding hook fires.
         self.ctx_dispatch_time = 0
         self.ctx_resp_time = 0
         self.perf_metrics_collector = perf_metrics_collector
@@ -89,10 +86,9 @@ class RawRequestResponseHooks(ResponseHooks):
         self.server_first_token_time = get_steady_clock_now_in_seconds()
 
     def on_resp_done(self, gen_server: str, request: UCompletionRequest, response: UCompletionResponse = None):
-        # Feed the orchestrator-side TTFT breakdown into a periodic aggregator
-        # (NOT one log line per request -- per-request logging on the single
-        # disagg event loop inflated TTFT ~3s, an observer effect). The aggregator
-        # logs p50/p95 of each stage every N requests.
+        # Feed the TTFT breakdown to a periodic aggregator (p50/p95 every N reqs),
+        # not one log line per request -- per-request logging on the disagg event
+        # loop inflated TTFT ~3s (observer effect).
         arr = self.request_arrival_time
         disp = self.ctx_dispatch_time
         cresp = self.ctx_resp_time
@@ -129,11 +125,9 @@ class OpenAIDisaggServer:
 
         self._perf_metrics_collector = DisaggPerfMetricsCollector(config.perf_metrics_max_requests)
 
-        # The server does NOT build routers. Router ownership is decided (and the
-        # routers built) by the coordinator object: DisaggCoordinatorService is
-        # the owner (builds core + ingest); CoordinatorClient is the delegating
-        # client (builds coreless surfaces). The server just holds whichever one
-        # matches its deployment and reads .ctx_router / .gen_router off it.
+        # The server doesn't build routers -- the coordinator object does:
+        # DisaggCoordinatorService (owner) or CoordinatorClient (delegating). The
+        # server just reads .ctx_router / .gen_router off whichever it holds.
         if self._coordinator_url:
             self._coordinator = CoordinatorClient(
                 self._coordinator_url, self._config, metadata_server_cfg,
@@ -175,11 +169,9 @@ class OpenAIDisaggServer:
 
         self.app.add_middleware(ServerArrivalTimeMiddleware)
 
-        # Log request-body validation failures (Pydantic/FastAPI) so a schema
-        # mismatch between the client and the server request models shows up in
-        # the SERVER log, not only in the client. Throttled: the first failure is
-        # logged in full, then one line per 1000 to avoid flooding the disagg
-        # event loop when every request fails the same way (observer effect).
+        # Log request-body validation failures so a client/server schema mismatch
+        # shows up server-side. Throttled (first, then every 1000th) to avoid
+        # flooding the event loop when every request fails identically.
         self._val_err_n = 0
         @self.app.exception_handler(RequestValidationError)
         async def validation_exception_handler(request: Request, exc):
@@ -239,15 +231,10 @@ class OpenAIDisaggServer:
         resolve_request_conversation_id(req, raw_req.headers)
 
     def _wrap_entry_point(self, entry_point: Callable, request_type: type = UCompletionRequest) -> Callable:
-        # Bind the CONCRETE request model per route (CompletionRequest for
-        # /v1/completions, ChatCompletionRequest for /v1/chat/completions). Typing
-        # the FastAPI body param as the bare Union UCompletionRequest =
-        # Union[CompletionRequest, ChatCompletionRequest] (no discriminator) makes
-        # Pydantic try CompletionRequest first and 400 a chat body with
-        # "('body','CompletionRequest','prompt') Field required" -- every chat
-        # request fails. openai_server.py types its handlers concretely for the
-        # same reason; mirror that by overriding the wrapper's annotation so
-        # FastAPI validates against request_type.
+        # Bind the concrete request model per route so FastAPI validates against it.
+        # The bare Union UCompletionRequest (no discriminator) makes Pydantic try
+        # CompletionRequest first and 400 every chat body, so override the wrapper's
+        # annotation with request_type (as openai_server.py does).
         async def wrapper(req: request_type, raw_req: Request) -> Response:
             try:
                 self._perf_metrics_collector.total_requests.inc()

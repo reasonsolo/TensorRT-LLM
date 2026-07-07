@@ -45,13 +45,9 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinatorService
 from tensorrt_llm.version import __version__ as VERSION
 
-# Timing headers to measure the coordinator client/server IPC latency. The fleet
-# worker and the implicit coordinator are co-located on one node, so wall-clock
-# time.time() is directly comparable (no cross-node skew). The client stamps
-# X-Client-Send-Time; the coordinator stamps X-Coord-Recv-Time on ingress and
-# X-Coord-Send-Time just before responding. From these the client derives, per
-# call: req_wire (send->coord recv), handler (coord recv->coord send), resp_wire
-# (coord send->client recv) -- isolating transport overhead vs handler work.
+# Timing headers to decompose the coordinator IPC round-trip (co-located, so
+# wall-clock time.time() is comparable): client stamps send time, coordinator
+# stamps recv/send, from which the client derives req_wire/handler/resp_wire.
 HDR_CLIENT_SEND = "x-client-send-time"
 HDR_COORD_RECV = "x-coord-recv-time"
 HDR_COORD_SEND = "x-coord-send-time"
@@ -79,8 +75,6 @@ class CoordinatorServer:
         self.app = FastAPI(lifespan=lifespan)
         self.app.add_api_route("/select", self.select, methods=["POST"])
         self.app.add_api_route("/finish", self.finish, methods=["POST"])
-        self.app.add_api_route("/disagg_request_id",
-                               self.disagg_request_id, methods=["GET"])
         self.app.add_api_route("/cluster_info", self.cluster_info,
                                methods=["GET"])
         self.app.add_api_route("/health", self.health, methods=["GET"])
@@ -133,10 +127,6 @@ class CoordinatorServer:
         return JSONResponse(content={},
                             headers=self._timing_headers(raw_req, _recv))
 
-    async def disagg_request_id(self) -> Response:
-        return JSONResponse(content={"disagg_request_id":
-                                      await self._coordinator.get_disagg_request_id()})
-
     async def cluster_info(self) -> Response:
         return JSONResponse(content=await self._coordinator.cluster_info())
 
@@ -149,22 +139,15 @@ class CoordinatorServer:
 
     async def __call__(self, host: str, port: int,
                        uds: Optional[str] = None) -> None:
-        # Single-process by design: owns routing state + the centralized ZMQ
-        # ingest bind. workers=1 forced so a leaked WEB_CONCURRENCY can't fork it.
-        # When ``uds`` is given, also bind a Unix domain socket: the fleet is
-        # co-located with the implicit coordinator, and UDS avoids the TCP
-        # loopback stack (connection/backlog/parse overhead that dominated the
-        # per-request /select,/finish latency vs the ~0.1ms handler). The TCP
-        # port stays bound too (health checks, external/cross-node clients).
+        # Single-process (owns routing state + the centralized ZMQ ingest bind);
+        # workers=1 forced so a leaked WEB_CONCURRENCY can't fork it. When ``uds``
+        # is set the co-located fleet uses it for the hot /select,/finish path
+        # (avoids the TCP loopback overhead that dominated per-request latency).
         kwargs = dict(workers=1, log_level="info",
                       timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
         if uds:
-            # Bind UDS for the fleet; keep the TCP port for health/external use
-            # by serving both on one Server via a shared socket list is not
-            # supported by uvicorn.Config, so prefer UDS when set (the fleet is
-            # the only hot client; health probes use the same UDS-less URL only
-            # pre-startup). uvicorn binds uds XOR host:port per Config, so run
-            # two Servers concurrently: one UDS (hot path), one TCP (health).
+            # uvicorn.Config binds uds XOR host:port, so run two Servers: UDS for
+            # the fleet (hot path) and TCP for health/external clients.
             import asyncio as _asyncio
             uds_cfg = uvicorn.Config(self.app, uds=uds, **kwargs)
             tcp_cfg = uvicorn.Config(self.app, host=host, port=port, **kwargs)

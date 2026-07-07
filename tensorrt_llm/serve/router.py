@@ -357,10 +357,8 @@ class Router(ABC):
         self._health_check_timeout = metadata_server_cfg.health_check_timeout if metadata_server_cfg else None
         self._server_preparation_func = server_preparation_func
         self._prepared_ready_servers: set[str] = set()
-        # Routing-latency diagnostics (gated by TLLM_LOG_ROUTE_TIMING=1). Records
-        # wall time spent in get_next_server per request and logs percentiles
-        # periodically. Lets us compare the per-request routing cost across
-        # router types.
+        # Routing-latency diagnostics (gated by TLLM_LOG_ROUTE_TIMING=1): record
+        # get_next_server wall time per request and log percentiles periodically.
         import os
         self._log_route_timing = (
             os.environ.get("TLLM_LOG_ROUTE_TIMING", "0") == "1")
@@ -1016,11 +1014,9 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                 affinity.popitem(last=False)
         hash_algo, block_hashes = _hashes(server)
 
-        # Register load + remember routed blocks in the SAME maps the standalone
-        # path uses; only the KEY differs. Standalone keys by id(request); the
-        # coordinator path keys by the disagg request id (req_id) -- the sole id
-        # that crosses the HTTP hop on /finish. No invented token, no fallback,
-        # no parallel map.
+        # Same load/routing maps as the standalone path; only the key differs:
+        # id(request) standalone, disagg req_id under the coordinator (the id that
+        # crosses the /finish HTTP hop).
         key = id(request) if req_id is None else req_id
         async with self._lock:
             await self._server_state[server].increment_load(request)
@@ -1068,10 +1064,9 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             self._server_state[server].schedule_poll_and_update(session)
 
     # ---- coordinator delegation: thin wrappers over the shared _route core ---
-    # Under the disagg coordinator (WEB_CONCURRENCY>1) the fleet worker computes
-    # routing_key() locally and the coordinator (which owns _server_state via
-    # /kv_cache_events polling) runs get_next_server_by_key(). Both go through the
-    # exact same _route core as the standalone get_next_server -- no divergence.
+    # The fleet worker computes routing_key() locally; the coordinator (owns
+    # _server_state) runs get_next_server_by_key(). Both use the same _route core
+    # as the standalone get_next_server.
 
     def routing_key(self, request: OpenAIRequest):
         """Worker-side: tokenize + block-hash. Same dict _route consumes, JSON-
@@ -1698,16 +1693,13 @@ class CoordinatorDelegatingRouter(Router):
             self,
             request: OpenAIRequest,
             exclude_server: Optional[str] = None) -> tuple[str, dict]:
-        # routing_key() tokenizes + block-hashes the (up to 38k-token) prompt for
-        # kv_cache_aware -- CPU-bound. Run it in a thread so it doesn't block the
-        # fleet worker event loop (which drives ~700 concurrent streams); blocking
-        # inline was a chunk of the ctxroute pre_ctx cost. (conversation router's
-        # routing_key is trivial; to_thread overhead is negligible there.)
+        # routing_key() tokenizes + block-hashes the prompt (CPU-bound for
+        # kv_cache_aware); run it in a thread so it doesn't block the fleet worker
+        # event loop driving the concurrent streams.
         key = await asyncio.to_thread(self._local.routing_key, request)
-        # Send the request's existing disagg id as the sole cross-process key; the
-        # coordinator keys its pending-request state by it for /finish. Placement
-        # (server selection) must NOT change the id -- the ctx<->gen KV transfer is
-        # keyed by it and was registered ctx-side before this call.
+        # Send the request's existing disagg id as the cross-process key (the
+        # coordinator keys pending state by it for /finish); placement must not
+        # change it, since the ctx<->gen KV transfer is keyed by it.
         payload = {"role": self._role, "routing_key": key,
                    "req_id": self._request_id(request),
                    "exclude_server": exclude_server}
@@ -1737,13 +1729,10 @@ class CoordinatorDelegatingRouter(Router):
                              request: OpenAIRequest,
                              session: Optional[aiohttp.ClientSession] = None,
                              success: bool = True):
-        # FIRE-AND-FORGET: /finish only releases the coordinator's routed-load
-        # bookkeeping -- the caller doesn't need its result and nothing downstream
-        # waits on it. Awaiting the HTTP round trip inline put ~130-200ms
-        # (resp_wire, i.e. busy-loop scheduling) on the tail of EVERY request's
-        # critical path. Launch it as a background task and return immediately.
-        # Capture req_id now (before returning) since the request object may be
-        # mutated/freed after. Errors are logged, never propagated.
+        # Fire-and-forget: /finish only releases the coordinator's routed-load
+        # bookkeeping, so run it as a background task instead of awaiting the HTTP
+        # round trip on every request's critical path. Capture req_id first (the
+        # request may be freed after return); errors are logged, not propagated.
         del session
         req_id = self._request_id(request)
         asyncio.create_task(self._finish_async(req_id, success))

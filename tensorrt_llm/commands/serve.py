@@ -1247,14 +1247,10 @@ def disaggregated(
     if os.getenv("TRTLLM_DISAGG_SERVER_DISABLE_GC", "1") == "1":
         gc.disable()
 
-    # Startup topology is driven by explicit config (num_workers +
-    # disagg_coordinator_url), NOT the WEB_CONCURRENCY env var. Three cases:
-    #   (a) disagg_coordinator_url set  -> don't start a coordinator here; the
-    #       fleet delegates to that external one (num_workers sizes the fleet).
-    #   (b) url absent, num_workers>1   -> start an implicit in-process
-    #       coordinator (port-1) + a delegating uvicorn fleet on the public port.
-    #   (c) url absent, num_workers==1  -> one self-contained server with a local
-    #       (in-process) coordinator.
+    # Topology from explicit config (num_workers + disagg_coordinator_url):
+    # (a) url set -> delegate to that external coordinator; (b) url absent,
+    # num_workers>1 -> implicit in-process coordinator + delegating fleet;
+    # (c) url absent, num_workers==1 -> single self-contained server.
     num_workers = disagg_cfg.num_workers
     coordinator_url = disagg_cfg.disagg_coordinator_url
 
@@ -1298,21 +1294,12 @@ def disaggregated(
 def _launch_disagg_fleet(disagg_cfg, config_file, metadata_server_config_file,
                          request_timeout, server_start_timeout, num_workers,
                          coordinator_url):
-    """Launch a fleet of ``num_workers`` delegating disagg servers on the shared
-    public port, each pointed at ``coordinator_url``.
-
-    Each worker is its OWN ``Popen`` (running ``_run_fleet_worker``), not a child
-    forked by ``uvicorn --workers N``. Two reasons:
-      1. Explicit per-worker env: each worker gets ``TLLM_DISAGG_WORKER_PROCESS_ID
-         = i`` directly, so the snowflake disagg-id's process_id field is unique
-         without any shared-filesystem counter file.
-      2. SO_REUSEPORT load balancing: each worker binds its own socket to the same
-         (host, port) with SO_REUSEPORT (see ``_run_fleet_worker``); the kernel
-         spreads connections across workers by 4-tuple hash, rather than the
-         unfair single-shared-socket accept() of ``uvicorn --workers N`` that
-         (with keep-alive clients) pinned most load onto a few workers.
-    MPI/PMIX/SLURM env is stripped so a worker (a plain HTTP process) never joins
-    an MPI namespace. Returns the list of Popen handles.
+    """Launch ``num_workers`` delegating disagg servers (each its own ``Popen``
+    running ``_run_fleet_worker``) on the shared public port, pointed at
+    ``coordinator_url``. Separate Popens (not ``uvicorn --workers N``) so each gets
+    an explicit per-worker TLLM_DISAGG_WORKER_PROCESS_ID and binds its own
+    SO_REUSEPORT socket for kernel-balanced connections. MPI/PMIX/SLURM env is
+    stripped (workers are plain HTTP processes). Returns the list of Popen handles.
     """
     from tensorrt_llm.llmapi.disagg_utils import disagg_process_id_space
     public_host, public_port = disagg_cfg.hostname, disagg_cfg.port
@@ -1516,17 +1503,11 @@ def create_disagg_server_app():
 
 
 def _run_fleet_worker():
-    """Entry point for a single fleet worker process (one OS process per worker).
-
-    Launched as its own ``Popen`` by ``_launch_disagg_fleet`` (rather than forked
-    by ``uvicorn --workers N``) so it can:
-      (a) receive an explicit ``TLLM_DISAGG_WORKER_PROCESS_ID`` in its env -- no
-          shared-filesystem counter file needed for the snowflake disagg-id; and
-      (b) bind its OWN listening socket to the shared public port with
-          ``SO_REUSEPORT``. The kernel then load-balances incoming connections
-          across all workers by 4-tuple hash, replacing the unfair single-shared-
-          socket ``accept()`` lottery of ``uvicorn --workers N`` (which, with
-          keep-alive clients, pinned most traffic onto a few workers)."""
+    """Entry point for a single fleet worker (one OS process per worker), launched
+    as its own ``Popen`` so it takes an explicit TLLM_DISAGG_WORKER_PROCESS_ID and
+    binds its own SO_REUSEPORT socket to the shared public port (the kernel then
+    4-tuple-hashes connections across workers instead of the unfair shared-socket
+    accept() of ``uvicorn --workers N``)."""
     _init_fleet_worker_process()
     server = _build_disagg_server_from_env()
     host, port = server._config.hostname, server._config.port
@@ -1653,16 +1634,14 @@ class DisaggWorkerEnvs(StrEnum):
     # Parent's logger level; the forked uvicorn fleet is a fresh process that
     # otherwise defaults to WARNING and drops the workers' INFO logs.
     TLLM_DISAGG_LOG_LEVEL = "TRTLLM_DISAGG_LOG_LEVEL"
-    # Coordinator transport knobs (read in _serve_coordinator_and_fleet):
-    #   PORT: override the coordinator's TCP port (default public_port-1).
-    #   UDS:  "1" (default) routes the co-located fleet's hot /select,/finish over
-    #         a Unix domain socket instead of TCP loopback; "0" to force TCP.
+    # Coordinator transport (read in _serve_coordinator_and_fleet): PORT overrides
+    # the coordinator TCP port (default public_port-1); UDS="1" (default) routes the
+    # co-located fleet's hot /select,/finish over a Unix domain socket, "0" for TCP.
     TLLM_DISAGG_COORDINATOR_PORT = "TRTLLM_DISAGG_COORDINATOR_PORT"
     TLLM_DISAGG_COORDINATOR_UDS = "TRTLLM_DISAGG_COORDINATOR_UDS"
-    # Per-fleet-worker process index (0..N-1) folded into the process_id field of
-    # the snowflake disagg request id so co-located workers never collide. The
-    # launcher sets one distinct value per worker Popen (see _launch_disagg_fleet /
-    # worker_local_process_id). Defaults to 0 if unset (single-process path).
+    # Per-fleet-worker process index (0..N-1) → the snowflake disagg-id process_id
+    # field so co-located workers never collide; the launcher sets one distinct
+    # value per worker Popen (see worker_local_process_id). Defaults to 0 if unset.
     TLLM_DISAGG_WORKER_PROCESS_ID = "TRTLLM_DISAGG_WORKER_PROCESS_ID"
 
 

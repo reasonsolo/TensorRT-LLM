@@ -99,11 +99,9 @@ class DisaggServerConfig():
     # >1 means a fleet of delegating servers behind one coordinator. Replaces the
     # WEB_CONCURRENCY env var (explicit config over implicit env).
     num_workers: int = 1
-    # URL of an already-running coordinator (e.g. "http://host:8332"). When set,
-    # this process does NOT start a coordinator -- the fleet delegates to this
-    # external one. When absent and num_workers>1, an implicit coordinator is
-    # started in-process. When absent and num_workers==1, a single self-contained
-    # server with a local (in-process) coordinator is run.
+    # URL of an already-running coordinator (e.g. "http://host:8332"). When set the
+    # fleet delegates to it; when absent, num_workers>1 starts an implicit in-process
+    # coordinator and num_workers==1 runs a single self-contained server.
     disagg_coordinator_url: Optional[str] = None
 
 
@@ -384,24 +382,19 @@ def parse_metadata_server_config_file(
         return MetadataServerConfig(**config)
 
 
-# Snowflake global disagg request id bit layout (64-bit, MSB reserved 0 so the
-# value is a positive int64):
-#   bit 63       : 0 (sign / reserved)
-#   bits 62..24  : timestamp_ms       (39 bits)
-#   bits 23..16  : node_id            (8 bits)  -- which node
-#   bits 15..10  : process_id         (6 bits)  -- which fleet worker on that node
-#   bits  9..0   : counter            (10 bits)
-# node_id + process_id together uniquely identify a fleet worker process, so two
-# co-located uvicorn workers never emit the same id in the same millisecond.
+# Snowflake global disagg request id, 64-bit / positive int64 (MSB reserved 0):
+#   [ 0 (1) | timestamp_ms (39) | node_id (8) | process_id (6) | counter (10) ]
+# The (node_id, process_id) pair identifies a fleet worker process, so co-located
+# workers never emit the same id in the same millisecond. See docs/source/
+# advanced/disaggregated-service.md for the full disagg-request-id design.
 DISAGG_TIMESTAMP_BITS = 39
 DISAGG_NODE_ID_BITS = 8
 DISAGG_PROCESS_ID_BITS = 6
 DISAGG_COUNTER_BITS = 10
 
-# Local ids (single-engine, sequential from max_batch_size) live in
-# [0, MIN_GLOBAL_ID); global disagg ids live in [MIN_GLOBAL_ID, 2^63) -- the two
-# ranges are disjoint by construction so a locally-issued id never collides with
-# a disagg id. Must be a power of two (get_local_request_id masks with it).
+# Local ids [0, MIN_GLOBAL_ID) and global disagg ids [MIN_GLOBAL_ID, 2^63) are
+# disjoint by construction so they never collide. Power of two (masked in
+# get_local_request_id).
 MIN_GLOBAL_ID = 1 << 40
 
 # Consider GIL being removed in the future, use a lock to protect the counter

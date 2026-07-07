@@ -75,11 +75,9 @@ class OpenAIDisaggregatedService(OpenAIService):
         perf_metrics_collector: Optional[DisaggPerfMetricsCollector] = None,
     ):
         self._config = config
-        # The coordinator owns readiness, cluster info, and worker events. The
-        # service takes its ctx/gen routers and drives get_next_server /
-        # finish_request uniformly -- so serving is identical whether the router
-        # is the real one (single-process) or a CoordinatorDelegatingRouter that
-        # forwards placement to a remote coordinator (worker).
+        # The service drives the coordinator's ctx/gen routers uniformly, so serving
+        # is identical whether the router is the real one (single-process) or a
+        # delegating one that forwards placement to a remote coordinator (worker).
         self._coordinator = coordinator
         self._ctx_router = coordinator.ctx_router
         self._gen_router = coordinator.gen_router
@@ -375,10 +373,9 @@ class OpenAIDisaggregatedService(OpenAIService):
                 else:
                     request.prompt_token_ids = ctx_response.prompt_token_ids
                 # Opt-in: drop conversation history so the gen worker doesn't
-                # re-parse the full conversation JSON (dominates its GIL at high
-                # concurrency). It uses prompt_token_ids and only reads the last
-                # message; tools are preserved. Config-gated because it's unsafe
-                # for harmony/multimodal workers (model type is fixed per deploy).
+                # re-parse the full conversation JSON (a GIL cost at high
+                # concurrency); it uses prompt_token_ids and only the last message,
+                # tools preserved. Config-gated (unsafe for harmony/multimodal).
                 if (
                     self._strip_gen_message_history
                     and request.messages
@@ -457,10 +454,8 @@ class OpenAIDisaggregatedService(OpenAIService):
         return self._config.conditional_disagg_config
 
     async def setup(self) -> None:
-        # Build the request-sending clients from the coordinator's routers
-        # (worker-mode: get_next_server / finish_request on those routers proxy
-        # the coordinator). Share them with the coordinator service so it can run
-        # readiness checks against the same pool (no-op on CoordinatorClient).
+        # Build the request-sending clients from the coordinator's routers and share
+        # them with the coordinator service so its readiness checks use the same pool.
         self._ctx_client = self._client_factory(
             self._ctx_router, ServerRole.CONTEXT, self._config.max_retries
         )
@@ -531,15 +526,10 @@ class OpenAIDisaggregatedService(OpenAIService):
         )
 
         if request.stream and need_ctx:
-            # For streaming gen_first requests, the gen client returns a lazy
-            # async generator whose HTTP POST only fires when iterated. The ctx
-            # server blocks waiting for the gen server's rx session (gen_first
-            # protocol). Using asyncio.gather would deadlock: ctx waits for gen
-            # server, but gen POST is deferred until the generator is consumed,
-            # and the generator isn't consumed until gather returns.
-            #
-            # Fix: eagerly start consuming the gen generator in a background
-            # task so the HTTP POST fires, then pipe chunks through a queue.
+            # Streaming gen_first: the gen POST is deferred until its generator is
+            # iterated, but the ctx server blocks on the gen rx session, so gather
+            # would deadlock. Eagerly consume the gen generator in a background task
+            # (firing the POST) and pipe chunks through a queue.
             gen_response = await self._gen_client.send_request(
                 gen_req, server=gen_server, hooks=hooks
             )

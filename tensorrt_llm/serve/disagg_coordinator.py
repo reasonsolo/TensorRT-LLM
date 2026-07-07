@@ -120,13 +120,10 @@ class DisaggCoordinatorService(DisaggCoordinator):
         self._config = config
         self._client_factory = client_factory
         self._metadata_config = metadata_config
-        # The coordinator OWNS routing state, so it builds the owner routers here
-        # (is_delegating_client=False): a centralized deployment gets ONE shared
-        # namespace-aware core and starts its single ZMQ ingest server exactly
-        # once. This is the sole place owner routers are created -- the fleet
-        # worker holds no owner router, only a CoordinatorClient's delegating
-        # surfaces. server_preparation_func (e.g. steady-clock sync) is wired into
-        # the routers at build time.
+        # The coordinator owns routing state, so it builds the owner routers here
+        # (is_delegating_client=False): one shared namespace-aware core + a single
+        # ZMQ ingest server. Sole place owner routers are created (fleet workers
+        # hold only a CoordinatorClient's delegating surfaces).
         self._metadata_server = create_metadata_server(metadata_config)
         ctx_servers, gen_servers = get_ctx_gen_server_addrs(
             config.server_configs)
@@ -248,10 +245,8 @@ class DisaggCoordinatorService(DisaggCoordinator):
 
     async def cluster_info(self) -> Dict[str, Any]:
         info = {"is_ready": await self.is_ready()}
-        # Expose the block-hash granularity so a delegating client hashes with
-        # the SAME tokens_per_block as the workers (the owner adopts it from
-        # /server_info). Clients don't monitor servers, so they can't learn it
-        # otherwise.
+        # Expose block-hash granularity so a delegating client (which doesn't
+        # monitor servers) hashes with the same tokens_per_block as the workers.
         tpb = getattr(self._ctx_router, "_tokens_per_block", None)
         if tpb is not None:
             info["tokens_per_block"] = tpb
@@ -374,16 +369,13 @@ class CoordinatorClient(DisaggCoordinator):
         self._request_timeout_s = request_timeout_s
         self._startup_timeout_s = startup_timeout_s
         self._session: Optional[aiohttp.ClientSession] = None
-        # LOCAL disagg-id generation (no per-request HTTP hop to the coordinator's
-        # /disagg_request_id). node_id identifies the node; process_id (claimed
-        # per fleet worker at startup, exported to TLLM_DISAGG_WORKER_PROCESS_ID)
-        # makes the snowflake unique across the co-located uvicorn workers.
+        # Local disagg-id generation (no HTTP hop): (node_id, per-worker process_id)
+        # keeps the snowflake unique across co-located workers.
         self._node_id = config.node_id
         self._process_id = worker_local_process_id()
-        # A delegating client builds coreless surfaces (is_delegating_client=True):
-        # they compute the routing key locally (routing_key()) but never bind an
-        # ingest port or own a core -- placement is delegated to the coordinator.
-        # This is the sole place delegating routers are created.
+        # A delegating client builds coreless router surfaces (compute routing_key
+        # locally, delegate placement to the coordinator; no ingest port / core).
+        # Sole place delegating routers are created.
         ctx_servers, gen_servers = get_ctx_gen_server_addrs(
             config.server_configs)
         ctx_router, gen_router = build_disagg_routers(
@@ -418,15 +410,11 @@ class CoordinatorClient(DisaggCoordinator):
         return self._session
 
     async def start(self) -> None:
-        # Fail fast: a delegating server is useless without its coordinator. Probe
-        # /cluster_info with bounded retry; if it never becomes reachable within
-        # startup_timeout_s, raise so the server exits non-zero instead of coming
-        # up and 500-ing every request against a missing coordinator.
+        # Fail fast: probe /cluster_info with bounded retry so a delegating server
+        # exits non-zero if its coordinator never comes up (vs 500-ing every req).
         info = await self._await_coordinator()
-        # A delegating client doesn't monitor servers, so it can't learn the
-        # workers' tokens_per_block from /server_info. Fetch it from the
-        # coordinator (above) and apply it to the local routers' block-hashing so
-        # the keys the client computes line up with the coordinator/workers.
+        # Adopt the coordinator's tokens_per_block so the client's block hashes
+        # line up with the workers (a delegating client can't learn it itself).
         tpb = info.get("tokens_per_block")
         if tpb is not None:
             for router in (self._ctx_router, self._gen_router):
@@ -472,12 +460,9 @@ class CoordinatorClient(DisaggCoordinator):
             await asyncio.sleep(2.0)
 
     async def get_disagg_request_id(self) -> int:
-        # Generate LOCALLY -- the disagg id is a self-contained snowflake
-        # (timestamp|node_id|process_id|counter), NOT shared state, so a
-        # per-request HTTP round trip to the coordinator's /disagg_request_id was
-        # pure overhead on the hot path. (node_id, process_id) is unique per fleet
-        # worker so ids don't collide across the co-located workers (which would
-        # break the ctx<->gen KV-transfer key).
+        # Generate locally: the snowflake id is self-contained (not shared state),
+        # so the per-worker (node_id, process_id) avoids collisions without any HTTP
+        # hop. See disagg_utils.get_global_disagg_request_id.
         return get_global_disagg_request_id(self._node_id, self._process_id)
 
     async def is_ready(self) -> bool:

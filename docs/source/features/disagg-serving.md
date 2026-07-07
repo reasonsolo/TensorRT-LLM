@@ -94,11 +94,19 @@ The optimizations required for KV cache transmission vary depending on whether i
 
 ### Unique Global Request ID
 
-A disaggregated-serving request can provide a unique global request ID via `DisaggregatedParams.disagg_request_id`.
-When this field is a positive integer, the context and generation requests share that value as their internal request ID, which enables end-to-end tracking.
-To avoid collisions with worker-local or warm-up requests, it is recommended to use a value larger than `1 << 42 = 4398046511104`.
-If the field is unset or non-positive, the context and generation requests instead receive separate local sequence IDs, rotating within the range `(0, 1<<42)`, assigned by the respective workers. When `disagg_request_id` is specified, do not route the context and generation requests to the same worker.
-This field is optional at present; however, some forthcoming features will depend on this unique identifier.
+The context and generation phases of one request must share a single request ID: the ctx↔gen KV-cache transfer is keyed by it, so a collision (two in-flight requests with the same ID) corrupts the transfer. This shared ID is carried on `DisaggregatedParams.disagg_request_id`.
+
+The disaggregated server generates this ID itself as a **snowflake** — a self-contained 64-bit positive integer that is unique without any cross-process coordination. The bit layout is:
+
+```
+[ 0 (1 bit) | timestamp_ms (39 bits) | node_id (8 bits) | process_id (6 bits) | counter (10 bits) ]
+```
+
+- `node_id` (0–255) identifies the node (defaults to a hash of the MAC address; overridable via `node_id` in the disaggregated config).
+- `process_id` (0–63) identifies the orchestrator process on that node. In a [coordinator + worker fleet](#coordinator-and-worker-fleet) each fleet worker receives a distinct value, so co-located workers never emit the same ID in the same millisecond. It is set from the `TRTLLM_DISAGG_WORKER_PROCESS_ID` environment variable (assigned automatically per worker by the launcher).
+- The `(node_id, process_id)` pair therefore makes the ID unique across all orchestrator processes without a shared counter or an extra network round trip — each worker mints its own IDs locally.
+
+Global disaggregated IDs occupy the range `[1 << 40, 2**63)`; worker-local and warm-up request IDs occupy the disjoint range `[0, 1 << 40)`, so the two never collide. If a client supplies its own positive `disagg_request_id`, that value is used verbatim and must be globally unique; when unset, the server mints a snowflake ID as above.
 
 ## Usage
 
@@ -240,7 +248,7 @@ A single disaggregated server process is itself a single-threaded orchestrator a
 The two roles split as follows:
 
 - **Coordinator** — a single process that owns all cluster state: the ctx/gen routers, worker readiness, and (for the KV-cache-aware router) the single ZMQ event-ingest endpoint. It exposes an internal coordination API (`/select`, `/finish`, `/cluster_info`, `/health`).
-- **Fleet workers** — `num_workers` stateless disaggregated servers sharing the public port (via uvicorn `--workers`). Each holds a lightweight delegating client: it computes the routing key locally (e.g. block hashes) and delegates the placement decision to the coordinator over HTTP. Workers own no routing state, so routing stays globally consistent no matter which worker terminates a connection.
+- **Fleet workers** — `num_workers` stateless disaggregated servers that share the public port via `SO_REUSEPORT` (each worker is its own process binding the same port, so the kernel load-balances incoming connections across them by 4-tuple hash). Each holds a lightweight delegating client: it computes the routing key locally (e.g. block hashes) and delegates the placement decision to the coordinator over HTTP. Workers own no routing state, so routing stays globally consistent no matter which worker terminates a connection. Each worker also gets a distinct `process_id` for the [global request ID](#unique-global-request-id).
 
 This is controlled by two fields in the disaggregated config:
 
