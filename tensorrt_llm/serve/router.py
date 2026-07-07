@@ -75,17 +75,6 @@ class ServerState:
         self._num_active_tokens = 0
         self._use_tokens = use_tokens
         self._session_provider = session_provider
-        # NOTE: this state (load counters + block tables) is mutated and read ONLY
-        # from the single asyncio event loop (routing + the finish/poll update task
-        # both run on it). Every critical section below is await-free, so the loop
-        # cannot preempt it mid-update -- a concurrent matched_tokens scan can never
-        # observe a torn block_table. We therefore do NOT take a lock on these hot
-        # sections: `async with self._lock` is itself an await/yield point, and at
-        # high concurrency ~8 such acquires per route (2 in _route + 1 per server in
-        # matched_tokens) dominated route latency via scheduler suspend/wake churn.
-        # RESTORE the lock on any section that gains an internal await, or if this
-        # state is ever mutated from a real (free-threaded / multi-thread) parallel
-        # context rather than a single event loop.
         self._lock = asyncio.Lock()
 
     @property
@@ -97,15 +86,16 @@ class ServerState:
         # object crosses the HTTP hop); token accounting is skipped then.
         num_tokens = (get_request_num_tokens(request)
                       if self._use_tokens and request is not None else 0)
-        # await-free: atomic on the event loop (see __init__ note).
-        self._num_active_requests += 1
-        self._num_active_tokens += num_tokens
+        async with self._lock:
+            self._num_active_requests += 1
+            self._num_active_tokens += num_tokens
 
     async def decrement_load(self, request: OpenAIRequest):
         num_tokens = (get_request_num_tokens(request)
                       if self._use_tokens and request is not None else 0)
-        self._num_active_requests -= 1
-        self._num_active_tokens -= num_tokens
+        async with self._lock:
+            self._num_active_requests -= 1
+            self._num_active_tokens -= num_tokens
 
     async def is_healthy(self) -> bool:
         try:
@@ -151,10 +141,10 @@ class KvCacheAwareServerState(ServerState):
         self._block_table(hash_algo)
 
     async def get_hash_algo(self, hash_algo: Optional[str] = None) -> str:
-        # await-free: atomic on the event loop (see ServerState.__init__ note).
-        if hash_algo is not None:
-            self.set_hash_algo(hash_algo)
-        return self._kv_cache_hash_algo
+        async with self._lock:
+            if hash_algo is not None:
+                self.set_hash_algo(hash_algo)
+            return self._kv_cache_hash_algo
 
     def _resolve_hash_algo(self, hash_algo: Optional[str]) -> str:
         return self._kv_cache_hash_algo if hash_algo is None else hash_algo
@@ -211,32 +201,32 @@ class KvCacheAwareServerState(ServerState):
             hash_algo: str = KV_CACHE_HASH_ALGO_DEFAULT) -> int:
         match_count = 0
         event_match_count = 0
-        # await-free scan: atomic on the event loop (see ServerState.__init__ note),
-        # so it never observes a torn block_table even while the finish/poll task's
-        # update_with_events runs -- that update is synchronous too.
-        block_table = self._block_table(hash_algo)
-        for hash_list in block_hashes:
-            for block_hash in hash_list:
-                if block_hash in block_table:
-                    match_count += self._tokens_per_block
-                    if block_hash in self._event_only_blocks:
-                        event_match_count += self._tokens_per_block
-                else:
-                    break
-        KvCacheAwareServerState._event_match_log_counter += 1
-        if KvCacheAwareServerState._event_match_log_counter <= 20 or KvCacheAwareServerState._event_match_log_counter % 100 == 0:
-            logger.info(
-                f"EVENT_MATCH_DIAG server={self._server} "
-                f"total_match={match_count} event_match={event_match_count} "
-                f"event_blocks={len(self._event_only_blocks)} "
-                f"total_blocks={len(block_table)} "
-                f"query_hashes={[h for hl in block_hashes for h in hl][:3]}")
+        async with self._lock:
+            block_table = self._block_table(hash_algo)
+            for hash_list in block_hashes:
+                for block_hash in hash_list:
+                    if block_hash in block_table:
+                        match_count += self._tokens_per_block
+                        if block_hash in self._event_only_blocks:
+                            event_match_count += self._tokens_per_block
+                    else:
+                        break
+            KvCacheAwareServerState._event_match_log_counter += 1
+            if KvCacheAwareServerState._event_match_log_counter <= 20 or KvCacheAwareServerState._event_match_log_counter % 100 == 0:
+                logger.info(
+                    f"EVENT_MATCH_DIAG server={self._server} "
+                    f"total_match={match_count} event_match={event_match_count} "
+                    f"event_blocks={len(self._event_only_blocks)} "
+                    f"total_blocks={len(block_table)} "
+                    f"query_hashes={[h for hl in block_hashes for h in hl][:3]}"
+                )
         return match_count
 
     async def decrement_load(self, request: OpenAIRequest):
         num_tokens = get_request_num_tokens(request) if self._use_tokens else 0
-        self._num_active_requests -= 1
-        self._num_active_tokens -= num_tokens
+        async with self._lock:
+            self._num_active_requests -= 1
+            self._num_active_tokens -= num_tokens
 
     async def poll_and_update(self, session=None):
         """Poll KV cache events and update block table. Called outside the critical path."""
@@ -244,11 +234,9 @@ class KvCacheAwareServerState(ServerState):
             session = session if session is not None else self._session
             assert session is not None, "session must be provided to poll_and_update"
             events_raw = await self.poll_events(session)
-            # update_with_events is await-free, so it applies atomically on the
-            # event loop relative to a concurrent matched_tokens scan (see note in
-            # ServerState.__init__); the await above (the HTTP poll) is outside it.
-            if events_raw is not None:
-                self.update_with_events(events_raw)
+            async with self._lock:
+                if events_raw is not None:
+                    self.update_with_events(events_raw)
         except Exception as e:
             logger.warning(
                 f"Failed to poll KV cache events from {self._server}: {e}")
@@ -1013,10 +1001,10 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         # Capture the worker-side tokenize/hash timings + counts before `key` is
         # reassigned to the load-table id below.
         _rt = (key or {}).get("_rt") or {}
-        # await-free read: _server_state is rebound atomically by the sync
-        # _on_servers_updated on the same loop, so a snapshot never tears (see the
-        # note in ServerState.__init__). No lock needed on the routing hot path.
-        servers = [s for s in self._server_state.keys() if s != exclude_server]
+        async with self._lock:
+            servers = [
+                s for s in self._server_state.keys() if s != exclude_server
+            ]
         if not servers:
             raise ValueError(
                 f"No available servers after excluding {exclude_server}")
@@ -1074,11 +1062,10 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         # id(request) standalone, disagg req_id under the coordinator (the id that
         # crosses the /finish HTTP hop).
         key = id(request) if req_id is None else req_id
-        # await-free updates (increment_load / dict set / stash are all synchronous
-        # now), atomic on the loop -- no lock (see ServerState.__init__ note).
-        await self._server_state[server].increment_load(request)
-        self._req_routing_table[key] = server
-        self._stash_routed_blocks_on_route(key, block_hashes, hash_algo)
+        async with self._lock:
+            await self._server_state[server].increment_load(request)
+            self._req_routing_table[key] = server
+            self._stash_routed_blocks_on_route(key, block_hashes, hash_algo)
         self._record_route_timing(_time.monotonic() - _rt_t0)
         # Aggregated route breakdown: tokenize/hash (worker-side, from routing_key's
         # "_rt") + match (here) + the block/token/server counts the match cost
@@ -1119,11 +1106,10 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                            session=session)
 
     async def _finish(self, key, success, request=None, session=None):
-        # await-free (pop + decrement_load are synchronous now), atomic on the loop
-        # -- no lock (see ServerState.__init__ note).
-        server = self._req_routing_table.pop(key, None)
-        if server is not None and server in self._server_state:
-            await self._server_state[server].decrement_load(request)
+        async with self._lock:
+            server = self._req_routing_table.pop(key, None)
+            if server is not None and server in self._server_state:
+                await self._server_state[server].decrement_load(request)
         self._apply_routed_blocks_on_finish(key, server, success)
         self._poll_server_on_finish(server, session)
 
