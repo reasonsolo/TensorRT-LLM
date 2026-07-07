@@ -32,7 +32,6 @@ while stateless routers never touch the coordinator.
 """
 
 import asyncio
-import json
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -41,14 +40,19 @@ import aiohttp
 import pytest
 import uvicorn
 
-from tensorrt_llm.llmapi.disagg_utils import (CtxGenServerConfig,
-                                              DisaggServerConfig, RouterConfig,
-                                              ServerRole)
+from tensorrt_llm.llmapi.disagg_utils import (
+    CtxGenServerConfig,
+    DisaggServerConfig,
+    RouterConfig,
+    ServerRole,
+)
 from tensorrt_llm.serve.coordinator_server import CoordinatorServer
-from tensorrt_llm.serve.disagg_coordinator import (CoordinatorClient,
-                                                   DisaggCoordinatorService)
-from tensorrt_llm.serve.openai_protocol import (CompletionRequest,
-                                                DisaggregatedParams)
+from tensorrt_llm.serve.disagg_coordinator import CoordinatorClient, DisaggCoordinatorService
+from tensorrt_llm.serve.openai_protocol import (
+    CompletionRequest,
+    ConversationParams,
+    DisaggregatedParams,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -57,8 +61,10 @@ def _reset_prometheus_registry():
     default registry (via its readiness OpenAIHttpClients). In production the
     coordinator is a single process; here two coordinators share one pytest
     process, so clear the registry between tests to avoid duplicate-timeseries
-    registration errors."""
+    registration errors.
+    """
     from prometheus_client import REGISTRY
+
     yield
     for collector in list(REGISTRY._collector_to_names):
         try:
@@ -69,6 +75,7 @@ def _reset_prometheus_registry():
 
 def _free_port():
     import socket
+
     s = socket.socket()
     # SO_REUSEADDR so a port left in TIME_WAIT by a sibling server in the same
     # suite can be rebound immediately (closes the alloc->bind race window).
@@ -86,7 +93,6 @@ class _FakeWorker:
         self.port = _free_port()
 
         class Handler(BaseHTTPRequestHandler):
-
             def log_message(self, *a):
                 pass
 
@@ -98,8 +104,7 @@ class _FakeWorker:
                 self.end_headers()
 
         self._httpd = ThreadingHTTPServer(("127.0.0.1", self.port), Handler)
-        self._thread = threading.Thread(target=self._httpd.serve_forever,
-                                        daemon=True)
+        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
 
     @property
     def url(self):
@@ -115,22 +120,22 @@ class _FakeWorker:
 
 def _make_config(ctx_urls, gen_urls, ctx_router_type, gen_router_type):
     server_configs = [
-        CtxGenServerConfig(type="ctx", hostname=u.split(":")[0],
-                           port=int(u.split(":")[1])) for u in ctx_urls
+        CtxGenServerConfig(type="ctx", hostname=u.split(":")[0], port=int(u.split(":")[1]))
+        for u in ctx_urls
     ] + [
-        CtxGenServerConfig(type="gen", hostname=u.split(":")[0],
-                           port=int(u.split(":")[1])) for u in gen_urls
+        CtxGenServerConfig(type="gen", hostname=u.split(":")[0], port=int(u.split(":")[1]))
+        for u in gen_urls
     ]
     return DisaggServerConfig(
         server_configs=server_configs,
-        ctx_router_config=RouterConfig(type=ctx_router_type,
-                                       server_role=ServerRole.CONTEXT),
-        gen_router_config=RouterConfig(type=gen_router_type,
-                                       server_role=ServerRole.GENERATION))
+        ctx_router_config=RouterConfig(type=ctx_router_type, server_role=ServerRole.CONTEXT),
+        gen_router_config=RouterConfig(type=gen_router_type, server_role=ServerRole.GENERATION),
+    )
 
 
 def _client_factory(router, role, max_retries=1):
     from tensorrt_llm.serve.openai_client import OpenAIHttpClient
+
     return OpenAIHttpClient(router, role, 30, max_retries)
 
 
@@ -143,9 +148,13 @@ class _CoordinatorThread:
         # The coordinator builds its own owner routers from config.
         self._cluster = DisaggCoordinatorService(config, _client_factory)
         self._server = uvicorn.Server(
-            uvicorn.Config(CoordinatorServer(self._cluster).app,
-                           host="127.0.0.1", port=self.port,
-                           log_level="warning"))
+            uvicorn.Config(
+                CoordinatorServer(self._cluster).app,
+                host="127.0.0.1",
+                port=self.port,
+                log_level="warning",
+            )
+        )
         self._thread = threading.Thread(target=self._server.run, daemon=True)
 
     def __enter__(self):
@@ -177,22 +186,20 @@ async def _wait_coord_ready(url, timeout_s=30.0):
 
 def test_stateless_router_places_locally_in_worker():
     """A round-robin (stateless) router is NOT wrapped: the worker places locally
-    with the real router and never calls the coordinator."""
-    from tensorrt_llm.serve.router import (CoordinatorDelegatingRouter,
-                                           RoundRobinRouter)
+    with the real router and never calls the coordinator.
+    """
+    from tensorrt_llm.serve.router import CoordinatorDelegatingRouter, RoundRobinRouter
+
     with _FakeWorker() as ctx0, _FakeWorker() as gen0, _FakeWorker() as gen1:
-        config = _make_config([ctx0.url], [gen0.url, gen1.url],
-                              "round_robin", "round_robin")
+        config = _make_config([ctx0.url], [gen0.url, gen1.url], "round_robin", "round_robin")
         with _CoordinatorThread(config) as coord:
-            assert asyncio.run(_wait_coord_ready(coord.url)), \
-                "coordinator never became healthy"
+            assert asyncio.run(_wait_coord_ready(coord.url)), "coordinator never became healthy"
 
             async def drive():
                 remote = CoordinatorClient(coord.url, config)
                 # Stateless -> real local router, not a delegating proxy.
                 assert isinstance(remote.gen_router, RoundRobinRouter)
-                assert not isinstance(remote.gen_router,
-                                      CoordinatorDelegatingRouter)
+                assert not isinstance(remote.gen_router, CoordinatorDelegatingRouter)
                 picks = []
                 for _ in range(4):
                     req = CompletionRequest(model="m", prompt="hello")
@@ -203,76 +210,86 @@ def test_stateless_router_places_locally_in_worker():
                 return picks
 
             picks = asyncio.run(drive())
-            assert set(picks) == {gen0.url, gen1.url}, \
+            assert set(picks) == {gen0.url, gen1.url}, (
                 f"local round-robin should hit both gen workers, got {picks}"
+            )
 
 
 def test_conversation_coordinator_sticky_by_conv_id():
     """Same conversation_id sticks to one gen worker; a stateful (conversation)
-    router delegates placement to the coordinator via /select."""
+    router delegates placement to the coordinator via /select.
+    """
     from tensorrt_llm.serve.router import CoordinatorDelegatingRouter
+
     with _FakeWorker() as ctx0, _FakeWorker() as gen0, _FakeWorker() as gen1:
-        config = _make_config([ctx0.url], [gen0.url, gen1.url],
-                              "round_robin", "conversation")
+        config = _make_config([ctx0.url], [gen0.url, gen1.url], "round_robin", "conversation")
         with _CoordinatorThread(config) as coord:
             assert asyncio.run(_wait_coord_ready(coord.url))
 
-            def _req(conv_id):
+            def _req(conv_id, ctx_request_id):
                 return CompletionRequest(
-                    model="m", prompt="hi",
+                    model="m",
+                    prompt="hi",
                     disaggregated_params=DisaggregatedParams(
-                        request_type="context_only", conversation_id=conv_id))
+                        request_type="generation_only", ctx_request_id=ctx_request_id
+                    ),
+                    conversation_params=ConversationParams(conversation_id=conv_id),
+                )
 
             async def drive():
                 remote = CoordinatorClient(coord.url, config)
                 # Stateful -> wrapped in a coordinator-delegating router.
-                assert isinstance(remote.gen_router,
-                                  CoordinatorDelegatingRouter)
+                assert isinstance(remote.gen_router, CoordinatorDelegatingRouter)
                 assert await remote.is_ready() is True
-                first, _ = await remote.gen_router.get_next_server(_req("conv-A"))
+                first_request = _req("conv-A", 100)
+                first, _ = await remote.gen_router.get_next_server(first_request)
+                await remote.gen_router.finish_request(first_request)
                 # Repeated conv-A requests must land on the same worker.
                 repeats = []
-                for _ in range(3):
-                    s, _ = await remote.gen_router.get_next_server(_req("conv-A"))
-                    repeats.append(s)
+                for ctx_request_id in range(101, 104):
+                    request = _req("conv-A", ctx_request_id)
+                    server, _ = await remote.gen_router.get_next_server(request)
+                    repeats.append(server)
+                    await remote.gen_router.finish_request(request)
                 await remote.stop()
                 return first, repeats
 
             first, repeats = asyncio.run(drive())
-            assert all(s == first for s in repeats), \
+            assert all(s == first for s in repeats), (
                 f"conv-A must be sticky, got first={first} repeats={repeats}"
+            )
 
 
-def test_coordinator_owns_generation_disagg_request_id():
-    """Generation routing receives its request ID from the coordinator."""
+def test_coordinator_preserves_generation_ctx_request_id():
+    """Generation routing preserves the context request ID for KV transfer."""
     from tensorrt_llm.serve.router import CoordinatorDelegatingRouter
 
     with _FakeWorker() as ctx0, _FakeWorker() as gen0:
-        config = _make_config([ctx0.url], [gen0.url], "round_robin",
-                              "conversation")
+        config = _make_config([ctx0.url], [gen0.url], "round_robin", "conversation")
         with _CoordinatorThread(config) as coord:
             assert asyncio.run(_wait_coord_ready(coord.url))
 
             async def drive():
                 remote = CoordinatorClient(coord.url, config)
-                assert isinstance(remote.gen_router,
-                                  CoordinatorDelegatingRouter)
+                assert isinstance(remote.gen_router, CoordinatorDelegatingRouter)
                 request = CompletionRequest(
                     model="m",
                     prompt="hello",
                     disaggregated_params=DisaggregatedParams(
-                        request_type="generation_only",
-                        ctx_request_id=123,
-                        disagg_request_id=None,
-                        conversation_id="conv-A"))
+                        request_type="generation_only", ctx_request_id=123, disagg_request_id=None
+                    ),
+                    conversation_params=ConversationParams(conversation_id="conv-A"),
+                )
                 await remote.gen_router.get_next_server(request)
                 assigned_id = request.disaggregated_params.disagg_request_id
+                ctx_request_id = request.disaggregated_params.ctx_request_id
                 await remote.gen_router.finish_request(request)
                 await remote.stop()
-                return assigned_id
+                return assigned_id, ctx_request_id
 
-            assigned_id = asyncio.run(drive())
-            assert assigned_id is not None and assigned_id != 123
+            assigned_id, ctx_request_id = asyncio.run(drive())
+            assert assigned_id is None
+            assert ctx_request_id == 123
 
 
 if __name__ == "__main__":

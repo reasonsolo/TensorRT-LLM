@@ -32,11 +32,11 @@ the ZMQ ingest bind for centralized mode.
 """
 
 import asyncio
-import json
 import time
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Any, Optional
 
+import msgpack
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
@@ -54,8 +54,28 @@ HDR_COORD_SEND = "x-coord-send-time"
 
 # The coordinator is a single event loop serving /select,/finish for the whole
 # fleet; each /select body carries a routing_key (a flat list of block hashes,
-# hundreds of int64 for long prompts). Request bodies are parsed with the stdlib
-# json.loads and responses use FastAPI's JSONResponse (stdlib json).
+# hundreds of int64 for long prompts). The bodies are msgpack, not JSON: msgpack
+# encodes an int64 in 1-9 bytes vs JSON's decimal text + delimiters, so the
+# routing-key payload and its parse/serialize cost on the hot coordinator loop
+# both shrink. Both sides are co-deployed TRT-LLM, so there is no JSON fallback.
+MSGPACK_CONTENT_TYPE = "application/msgpack"
+_MSGPACK_HEADERS = {"Content-Type": MSGPACK_CONTENT_TYPE}
+
+
+def msgpack_dumps(obj: Any) -> bytes:
+    return msgpack.packb(obj, use_bin_type=True)
+
+
+def msgpack_loads(data: bytes) -> Any:
+    return msgpack.unpackb(data, raw=False)
+
+
+class MsgpackResponse(Response):
+    media_type = MSGPACK_CONTENT_TYPE
+
+    def render(self, content: Any) -> bytes:
+        return msgpack_dumps(content)
+
 
 TIMEOUT_KEEP_ALIVE = 60  # seconds
 
@@ -75,15 +95,15 @@ class CoordinatorServer:
         self.app = FastAPI(lifespan=lifespan)
         self.app.add_api_route("/select", self.select, methods=["POST"])
         self.app.add_api_route("/finish", self.finish, methods=["POST"])
-        self.app.add_api_route("/cluster_info", self.cluster_info,
-                               methods=["GET"])
+        self.app.add_api_route("/cluster_info", self.cluster_info, methods=["GET"])
         self.app.add_api_route("/health", self.health, methods=["GET"])
         self.app.add_api_route("/version", self.version, methods=["GET"])
 
     def _timing_headers(self, raw_req: Request, recv_t: float) -> dict:
         """Echo the client send time + stamp coord recv/send times so the client
         can decompose the IPC round-trip. recv_t is captured at handler entry;
-        send time is 'now' (just before responding)."""
+        send time is 'now' (just before responding).
+        """
         h = {HDR_COORD_RECV: repr(recv_t), HDR_COORD_SEND: repr(time.time())}
         cs = raw_req.headers.get(HDR_CLIENT_SEND)
         if cs is not None:
@@ -93,65 +113,62 @@ class CoordinatorServer:
     async def select(self, raw_req: Request) -> Response:
         _recv = time.time()
         try:
-            body = json.loads(await raw_req.body())
+            body = msgpack_loads(await raw_req.body())
         except Exception as e:
-            return JSONResponse(status_code=400,
-                                content={"error": f"invalid JSON body: {e}"})
+            return MsgpackResponse(status_code=400, content={"error": f"invalid msgpack body: {e}"})
         if not isinstance(body, dict) or "role" not in body:
-            return JSONResponse(
-                status_code=400,
-                content={"error": "body must include 'role' and 'routing_key'"})
+            return MsgpackResponse(
+                status_code=400, content={"error": "body must include 'role' and 'routing_key'"}
+            )
         try:
             server, info, req_id = await self._coordinator.select(
-                body["role"], body.get("routing_key"), body.get("req_id"),
-                body.get("exclude_server"))
+                body["role"],
+                body.get("routing_key"),
+                body.get("req_id"),
+                body.get("exclude_server"),
+            )
         except ValueError as e:
-            return JSONResponse(status_code=503, content={"error": str(e)})
+            return MsgpackResponse(status_code=503, content={"error": str(e)})
         except Exception as e:  # noqa: BLE001
             logger.error(f"CoordinatorServer.select failed: {e}")
-            return JSONResponse(status_code=500, content={"error": str(e)})
-        return JSONResponse(content={"server": server, "info": info,
-                                     "req_id": req_id},
-                            headers=self._timing_headers(raw_req, _recv))
+            return MsgpackResponse(status_code=500, content={"error": str(e)})
+        return MsgpackResponse(
+            content={"server": server, "info": info, "req_id": req_id},
+            headers=self._timing_headers(raw_req, _recv),
+        )
 
     async def finish(self, raw_req: Request) -> Response:
         _recv = time.time()
         try:
-            body = json.loads(await raw_req.body())
+            body = msgpack_loads(await raw_req.body())
         except Exception as e:
-            return JSONResponse(status_code=400,
-                                content={"error": f"invalid JSON body: {e}"})
-        await self._coordinator.finish(body.get("role", "gen"),
-                                       body.get("req_id"),
-                                       body.get("success", True))
-        return JSONResponse(content={},
-                            headers=self._timing_headers(raw_req, _recv))
+            return MsgpackResponse(status_code=400, content={"error": f"invalid msgpack body: {e}"})
+        await self._coordinator.finish(
+            body.get("role", "gen"), body.get("req_id"), body.get("success", True)
+        )
+        return MsgpackResponse(content={}, headers=self._timing_headers(raw_req, _recv))
 
     async def cluster_info(self) -> Response:
         return JSONResponse(content=await self._coordinator.cluster_info())
 
     async def health(self) -> Response:
-        return Response(status_code=200 if await self._coordinator.is_ready()
-                        else 503)
+        return Response(status_code=200 if await self._coordinator.is_ready() else 503)
 
     async def version(self) -> Response:
         return JSONResponse(content={"version": VERSION})
 
-    async def __call__(self, host: str, port: int,
-                       uds: Optional[str] = None) -> None:
-        kwargs = dict(workers=1, log_level="info",
-                      timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
+    async def __call__(self, host: str, port: int, uds: Optional[str] = None) -> None:
+        kwargs = dict(workers=1, log_level="info", timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
         if uds:
             import asyncio as _asyncio
+
             uds_cfg = uvicorn.Config(self.app, uds=uds, **kwargs)
             tcp_cfg = uvicorn.Config(self.app, host=host, port=port, **kwargs)
-            await _asyncio.gather(uvicorn.Server(uds_cfg).serve(),
-                                  uvicorn.Server(tcp_cfg).serve())
+            await _asyncio.gather(uvicorn.Server(uds_cfg).serve(), uvicorn.Server(tcp_cfg).serve())
         else:
             config = uvicorn.Config(self.app, host=host, port=port, **kwargs)
             await uvicorn.Server(config).serve()
 
 
-def serve_coordinator(host: str, port: int,
-                      coordinator: DisaggCoordinatorService) -> None:
+def serve_coordinator(host: str, port: int, coordinator: DisaggCoordinatorService) -> None:
     asyncio.run(CoordinatorServer(coordinator)(host, port))

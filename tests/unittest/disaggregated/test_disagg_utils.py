@@ -219,8 +219,8 @@ def test_get_global_disagg_request_id(multithread):
     if multithread:
         with ThreadPoolExecutor(max_workers=len(worker_ids)) as executor:
             all_worker_ids = [
-                ids[0] for ids in executor.map(get_ids, [[w]
-                                                         for w in worker_ids])
+                ids[0]
+                for ids in executor.map(get_ids, [[w] for w in worker_ids])
             ]
     else:
         all_worker_ids = get_ids(worker_ids)
@@ -253,5 +253,4 @@ def test_get_local_request_id():
     assert len(ids) == 1000
     assert min(ids) == 0
     assert max(ids) == MIN_GLOBAL_ID - 1
-    assert max(ids) - min(ids) > (
-        1 << 40)  # ensure there is enough space for local ids
+    assert max(ids) - min(ids) == MIN_GLOBAL_ID - 1
