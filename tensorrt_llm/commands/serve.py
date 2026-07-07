@@ -1302,6 +1302,14 @@ def _launch_disagg_fleet(disagg_cfg, config_file, metadata_server_config_file,
     stripped (workers are plain HTTP processes). Returns the list of Popen handles.
     """
     from tensorrt_llm.llmapi.disagg_utils import disagg_process_id_space
+    procid_space = disagg_process_id_space()
+    if num_workers > procid_space:
+        raise ValueError(
+            f"num_workers ({num_workers}) exceeds the disagg process_id space "
+            f"({procid_space}); co-located workers would reuse a process_id and "
+            f"emit colliding disagg request ids (which key the ctx<->gen KV "
+            f"transfer). Reduce num_workers to <= {procid_space} or widen "
+            f"DISAGG_PROCESS_ID_BITS.")
     public_host, public_port = disagg_cfg.hostname, disagg_cfg.port
     base_env = {
         k: v for k, v in os.environ.items()
@@ -1330,14 +1338,12 @@ def _launch_disagg_fleet(disagg_cfg, config_file, metadata_server_config_file,
     logger.info(f"Launching disagg fleet: {num_workers} SO_REUSEPORT workers on "
                 f"{public_host}:{public_port}, coordinator={coordinator_url}")
 
-    procid_space = disagg_process_id_space()
     fleet = []
     for i in range(num_workers):
         worker_env = dict(base_env)
-        # Explicit per-worker process index (no shared counter file). Wrap into
-        # the snowflake process_id space so ids stay in the 6-bit field.
-        worker_env[DisaggWorkerEnvs.TLLM_DISAGG_WORKER_PROCESS_ID] = str(
-            i % procid_space)
+        # Explicit per-worker process index (no shared counter file); distinct per
+        # worker (num_workers <= procid_space is enforced above).
+        worker_env[DisaggWorkerEnvs.TLLM_DISAGG_WORKER_PROCESS_ID] = str(i)
         p = subprocess.Popen(cmd, env=worker_env, stdout=sys.stdout,
                              stderr=sys.stderr, start_new_session=True)
         logger.info(f"Disagg fleet worker {i} launched (pid={p.pid})")

@@ -96,12 +96,9 @@ class DisaggServerConfig():
     # on its event loop. Text-only, non-harmony deployments (see _get_ctx_request).
     gen_tokids_ctxbytes: bool = False
     # Number of uvicorn disagg-server worker processes to fork on the public port.
-    # >1 means a fleet of delegating servers behind one coordinator. Replaces the
-    # WEB_CONCURRENCY env var (explicit config over implicit env).
+    # >1 means a fleet of delegating servers behind one coordinator. 
     num_workers: int = 1
-    # URL of an already-running coordinator (e.g. "http://host:8332"). When set the
-    # fleet delegates to it; when absent, num_workers>1 starts an implicit in-process
-    # coordinator and num_workers==1 runs a single self-contained server.
+    # URL of an already-running coordinator (e.g. "http://host:8332"). 
     disagg_coordinator_url: Optional[str] = None
 
 

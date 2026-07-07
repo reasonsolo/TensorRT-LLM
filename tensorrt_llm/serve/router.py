@@ -1041,11 +1041,6 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                            session=session)
 
     async def _finish(self, key, success, request=None, session=None):
-        """THE single finish core, shared by finish_request (standalone, key =
-        id(request), request passed) and finish_request_by_id (coordinator, key =
-        disagg req_id, request=None -- symmetric with its increment_load(None)).
-        Pops the SAME maps _route filled, decrements load, commits routed blocks
-        on success, and refreshes the block table."""
         async with self._lock:
             server = self._req_routing_table.pop(key, None)
             if server is not None and server in self._server_state:
@@ -1054,10 +1049,6 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         self._poll_server_on_finish(server, session)
 
     def _poll_server_on_finish(self, server, session=None):
-        """Refresh a server's KV-cache block table from /kv_cache_events after a
-        request finishes. Shared by finish_request (standalone) and
-        finish_request_by_id (coordinator) so the block table always stays warm --
-        the delegated path is inert without this (matches score 0)."""
         if (server is not None and server in self._server_state
                 and self._events_aligned(server)):
             # Fire-and-forget; poll runs in background and coalesces per server.

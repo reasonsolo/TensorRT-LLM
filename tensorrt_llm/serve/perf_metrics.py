@@ -237,9 +237,6 @@ class DisaggPerfMetricsCollector:
                             "ctx_server": ctx_server,
                             "gen_server": gen_server,
                             "disagg_server_arrival_time": server_arrival_time,
-                            # arrival->ctx_dispatch = pre-ctx wait in the
-                            # orchestrator/fleet (accept queue + event loop +
-                            # pipeline), the dominant TTFT term under fleet load.
                             "disagg_ctx_dispatch_time": ctx_dispatch_time,
                             "disagg_server_first_token_time": server_first_token_time,
                             "ctx_perf_metrics": ctx_perf_metrics,

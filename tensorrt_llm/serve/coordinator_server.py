@@ -57,7 +57,7 @@ HDR_COORD_SEND = "x-coord-send-time"
 # hundreds of int64 for long prompts). Request bodies are parsed with the stdlib
 # json.loads and responses use FastAPI's JSONResponse (stdlib json).
 
-TIMEOUT_KEEP_ALIVE = 10  # seconds
+TIMEOUT_KEEP_ALIVE = 60  # seconds
 
 
 class CoordinatorServer:
@@ -139,15 +139,9 @@ class CoordinatorServer:
 
     async def __call__(self, host: str, port: int,
                        uds: Optional[str] = None) -> None:
-        # Single-process (owns routing state + the centralized ZMQ ingest bind);
-        # workers=1 forced so a leaked WEB_CONCURRENCY can't fork it. When ``uds``
-        # is set the co-located fleet uses it for the hot /select,/finish path
-        # (avoids the TCP loopback overhead that dominated per-request latency).
         kwargs = dict(workers=1, log_level="info",
                       timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
         if uds:
-            # uvicorn.Config binds uds XOR host:port, so run two Servers: UDS for
-            # the fleet (hot path) and TCP for health/external clients.
             import asyncio as _asyncio
             uds_cfg = uvicorn.Config(self.app, uds=uds, **kwargs)
             tcp_cfg = uvicorn.Config(self.app, host=host, port=port, **kwargs)
