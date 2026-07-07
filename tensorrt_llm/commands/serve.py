@@ -10,6 +10,7 @@ import signal
 import socket
 import subprocess  # nosec B404
 import sys
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, Literal, Mapping, Optional, Sequence
@@ -1297,53 +1298,73 @@ def disaggregated(
 def _launch_disagg_fleet(disagg_cfg, config_file, metadata_server_config_file,
                          request_timeout, server_start_timeout, num_workers,
                          coordinator_url):
-    """Fork a uvicorn fleet of delegating disagg servers pointed at ``coordinator_url``.
+    """Launch a fleet of ``num_workers`` delegating disagg servers on the shared
+    public port, each pointed at ``coordinator_url``.
 
-    Each worker is an ordinary ``OpenAIDisaggServer`` built with ``coordinator_url``
-    so it holds a remote ``CoordinatorClient``. Invoked as ``python -m uvicorn`` so
-    there is no bespoke worker command; uvicorn owns the shared socket, worker
-    supervision, and graceful shutdown. MPI/PMIX/SLURM env is stripped so a worker
-    (a plain HTTP process) never joins an MPI namespace. Returns the Popen handle.
+    Each worker is its OWN ``Popen`` (running ``_run_fleet_worker``), not a child
+    forked by ``uvicorn --workers N``. Two reasons:
+      1. Explicit per-worker env: each worker gets ``TLLM_DISAGG_WORKER_PROCESS_ID
+         = i`` directly, so the snowflake disagg-id's process_id field is unique
+         without any shared-filesystem counter file.
+      2. SO_REUSEPORT load balancing: each worker binds its own socket to the same
+         (host, port) with SO_REUSEPORT (see ``_run_fleet_worker``); the kernel
+         spreads connections across workers by 4-tuple hash, rather than the
+         unfair single-shared-socket accept() of ``uvicorn --workers N`` that
+         (with keep-alive clients) pinned most load onto a few workers.
+    MPI/PMIX/SLURM env is stripped so a worker (a plain HTTP process) never joins
+    an MPI namespace. Returns the list of Popen handles.
     """
+    from tensorrt_llm.llmapi.disagg_utils import disagg_process_id_space
     public_host, public_port = disagg_cfg.hostname, disagg_cfg.port
-    child_env = {
+    base_env = {
         k: v for k, v in os.environ.items()
         if not k.startswith(("SLURM_", "PMIX_", "PMI_", "OMPI_", "UCX_",
                              "I_MPI_", "HYDRA_", "MPI_"))
     }
     # num_workers is explicit config now; ensure no stale WEB_CONCURRENCY leaks in
     # and re-forks each plain-HTTP worker into a nested fleet.
-    child_env.pop("WEB_CONCURRENCY", None)
-    child_env[DisaggWorkerEnvs.TLLM_DISAGG_COORDINATOR_URL] = coordinator_url
-    child_env[DisaggWorkerEnvs.TLLM_DISAGG_CONFIG_FILE] = os.path.abspath(
+    base_env.pop("WEB_CONCURRENCY", None)
+    base_env[DisaggWorkerEnvs.TLLM_DISAGG_COORDINATOR_URL] = coordinator_url
+    base_env[DisaggWorkerEnvs.TLLM_DISAGG_CONFIG_FILE] = os.path.abspath(
         config_file)
     if metadata_server_config_file:
-        child_env[DisaggWorkerEnvs.TLLM_DISAGG_METADATA_CONFIG_FILE] = \
+        base_env[DisaggWorkerEnvs.TLLM_DISAGG_METADATA_CONFIG_FILE] = \
             os.path.abspath(metadata_server_config_file)
-    child_env[DisaggWorkerEnvs.TLLM_DISAGG_REQUEST_TIMEOUT] = str(request_timeout)
-    child_env[DisaggWorkerEnvs.TLLM_DISAGG_SERVER_START_TIMEOUT] = str(
+    base_env[DisaggWorkerEnvs.TLLM_DISAGG_REQUEST_TIMEOUT] = str(request_timeout)
+    base_env[DisaggWorkerEnvs.TLLM_DISAGG_SERVER_START_TIMEOUT] = str(
         server_start_timeout)
     # Propagate the parent's log level so fleet workers' INFO logs (e.g. the
     # per-request [ttft_split] / [coord_api] breakdowns) are not dropped.
-    child_env[DisaggWorkerEnvs.TLLM_DISAGG_LOG_LEVEL] = logger.level
-    cmd = [sys.executable, "-m", "uvicorn", "--factory",
-           "--host", str(public_host), "--port", str(public_port),
-           "--workers", str(num_workers), "--timeout-keep-alive", "10",
-           "tensorrt_llm.commands.serve:create_disagg_server_app"]
-    logger.info(f"Launching disagg fleet: {num_workers} uvicorn workers on "
+    base_env[DisaggWorkerEnvs.TLLM_DISAGG_LOG_LEVEL] = logger.level
+
+    cmd = [sys.executable, "-c",
+           "from tensorrt_llm.commands.serve import _run_fleet_worker; "
+           "_run_fleet_worker()"]
+    logger.info(f"Launching disagg fleet: {num_workers} SO_REUSEPORT workers on "
                 f"{public_host}:{public_port}, coordinator={coordinator_url}")
-    logger.info(f"Disagg fleet command: {' '.join(cmd)}")
-    fleet = subprocess.Popen(cmd, env=child_env, stdout=sys.stdout,
+
+    procid_space = disagg_process_id_space()
+    fleet = []
+    for i in range(num_workers):
+        worker_env = dict(base_env)
+        # Explicit per-worker process index (no shared counter file). Wrap into
+        # the snowflake process_id space so ids stay in the 6-bit field.
+        worker_env[DisaggWorkerEnvs.TLLM_DISAGG_WORKER_PROCESS_ID] = str(
+            i % procid_space)
+        p = subprocess.Popen(cmd, env=worker_env, stdout=sys.stdout,
                              stderr=sys.stderr, start_new_session=True)
-    logger.info(f"Disagg fleet launched (pid={fleet.pid})")
+        logger.info(f"Disagg fleet worker {i} launched (pid={p.pid})")
+        fleet.append(p)
 
     def _cleanup():
-        if fleet.poll() is None:
-            fleet.terminate()
-        try:
-            fleet.wait(timeout=10)
-        except Exception:
-            fleet.kill()
+        for p in fleet:
+            if p.poll() is None:
+                p.terminate()
+        for p in fleet:
+            try:
+                p.wait(timeout=10)
+            except Exception:
+                p.kill()
 
     atexit.register(_cleanup)
     return fleet
@@ -1361,9 +1382,18 @@ def _serve_disagg_fleet(disagg_cfg, config_file, metadata_server_config_file,
                                  metadata_server_config_file, request_timeout,
                                  server_start_timeout, num_workers,
                                  coordinator_url)
-    rc = fleet.wait()
-    if rc != 0:
-        raise RuntimeError(f"Disagg fleet exited with code {rc}")
+    # Block until any worker exits; a nonzero exit from any worker is a failure.
+    while True:
+        for i, p in enumerate(fleet):
+            rc = p.poll()
+            if rc is not None:
+                if rc != 0:
+                    raise RuntimeError(
+                        f"Disagg fleet worker {i} (pid={p.pid}) exited with "
+                        f"code {rc}")
+                # A clean exit of one worker ends the fleet.
+                return
+        time.sleep(1)
 
 
 def _serve_coordinator_and_fleet(disagg_cfg, config_file,
@@ -1417,25 +1447,22 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
                                                uds=coord_uds))
 
 
-def create_disagg_server_app():
-    """uvicorn import-string factory: build one disagg server's FastAPI app.
+def _init_fleet_worker_process():
+    """Per-process setup shared by every fleet worker (one OS process each).
 
-    Rebuilt inside each uvicorn worker process (workers=N). Fully stateless --
-    reads config + coordinator URL from the env ``_serve_coordinator_and_fleet``
-    exported (see ``DisaggWorkerEnvs``); the server holds a remote
-    ``CoordinatorClient`` so routing/readiness are delegated to the coordinator.
-    """
+    Restores logging/GC state for the fresh ``python -c`` interpreter and tags
+    every log line with this worker's PID so the shared-stdout fleet output stays
+    attributable."""
     # A worker is a plain HTTP process, never an MPI rank; drop WEB_CONCURRENCY so
     # it is never itself re-forked into multiple uvicorn workers.
     os.environ.pop("WEB_CONCURRENCY", None)
     if os.getenv("TRTLLM_DISAGG_SERVER_DISABLE_GC", "1") == "1":
         gc.disable()
 
-    # This is a fresh Python process (python -m uvicorn), so the TRT-LLM logger
-    # defaults to WARNING and would drop the workers' INFO logs (per-request
-    # [ttft_split] / [coord_api]). Restore the parent's level.
-    _worker_log_level = os.environ.get(
-        DisaggWorkerEnvs.TLLM_DISAGG_LOG_LEVEL)
+    # This is a fresh Python process, so the TRT-LLM logger defaults to WARNING
+    # and would drop the workers' INFO logs (per-request [ttft_split] /
+    # [coord_api]). Restore the parent's level.
+    _worker_log_level = os.environ.get(DisaggWorkerEnvs.TLLM_DISAGG_LOG_LEVEL)
     if _worker_log_level:
         logger.set_level(_worker_log_level)
 
@@ -1447,6 +1474,15 @@ def create_disagg_server_app():
             fmt=f"[%(asctime)s] [fleet-worker pid={os.getpid()}] %(message)s",
             datefmt="%m/%d/%Y-%H:%M:%S"))
 
+
+def _build_disagg_server_from_env() -> "OpenAIDisaggServer":
+    """Build one delegating disagg server from the env the launcher exported.
+
+    Fully stateless -- reads config + coordinator URL from ``DisaggWorkerEnvs``;
+    the server holds a remote ``CoordinatorClient`` so routing/readiness are
+    delegated to the coordinator. The worker's process index (for the snowflake
+    disagg-id) is read from ``TLLM_DISAGG_WORKER_PROCESS_ID``, which the launcher
+    set explicitly per worker (see ``worker_local_process_id``)."""
     config_file = os.environ[DisaggWorkerEnvs.TLLM_DISAGG_CONFIG_FILE]
     coordinator_url = os.environ[DisaggWorkerEnvs.TLLM_DISAGG_COORDINATOR_URL]
     metadata_config_file = os.environ.get(
@@ -1466,8 +1502,49 @@ def create_disagg_server_app():
         server_start_timeout_secs=server_start_timeout,
         metadata_server_cfg=metadata_server_cfg,
         coordinator_url=coordinator_url)
-    logger.info(f"Disagg server app built, coordinator={coordinator_url}")
-    return server.app
+    logger.info(f"Disagg server built, coordinator={coordinator_url}")
+    return server
+
+
+def create_disagg_server_app():
+    """uvicorn import-string factory: build one disagg server's FastAPI app.
+
+    Retained for the ``uvicorn --factory`` entry point; the SO_REUSEPORT fleet
+    launcher uses ``_run_fleet_worker`` instead."""
+    _init_fleet_worker_process()
+    return _build_disagg_server_from_env().app
+
+
+def _run_fleet_worker():
+    """Entry point for a single fleet worker process (one OS process per worker).
+
+    Launched as its own ``Popen`` by ``_launch_disagg_fleet`` (rather than forked
+    by ``uvicorn --workers N``) so it can:
+      (a) receive an explicit ``TLLM_DISAGG_WORKER_PROCESS_ID`` in its env -- no
+          shared-filesystem counter file needed for the snowflake disagg-id; and
+      (b) bind its OWN listening socket to the shared public port with
+          ``SO_REUSEPORT``. The kernel then load-balances incoming connections
+          across all workers by 4-tuple hash, replacing the unfair single-shared-
+          socket ``accept()`` lottery of ``uvicorn --workers N`` (which, with
+          keep-alive clients, pinned most traffic onto a few workers)."""
+    _init_fleet_worker_process()
+    server = _build_disagg_server_from_env()
+    host, port = server._config.hostname, server._config.port
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # SO_REUSEPORT: every worker binds the same (host, port); the kernel spreads
+    # connections across the workers' accept queues by 4-tuple hash.
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    try:
+        s.bind((host, port))
+    except OSError as e:
+        raise RuntimeError(
+            f"Fleet worker failed to SO_REUSEPORT-bind {host}:{port}: {e}")
+    pidx = os.environ.get(DisaggWorkerEnvs.TLLM_DISAGG_WORKER_PROCESS_ID, "0")
+    logger.info(f"Fleet worker process_id={pidx} bound {host}:{port} "
+                f"(SO_REUSEPORT)")
+    asyncio.run(server(host, port, sockets=[s]))
 
 
 def set_cuda_device():
@@ -1566,8 +1643,8 @@ class DisaggLauncherEnvs(StrEnum):
 
 
 class DisaggWorkerEnvs(StrEnum):
-    # Passed from the `disaggregated` coordinator to the forked worker fleet
-    # (uvicorn workers=N) via env, then read by create_disagg_server_app in each worker.
+    # Passed from the `disaggregated` coordinator to the fleet of worker processes
+    # (one Popen per worker) via env, then read by _run_fleet_worker in each worker.
     TLLM_DISAGG_COORDINATOR_URL = "TRTLLM_DISAGG_COORDINATOR_URL"
     TLLM_DISAGG_CONFIG_FILE = "TRTLLM_DISAGG_CONFIG_FILE"
     TLLM_DISAGG_METADATA_CONFIG_FILE = "TRTLLM_DISAGG_METADATA_CONFIG_FILE"
@@ -1582,6 +1659,11 @@ class DisaggWorkerEnvs(StrEnum):
     #         a Unix domain socket instead of TCP loopback; "0" to force TCP.
     TLLM_DISAGG_COORDINATOR_PORT = "TRTLLM_DISAGG_COORDINATOR_PORT"
     TLLM_DISAGG_COORDINATOR_UDS = "TRTLLM_DISAGG_COORDINATOR_UDS"
+    # Per-fleet-worker process index (0..N-1) folded into the process_id field of
+    # the snowflake disagg request id so co-located workers never collide. The
+    # launcher sets one distinct value per worker Popen (see _launch_disagg_fleet /
+    # worker_local_process_id). Defaults to 0 if unset (single-process path).
+    TLLM_DISAGG_WORKER_PROCESS_ID = "TRTLLM_DISAGG_WORKER_PROCESS_ID"
 
 
 def _launch_disaggregated_server(disagg_config_file: str, llm_args: dict):

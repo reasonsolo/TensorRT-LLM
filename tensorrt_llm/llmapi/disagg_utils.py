@@ -1,4 +1,5 @@
 import logging
+import os
 import threading
 import time
 import uuid
@@ -383,42 +384,64 @@ def parse_metadata_server_config_file(
         return MetadataServerConfig(**config)
 
 
-MIN_GLOBAL_ID = 1 << 42
+# Snowflake global disagg request id bit layout (64-bit, MSB reserved 0 so the
+# value is a positive int64):
+#   bit 63       : 0 (sign / reserved)
+#   bits 62..24  : timestamp_ms       (39 bits)
+#   bits 23..16  : node_id            (8 bits)  -- which node
+#   bits 15..10  : process_id         (6 bits)  -- which fleet worker on that node
+#   bits  9..0   : counter            (10 bits)
+# node_id + process_id together uniquely identify a fleet worker process, so two
+# co-located uvicorn workers never emit the same id in the same millisecond.
+DISAGG_TIMESTAMP_BITS = 39
+DISAGG_NODE_ID_BITS = 8
+DISAGG_PROCESS_ID_BITS = 6
+DISAGG_COUNTER_BITS = 10
+
+# Local ids (single-engine, sequential from max_batch_size) live in
+# [0, MIN_GLOBAL_ID); global disagg ids live in [MIN_GLOBAL_ID, 2^63) -- the two
+# ranges are disjoint by construction so a locally-issued id never collides with
+# a disagg id. Must be a power of two (get_local_request_id masks with it).
+MIN_GLOBAL_ID = 1 << 40
 
 # Consider GIL being removed in the future, use a lock to protect the counter
 _global_disagg_request_id_lock = threading.Lock()
 _global_disagg_request_id_counter = 0
 
 
-def get_global_disagg_request_id(machine_id: int) -> int:
-    """
-    a snowflake global disagg request id that doesn't guarantee monotonicity
-    0: positive integer
-    1-41  41 bits: timestamp_ms
-    42-51 10 bits: machine_id
-    52-63 12 bits: counter
+def get_global_disagg_request_id(node_id: int, process_id: int = 0) -> int:
+    """A snowflake global disagg request id (does not guarantee monotonicity).
+
+    Layout: 0(1) | timestamp_ms(39) | node_id(8) | process_id(6) | counter(10).
+    node_id identifies the node, process_id the fleet worker process on it -- the
+    pair makes the id unique across co-located workers without any coordination.
     """
     global _global_disagg_request_id_lock
     global _global_disagg_request_id_counter
 
-    COUNTER_BITS = 12
-    MACHINE_ID_BITS = 10
-    COUNTER_MASK = (1 << COUNTER_BITS) - 1
+    NODE_ID_SPACE = 1 << DISAGG_NODE_ID_BITS
+    PROCESS_ID_SPACE = 1 << DISAGG_PROCESS_ID_BITS
+    COUNTER_MASK = (1 << DISAGG_COUNTER_BITS) - 1
+    TIMESTAMP_MASK = (1 << DISAGG_TIMESTAMP_BITS) - 1
     MAX_INT64 = (1 << 63) - 1
 
-    if machine_id not in range(0, (1 << MACHINE_ID_BITS) - 1):
+    if node_id not in range(0, NODE_ID_SPACE):
+        raise ValueError(f"node_id must be in range [0, {NODE_ID_SPACE})")
+    if process_id not in range(0, PROCESS_ID_SPACE):
         raise ValueError(
-            f"machine_id must be in range [0, {(1 << MACHINE_ID_BITS) - 1})")
+            f"process_id must be in range [0, {PROCESS_ID_SPACE})")
 
-    timestamp_ms = int(time.monotonic() * 1000)
+    timestamp_ms = int(time.monotonic() * 1000) & TIMESTAMP_MASK
     with _global_disagg_request_id_lock:
         counter = _global_disagg_request_id_counter & COUNTER_MASK
         _global_disagg_request_id_counter += 1
 
-    # Rotate in [MIN_GLOBAL_ID, MAX_INT64)
-    # [0, MIN_GLOBAL_ID) is reserved for local ids
-    global_id = (timestamp_ms << (MACHINE_ID_BITS + COUNTER_BITS)) | (
-        machine_id << COUNTER_BITS) | counter
+    global_id = ((timestamp_ms << (DISAGG_NODE_ID_BITS + DISAGG_PROCESS_ID_BITS +
+                                   DISAGG_COUNTER_BITS))
+                 | (node_id << (DISAGG_PROCESS_ID_BITS + DISAGG_COUNTER_BITS))
+                 | (process_id << DISAGG_COUNTER_BITS)
+                 | counter)
+    # Rotate into [MIN_GLOBAL_ID, MAX_INT64); [0, MIN_GLOBAL_ID) is local-id space.
     global_id_int64 = global_id % (MAX_INT64 - MIN_GLOBAL_ID) + MIN_GLOBAL_ID
     return global_id_int64
 
@@ -426,3 +449,16 @@ def get_global_disagg_request_id(machine_id: int) -> int:
 def get_local_request_id(last_id: int) -> int:
     """ increment the last_id by 1 and mod by MIN_GLOBAL_ID """
     return (last_id + 1) & (MIN_GLOBAL_ID - 1)
+
+
+def disagg_process_id_space() -> int:
+    """Number of distinct process_id slots in the snowflake id (2^bits)."""
+    return 1 << DISAGG_PROCESS_ID_BITS
+
+
+def worker_local_process_id() -> int:
+    """Read this fleet worker's process index from TRTLLM_DISAGG_WORKER_PROCESS_ID
+    (set explicitly per worker by the fleet launcher, one distinct value 0..N-1
+    per Popen). 0 if unset (e.g. single-process / non-fleet path)."""
+    return int(os.environ.get("TRTLLM_DISAGG_WORKER_PROCESS_ID", "0")) \
+        % disagg_process_id_space()

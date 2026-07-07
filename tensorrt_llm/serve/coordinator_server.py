@@ -32,6 +32,7 @@ the ZMQ ingest bind for centralized mode.
 """
 
 import asyncio
+import time
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -43,6 +44,17 @@ from fastapi.responses import ORJSONResponse, Response
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinatorService
 from tensorrt_llm.version import __version__ as VERSION
+
+# Timing headers to measure the coordinator client/server IPC latency. The fleet
+# worker and the implicit coordinator are co-located on one node, so wall-clock
+# time.time() is directly comparable (no cross-node skew). The client stamps
+# X-Client-Send-Time; the coordinator stamps X-Coord-Recv-Time on ingress and
+# X-Coord-Send-Time just before responding. From these the client derives, per
+# call: req_wire (send->coord recv), handler (coord recv->coord send), resp_wire
+# (coord send->client recv) -- isolating transport overhead vs handler work.
+HDR_CLIENT_SEND = "x-client-send-time"
+HDR_COORD_RECV = "x-coord-recv-time"
+HDR_COORD_SEND = "x-coord-send-time"
 
 # The coordinator is a single event loop serving /select,/finish for the whole
 # fleet; each /select body carries a routing_key (a flat list of block hashes,
@@ -77,7 +89,18 @@ class CoordinatorServer:
         self.app.add_api_route("/health", self.health, methods=["GET"])
         self.app.add_api_route("/version", self.version, methods=["GET"])
 
+    def _timing_headers(self, raw_req: Request, recv_t: float) -> dict:
+        """Echo the client send time + stamp coord recv/send times so the client
+        can decompose the IPC round-trip. recv_t is captured at handler entry;
+        send time is 'now' (just before responding)."""
+        h = {HDR_COORD_RECV: repr(recv_t), HDR_COORD_SEND: repr(time.time())}
+        cs = raw_req.headers.get(HDR_CLIENT_SEND)
+        if cs is not None:
+            h[HDR_CLIENT_SEND] = cs
+        return h
+
     async def select(self, raw_req: Request) -> Response:
+        _recv = time.time()
         try:
             body = orjson.loads(await raw_req.body())
         except Exception as e:
@@ -97,9 +120,11 @@ class CoordinatorServer:
             logger.error(f"CoordinatorServer.select failed: {e}")
             return ORJSONResponse(status_code=500, content={"error": str(e)})
         return ORJSONResponse(content={"server": server, "info": info,
-                                     "req_id": req_id})
+                                     "req_id": req_id},
+                            headers=self._timing_headers(raw_req, _recv))
 
     async def finish(self, raw_req: Request) -> Response:
+        _recv = time.time()
         try:
             body = orjson.loads(await raw_req.body())
         except Exception as e:
@@ -108,7 +133,8 @@ class CoordinatorServer:
         await self._coordinator.finish(body.get("role", "gen"),
                                        body.get("req_id"),
                                        body.get("success", True))
-        return ORJSONResponse(content={})
+        return ORJSONResponse(content={},
+                            headers=self._timing_headers(raw_req, _recv))
 
     async def disagg_request_id(self) -> Response:
         return ORJSONResponse(content={"disagg_request_id":

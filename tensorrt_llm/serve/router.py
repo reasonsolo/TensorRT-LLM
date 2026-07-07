@@ -1619,9 +1619,23 @@ class CoordinatorDelegatingRouter(Router):
         # Coordinator HTTP-client API latency (includes network round-trip to the
         # coordinator + its in-process handler). Compare against the owner-side
         # [coord_api] to isolate the fleet /select|/finish HTTP overhead.
-        from tensorrt_llm.serve.responses_utils import PeriodicLatencyLogger
+        from tensorrt_llm.serve.responses_utils import (
+            PeriodicBreakdownLogger, PeriodicLatencyLogger)
         self._select_lat = PeriodicLatencyLogger(f"client.select[{role}]")
         self._finish_lat = PeriodicLatencyLogger(f"client.finish[{role}]")
+        # IPC latency breakdown (ms) for the coordinator client<->server round
+        # trip, decomposed via the X-Client-Send/X-Coord-Recv/X-Coord-Send headers
+        # (client + coordinator co-located => wall clock comparable):
+        #   req_wire  : client send  -> coord recv   (request transport + accept)
+        #   handler   : coord recv   -> coord send   (in-coordinator handler work)
+        #   resp_wire : coord send   -> client recv  (response transport)
+        #   rtt       : client send  -> client recv  (total observed round trip)
+        # Aggregated p50/p95 per field every window samples (no per-call logging).
+        self._ipc_fields = ["req_wire_ms", "handler_ms", "resp_wire_ms", "rtt_ms"]
+        self._select_ipc = PeriodicBreakdownLogger(
+            f"coord_ipc.select[{role}]", self._ipc_fields)
+        self._finish_ipc = PeriodicBreakdownLogger(
+            f"coord_ipc.finish[{role}]", self._ipc_fields)
 
     def __getattr__(self, name):
         # servers / prepare_servers / num_prepared_servers / start_server_monitoring
@@ -1638,6 +1652,29 @@ class CoordinatorDelegatingRouter(Router):
 
     def _on_servers_updated(self, old_servers, new_servers):
         pass
+
+    def _record_ipc(self, ipc_logger, send_t: float, recv_t: float, resp) -> None:
+        """Decompose the coordinator round trip from the response timing headers.
+        send_t/recv_t are the client-side wall clocks (co-located => comparable).
+        Missing headers (older coordinator) => that field is dropped by the
+        breakdown logger (records -1). All values in ms."""
+        from tensorrt_llm.serve.coordinator_server import (HDR_COORD_RECV,
+                                                          HDR_COORD_SEND)
+        def _f(name):
+            v = resp.headers.get(name)
+            try:
+                return float(v) if v is not None else None
+            except (TypeError, ValueError):
+                return None
+        coord_recv = _f(HDR_COORD_RECV)
+        coord_send = _f(HDR_COORD_SEND)
+        ipc_logger.record({
+            "req_wire_ms": (coord_recv - send_t) * 1000 if coord_recv else -1.0,
+            "handler_ms": (coord_send - coord_recv) * 1000
+                          if (coord_recv and coord_send) else -1.0,
+            "resp_wire_ms": (recv_t - coord_send) * 1000 if coord_send else -1.0,
+            "rtt_ms": (recv_t - send_t) * 1000,
+        })
 
     def _request_id(self, request: OpenAIRequest) -> int:
         """The request's disagg id -- the sole cross-process key for select/finish.
@@ -1661,7 +1698,12 @@ class CoordinatorDelegatingRouter(Router):
             self,
             request: OpenAIRequest,
             exclude_server: Optional[str] = None) -> tuple[str, dict]:
-        key = self._local.routing_key(request)
+        # routing_key() tokenizes + block-hashes the (up to 38k-token) prompt for
+        # kv_cache_aware -- CPU-bound. Run it in a thread so it doesn't block the
+        # fleet worker event loop (which drives ~700 concurrent streams); blocking
+        # inline was a chunk of the ctxroute pre_ctx cost. (conversation router's
+        # routing_key is trivial; to_thread overhead is negligible there.)
+        key = await asyncio.to_thread(self._local.routing_key, request)
         # Send the request's existing disagg id as the sole cross-process key; the
         # coordinator keys its pending-request state by it for /finish. Placement
         # (server selection) must NOT change the id -- the ctx<->gen KV transfer is
@@ -1671,17 +1713,22 @@ class CoordinatorDelegatingRouter(Router):
                    "exclude_server": exclude_server}
         # orjson.dumps (bytes) instead of aiohttp json= (stdlib dumps): the
         # routing_key is hundreds of int64, and this is the hot fleet->coordinator
-        # call. Parse the response with orjson too.
+        # call. Parse the response with orjson too. X-Client-Send-Time (wall clock)
+        # lets the coordinator echo timing headers back for the IPC breakdown.
+        from tensorrt_llm.serve.coordinator_server import HDR_CLIENT_SEND
         _t0 = time.monotonic()
+        _send_wall = time.time()
+        hdrs = {**_JSON_HEADERS, HDR_CLIENT_SEND: repr(_send_wall)}
         async with self.session.post(
                 f"{self._coordinator_url}/select", data=orjson.dumps(payload),
-                headers=_JSON_HEADERS,
+                headers=hdrs,
                 timeout=self._request_timeout_s) as resp:
             if resp.status != 200:
                 raise ValueError(
                     f"coordinator /select returned {resp.status}: "
                     f"{await resp.text()}")
             body = orjson.loads(await resp.read())
+            self._record_ipc(self._select_ipc, _send_wall, time.time(), resp)
         self._select_lat.record(time.monotonic() - _t0)
         info = body.get("info") or {}
         return body["server"], info
@@ -1690,19 +1737,34 @@ class CoordinatorDelegatingRouter(Router):
                              request: OpenAIRequest,
                              session: Optional[aiohttp.ClientSession] = None,
                              success: bool = True):
+        # FIRE-AND-FORGET: /finish only releases the coordinator's routed-load
+        # bookkeeping -- the caller doesn't need its result and nothing downstream
+        # waits on it. Awaiting the HTTP round trip inline put ~130-200ms
+        # (resp_wire, i.e. busy-loop scheduling) on the tail of EVERY request's
+        # critical path. Launch it as a background task and return immediately.
+        # Capture req_id now (before returning) since the request object may be
+        # mutated/freed after. Errors are logged, never propagated.
         del session
+        req_id = self._request_id(request)
+        asyncio.create_task(self._finish_async(req_id, success))
+
+    async def _finish_async(self, req_id: int, success: bool):
+        from tensorrt_llm.serve.coordinator_server import HDR_CLIENT_SEND
         _t0 = time.monotonic()
+        _send_wall = time.time()
+        hdrs = {**_JSON_HEADERS, HDR_CLIENT_SEND: repr(_send_wall)}
         try:
             async with self.session.post(
                     f"{self._coordinator_url}/finish",
                     data=orjson.dumps({"role": self._role,
-                                       "req_id": self._request_id(request),
+                                       "req_id": req_id,
                                        "success": success}),
-                    headers=_JSON_HEADERS,
+                    headers=hdrs,
                     timeout=self._request_timeout_s) as resp:
                 if resp.status != 200:
                     logger.warning(
                         f"coordinator /finish returned {resp.status}")
+                self._record_ipc(self._finish_ipc, _send_wall, time.time(), resp)
             self._finish_lat.record(time.monotonic() - _t0)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"CoordinatorDelegatingRouter finish failed: {e}")

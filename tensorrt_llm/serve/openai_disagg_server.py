@@ -43,7 +43,9 @@ from tensorrt_llm.serve.disagg_coordinator import (CoordinatorClient,
                                                    DisaggCoordinatorService)
 from tensorrt_llm.serve.openai_disagg_service import (
     OpenAIDisaggregatedService, ResponseHooks)
-from tensorrt_llm.serve.openai_protocol import (UCompletionRequest,
+from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
+                                                CompletionRequest,
+                                                UCompletionRequest,
                                                 UCompletionResponse)
 from tensorrt_llm.serve.perf_metrics import DisaggPerfMetricsCollector
 from tensorrt_llm.serve.responses_utils import (ServerArrivalTimeMiddleware,
@@ -173,9 +175,27 @@ class OpenAIDisaggServer:
 
         self.app.add_middleware(ServerArrivalTimeMiddleware)
 
+        # Log request-body validation failures (Pydantic/FastAPI) so a schema
+        # mismatch between the client and the server request models shows up in
+        # the SERVER log, not only in the client. Throttled: the first failure is
+        # logged in full, then one line per 1000 to avoid flooding the disagg
+        # event loop when every request fails the same way (observer effect).
+        self._val_err_n = 0
         @self.app.exception_handler(RequestValidationError)
-        async def validation_exception_handler(_, exc):
+        async def validation_exception_handler(request: Request, exc):
             self._perf_metrics_collector.validation_exceptions.inc()
+            self._val_err_n += 1
+            if self._val_err_n == 1 or self._val_err_n % 1000 == 0:
+                try:
+                    errs = exc.errors()
+                    # Compact: [{loc, type, msg}] -- drops the (large) echoed input.
+                    brief = [{"loc": e.get("loc"), "type": e.get("type"),
+                              "msg": e.get("msg")} for e in errs][:8]
+                except Exception:  # noqa: BLE001
+                    brief = str(exc)[:500]
+                logger.warning(
+                    f"[validation] {request.method} {request.url.path} 400 "
+                    f"(n={self._val_err_n}): {brief}")
             return JSONResponse(status_code=400, content={"error": str(exc)})
 
         self.register_routes()
@@ -193,8 +213,8 @@ class OpenAIDisaggServer:
         # The disagg service owns only the request-serving endpoints (/v1/*) and
         # perf metrics. Readiness / cluster topology are the coordinator's state,
         # so /health and /cluster_info hook straight to self._coordinator.
-        self.app.add_api_route("/v1/completions", self._wrap_entry_point(self._service.openai_completion), methods=["POST"])
-        self.app.add_api_route("/v1/chat/completions", self._wrap_entry_point(self._service.openai_chat_completion), methods=["POST"])
+        self.app.add_api_route("/v1/completions", self._wrap_entry_point(self._service.openai_completion, CompletionRequest), methods=["POST"])
+        self.app.add_api_route("/v1/chat/completions", self._wrap_entry_point(self._service.openai_chat_completion, ChatCompletionRequest), methods=["POST"])
         self.app.add_api_route("/health", self.health, methods=["GET"])
         self.app.add_api_route("/cluster_info", self.cluster_info, methods=["GET"])
         self.app.add_api_route("/version", self.version, methods=["GET"])
@@ -218,8 +238,17 @@ class OpenAIDisaggServer:
         """
         resolve_request_conversation_id(req, raw_req.headers)
 
-    def _wrap_entry_point(self, entry_point: Callable) -> Callable:
-        async def wrapper(req: UCompletionRequest, raw_req: Request) -> Response:
+    def _wrap_entry_point(self, entry_point: Callable, request_type: type = UCompletionRequest) -> Callable:
+        # Bind the CONCRETE request model per route (CompletionRequest for
+        # /v1/completions, ChatCompletionRequest for /v1/chat/completions). Typing
+        # the FastAPI body param as the bare Union UCompletionRequest =
+        # Union[CompletionRequest, ChatCompletionRequest] (no discriminator) makes
+        # Pydantic try CompletionRequest first and 400 a chat body with
+        # "('body','CompletionRequest','prompt') Field required" -- every chat
+        # request fails. openai_server.py types its handlers concretely for the
+        # same reason; mirror that by overriding the wrapper's annotation so
+        # FastAPI validates against request_type.
+        async def wrapper(req: request_type, raw_req: Request) -> Response:
             try:
                 self._perf_metrics_collector.total_requests.inc()
                 if req.stream:

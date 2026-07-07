@@ -44,7 +44,8 @@ import aiohttp
 from tensorrt_llm.llmapi.disagg_utils import (DisaggServerConfig,
                                               MetadataServerConfig, ServerRole,
                                               get_ctx_gen_server_addrs,
-                                              get_global_disagg_request_id)
+                                              get_global_disagg_request_id,
+                                              worker_local_process_id)  # noqa: F401
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.cluster_storage import (ClusterStorage, WatchEventType,
                                                 create_cluster_storage)
@@ -373,6 +374,12 @@ class CoordinatorClient(DisaggCoordinator):
         self._request_timeout_s = request_timeout_s
         self._startup_timeout_s = startup_timeout_s
         self._session: Optional[aiohttp.ClientSession] = None
+        # LOCAL disagg-id generation (no per-request HTTP hop to the coordinator's
+        # /disagg_request_id). node_id identifies the node; process_id (claimed
+        # per fleet worker at startup, exported to TLLM_DISAGG_WORKER_PROCESS_ID)
+        # makes the snowflake unique across the co-located uvicorn workers.
+        self._node_id = config.node_id
+        self._process_id = worker_local_process_id()
         # A delegating client builds coreless surfaces (is_delegating_client=True):
         # they compute the routing key locally (routing_key()) but never bind an
         # ingest port or own a core -- placement is delegated to the coordinator.
@@ -465,14 +472,13 @@ class CoordinatorClient(DisaggCoordinator):
             await asyncio.sleep(2.0)
 
     async def get_disagg_request_id(self) -> int:
-        async with self.session.get(
-                f"{self._remote_url}/disagg_request_id",
-                timeout=self._request_timeout_s) as resp:
-            if resp.status != 200:
-                raise RuntimeError(
-                    f"coordinator /disagg_request_id returned {resp.status}")
-            body = await resp.json()
-        return body["disagg_request_id"]
+        # Generate LOCALLY -- the disagg id is a self-contained snowflake
+        # (timestamp|node_id|process_id|counter), NOT shared state, so a
+        # per-request HTTP round trip to the coordinator's /disagg_request_id was
+        # pure overhead on the hot path. (node_id, process_id) is unique per fleet
+        # worker so ids don't collide across the co-located workers (which would
+        # break the ctx<->gen KV-transfer key).
+        return get_global_disagg_request_id(self._node_id, self._process_id)
 
     async def is_ready(self) -> bool:
         try:
