@@ -206,6 +206,21 @@ class KVCacheEventManager:
             return
         self.add_stored_block_event_from_block(block)
 
+    def note_removal_split(self, real_removed: int, still_resident_skipped: int) -> None:
+        # Diagnostic: track how many blocks were reported as truly removed vs
+        # skipped because a page was still resident on another tier (offloaded).
+        # A large skipped count => the old code was over-reporting removals to the
+        # KV-aware router, wrongly shrinking its reuse block table.
+        self._dbg_real_removed = getattr(self, "_dbg_real_removed", 0) + real_removed
+        self._dbg_skipped_resident = (
+            getattr(self, "_dbg_skipped_resident", 0) + still_resident_skipped)
+        self._dbg_split_calls = getattr(self, "_dbg_split_calls", 0) + 1
+        if self._dbg_split_calls % 500 == 0:
+            logger.info(
+                f"KVEVT_REMOVAL_SPLIT real_removed={self._dbg_real_removed} "
+                f"skipped_still_resident={self._dbg_skipped_resident} "
+                f"(skipped are offloaded blocks kept as reuse candidates)")
+
     def add_removed_event(self, block_hashes: BlockHashesLike) -> None:
         removed_block_hashes_by_layer_group: dict[int, list[EventBlockHash]] = {}
         removed_block_hashes_without_layer_group: list[EventBlockHash] = []

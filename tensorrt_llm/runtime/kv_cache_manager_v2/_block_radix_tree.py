@@ -150,7 +150,14 @@ def remove_subtree(root: "RootBlock | Block") -> list[rawref.ref["CommittedPage"
     # taking O(1) space
     # remove leaf blocks one by one, in post-order
     ret: list[rawref.ref["CommittedPage"]] = []
+    # Only blocks whose data truly leaves the cache hierarchy are reported as
+    # 'removed'. A block that still has a page resident on another tier (e.g.
+    # offloaded GPU->host) is NOT a real removal for reuse purposes -- it can still
+    # serve a cache hit -- so emitting 'removed' for it wrongly evicts it from the
+    # KV-aware router's block table. Such blocks are counted (below) but not
+    # reported as removed.
     removed_block_hashes: list[BlockKey] = []
+    still_resident_skipped = 0
     tree = try_get_tree(root)
     event_manager = tree.event_manager if tree is not None else None
     block: "RootBlock | Block" = root
@@ -159,8 +166,14 @@ def remove_subtree(root: "RootBlock | Block") -> list[rawref.ref["CommittedPage"
             block = next(iter(block.next.values()))
         else:
             if isinstance(block, Block):
-                removed_block_hashes.append(block.key)
-                ret.extend(p for p in block.storage if p is not None)
+                resident = [p for p in block.storage if p is not None]
+                if resident:
+                    # Block still holds a page (another tier) -> real reuse
+                    # candidate; do NOT report as removed.
+                    still_resident_skipped += 1
+                else:
+                    removed_block_hashes.append(block.key)
+                ret.extend(resident)
                 block.storage = filled_list(None, block.num_life_cycles)
             assert isinstance(block, RootBlock) or all(page is None for page in block.storage), (
                 "Storage is not cleared, yet"
@@ -178,7 +191,11 @@ def remove_subtree(root: "RootBlock | Block") -> list[rawref.ref["CommittedPage"
             assert not isinstance(prev_block, BlockRadixTree)
             block = prev_block
     if event_manager is not None:
-        event_manager.add_removed_event(removed_block_hashes)
+        if removed_block_hashes:
+            event_manager.add_removed_event(removed_block_hashes)
+        # Diagnostic: count real removals vs blocks skipped because a page was
+        # still resident on another tier (the previously-mislabeled removals).
+        event_manager.note_removal_split(len(removed_block_hashes), still_resident_skipped)
     return ret
 
 
@@ -343,7 +360,13 @@ class Block:
         for k in to_remove:
             b = prev.next.pop(k)
             if event_manager is not None:
-                event_manager.add_removed_event(b.key)
+                # Skip the 'removed' event if the pruned sibling still holds a page
+                # (offloaded/other-tier) -- it remains a reuse candidate for the
+                # router; only report blocks whose data is truly gone.
+                if isinstance(b, Block) and any(p is not None for p in b.storage):
+                    event_manager.note_removal_split(0, 1)
+                else:
+                    event_manager.add_removed_event(b.key)
             assert b.is_orphan  # _KVCache may still hold it.
         # prev.next keeps a strong ref to this _Block, so no need to remove self from prev.next in __del__().
         prev.next[self.key] = self
@@ -404,8 +427,15 @@ class Block:
         ):
             if curr.key in curr.prev.next:
                 curr.prev.next.pop(curr.key)
+                # Only report a real removal: a block that still holds a page on
+                # another tier/lifecycle (e.g. offloaded to host) is still a reuse
+                # candidate and must NOT be evicted from the KV-aware router's
+                # block table. Skip the 'removed' event for such blocks.
                 if event_manager is not None:
-                    event_manager.add_removed_event(curr.key)
+                    if any(p is not None for p in curr.storage):
+                        event_manager.note_removal_split(0, 1)
+                    else:
+                        event_manager.add_removed_event(curr.key)
             curr = curr.prev
 
     @property
