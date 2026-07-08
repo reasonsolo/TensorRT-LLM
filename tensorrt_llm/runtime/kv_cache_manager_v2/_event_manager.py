@@ -365,6 +365,18 @@ class KVCacheEventManager:
         with self._condition:
             self._latest_removed_block_hashes.setdefault(layer_group_id, []).extend(block_hashes)
             self._latest_stored_events.pop(layer_group_id, None)
+        # Diagnostics: count blocks the engine removes from the reuse tree (radix
+        # eviction / orphan / lifecycle cleanup). Non-zero here => a 'removed' KV
+        # event is on its way to the router (which will shrink its block table).
+        # Aggregated + throttled to avoid per-call flooding on the hot path.
+        n = len(block_hashes)
+        self._dbg_removed_blocks = getattr(self, "_dbg_removed_blocks", 0) + n
+        self._dbg_removed_calls = getattr(self, "_dbg_removed_calls", 0) + 1
+        if self._dbg_removed_calls % 200 == 0:
+            logger.info(
+                f"KVEVT_REMOVED_DIAG cumulative_removed_blocks="
+                f"{self._dbg_removed_blocks} removed_calls={self._dbg_removed_calls} "
+                f"last_batch={n}")
 
     def _flush_removed_events(self, layer_group_id: LayerGroupId) -> None:
         if self._max_kv_event_entries <= 0:

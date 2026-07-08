@@ -178,6 +178,11 @@ class KvCacheAwareServerState(ServerState):
 
     def update_with_events(self, events: Iterable[dict]):
         # event_raw: {"id": <id>, "data": <event body>}
+        # Diagnostics: tally per-poll event types + block deltas so we can see when
+        # and how much the block table grows/shrinks (a net-negative poll means the
+        # server issued 'removed' events -- radix-tree eviction). Throttled log.
+        n_created = n_stored = n_removed = 0
+        stored_blocks = removed_blocks = 0
         for event_raw in events:
             if "data" in event_raw:
                 event = event_raw["data"]
@@ -188,15 +193,35 @@ class KvCacheAwareServerState(ServerState):
                 "hash_algo", event.get("hash_algo", KV_CACHE_HASH_ALGO_DEFAULT))
             if event["type"] == "created":
                 self.set_hash_algo(hash_algo)
+                n_created += 1
             if event["type"] == "stored":
                 block_hashes = [
                     block["block_hash"] for block in event["blocks"]
                 ]
                 self.add_blocks(block_hashes, hash_algo=hash_algo)
                 self._event_only_blocks.update(block_hashes)
+                n_stored += 1
+                stored_blocks += len(block_hashes)
             elif event["type"] == "removed":
-                self.remove_blocks(event["block_hashes"], hash_algo=hash_algo)
-                self._event_only_blocks.difference_update(event["block_hashes"])
+                rbh = event["block_hashes"]
+                self.remove_blocks(rbh, hash_algo=hash_algo)
+                self._event_only_blocks.difference_update(rbh)
+                n_removed += 1
+                removed_blocks += len(rbh) if hasattr(rbh, "__len__") else 0
+        if n_removed or (n_stored and self._should_log_events()):
+            tbl = len(self._block_table(self._kv_cache_hash_algo))
+            logger.info(
+                f"KVEVT_DIAG server={self._server} stored_ev={n_stored} "
+                f"removed_ev={n_removed} created_ev={n_created} "
+                f"stored_blocks=+{stored_blocks} removed_blocks=-{removed_blocks} "
+                f"net={stored_blocks - removed_blocks} table_now={tbl}")
+
+    def _should_log_events(self) -> bool:
+        # Throttle the KVEVT_DIAG stored-only lines (log all removals, but only
+        # every Nth store-only poll) to avoid flooding.
+        c = getattr(self, "_kvevt_log_counter", 0) + 1
+        self._kvevt_log_counter = c
+        return c % 50 == 0
 
     async def poll_events(self, session: aiohttp.ClientSession):
         async with session.post(
