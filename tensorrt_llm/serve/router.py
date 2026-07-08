@@ -34,6 +34,14 @@ from tensorrt_llm.serve.router_utils import (  # noqa: F401
     block_key_hasher, get_cache_salt_id, get_request_num_tokens,
     hash_v1_block_key, truncate_sha256_hash_to_int64, v2_sha256_block_hasher)
 
+# KV-cache event poll interval (seconds) for the kv_cache_aware router's periodic
+# poll loop. Overridable via TRTLLM_KV_EVENT_POLL_INTERVAL_S. Previously the poll
+# was triggered per finish_request (one coalesced poll attempt per finish); a
+# fixed time-based loop decouples poll frequency from request rate.
+import os as _os
+KV_EVENT_POLL_INTERVAL_S = float(
+    _os.environ.get("TRTLLM_KV_EVENT_POLL_INTERVAL_S", "0.05"))
+
 # Max number of conversations whose home-server pin is retained (LRU).
 ROUTE_AFFINITY_CACHE_SIZE = 50000
 # Leading token-id count folded into the affinity key so pre-tokenized
@@ -123,9 +131,12 @@ class KvCacheAwareServerState(ServerState):
         self._event_only_blocks: set[BlockHash] = set()
         self._kv_cache_hash_algo = KV_CACHE_HASH_ALGO_DEFAULT
         self._tokens_per_block = tokens_per_block
+        # KV-cache events are drained by a periodic background loop (started on the
+        # first schedule_poll_and_update / first finish for this server), NOT once
+        # per finish_request. _poll_interval_s is the loop period.
         self._poll_task: Optional[asyncio.Task] = None
-        self._poll_pending: bool = False
         self._poll_session = None
+        self._poll_interval_s: float = KV_EVENT_POLL_INTERVAL_S
 
     @property
     def hash_algo(self) -> str:
@@ -242,27 +253,26 @@ class KvCacheAwareServerState(ServerState):
                 f"Failed to poll KV cache events from {self._server}: {e}")
 
     def schedule_poll_and_update(self, session=None) -> None:
-        # Coalesce concurrent polls into one in-flight task, but record that a
-        # fresh poll was requested so the running task re-polls once more before
-        # exiting. Without the re-arm, a poll requested by the LAST
-        # finish_request while a poll is already in flight would be dropped and
-        # its KV events stranded until the next request (which may never come).
-        # The strong ref on _poll_task keeps the task alive for the GC.
-        self._poll_pending = True
+        # Ensure the periodic poll loop for this server is running. Called from
+        # finish_request, but the loop polls on a fixed timer (_poll_interval_s),
+        # NOT once per finish -- so poll frequency is decoupled from request rate.
+        # Idempotent: the loop is started once and reused (strong ref keeps it
+        # alive for the GC).
         self._poll_session = session
         if self._poll_task is not None and not self._poll_task.done():
             return
-        self._poll_task = asyncio.create_task(self._drain_poll_and_update())
+        self._poll_task = asyncio.create_task(self._poll_loop())
 
-    async def _drain_poll_and_update(self) -> None:
-        while self._poll_pending:
-            self._poll_pending = False
+    async def _poll_loop(self) -> None:
+        # Drain KV-cache events every _poll_interval_s (default 50ms). Runs until
+        # cancelled at shutdown (cancel_poll_task).
+        while True:
+            await asyncio.sleep(self._poll_interval_s)
             await self.poll_and_update(self._poll_session)
 
     async def cancel_poll_task(self) -> None:
-        # Cancel and await the background poll so shutdown leaves no orphaned
+        # Cancel and await the background poll loop so shutdown leaves no orphaned
         # task polling a closed session.
-        self._poll_pending = False
         if self._poll_task is not None and not self._poll_task.done():
             self._poll_task.cancel()
             try:
