@@ -13,6 +13,11 @@
 # limitations under the License.
 
 import asyncio
+# KV-cache event poll interval (seconds) for the kv_cache_aware router's periodic
+# poll loop. Overridable via TRTLLM_KV_EVENT_POLL_INTERVAL_S. Previously the poll
+# was triggered per finish_request (one coalesced poll attempt per finish); a
+# fixed time-based loop decouples poll frequency from request rate.
+import os as _os
 import time
 from abc import ABC, abstractmethod
 from collections import OrderedDict
@@ -34,11 +39,6 @@ from tensorrt_llm.serve.router_utils import (  # noqa: F401
     block_key_hasher, get_cache_salt_id, get_request_num_tokens,
     hash_v1_block_key, truncate_sha256_hash_to_int64, v2_sha256_block_hasher)
 
-# KV-cache event poll interval (seconds) for the kv_cache_aware router's periodic
-# poll loop. Overridable via TRTLLM_KV_EVENT_POLL_INTERVAL_S. Previously the poll
-# was triggered per finish_request (one coalesced poll attempt per finish); a
-# fixed time-based loop decouples poll frequency from request rate.
-import os as _os
 KV_EVENT_POLL_INTERVAL_S = float(
     _os.environ.get("TRTLLM_KV_EVENT_POLL_INTERVAL_S", "0.05"))
 
@@ -861,6 +861,15 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         # request key -> (flat block hashes, hash_algo). Key is id(request) on the
         # standalone path, the disagg req_id on the coordinator path.
         self._pending_routed_blocks: dict[int, tuple[list[BlockHash], str]] = {}
+        # ROUTE_PREDICT_DIAG: partition the fleet-size cache gap into "routed to
+        # the wrong server" vs "routed right, block already gone". Accumulates
+        # the coordinator's *predicted* match (from its block table) at decision
+        # time; compare offline to the client's *actual* cache hit.
+        self._predict_diag_n = 0
+        self._predict_sum_prompt = 0
+        self._predict_sum_chosen = 0
+        self._predict_sum_best = 0
+        self._predict_suboptimal = 0  # winner != argmax(matches)
 
     def _create_server_state(self, server: str) -> KvCacheAwareServerState:
         return KvCacheAwareServerState(server, self._use_tokens,
@@ -1086,6 +1095,31 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             winner = tied[self._rr_counter % len(tied)]
         self._rr_counter += 1
         server = servers[winner]
+        # ROUTE_PREDICT_DIAG (experiment B): record what the coordinator's block
+        # table PREDICTED was cached on the chosen server vs the best available,
+        # so the fleet-size cache gap can be split offline into "routed wrong"
+        # (chosen << best) vs "routed right, evicted before use" (predicted high
+        # but client actual low). matches[i] is predicted matched *tokens*.
+        _prompt_tokens = sum(len(tl) for tl in token_lists)
+        _chosen_match = matches[winner]
+        _best_match = max(matches) if matches else 0
+        self._predict_diag_n += 1
+        self._predict_sum_prompt += _prompt_tokens
+        self._predict_sum_chosen += _chosen_match
+        self._predict_sum_best += _best_match
+        if _chosen_match < _best_match:
+            self._predict_suboptimal += 1
+        if self._predict_diag_n <= 20 or self._predict_diag_n % 200 == 0:
+            _n = self._predict_diag_n
+            _cf = (self._predict_sum_chosen / self._predict_sum_prompt
+                   if self._predict_sum_prompt else 0.0)
+            _bf = (self._predict_sum_best / self._predict_sum_prompt
+                   if self._predict_sum_prompt else 0.0)
+            logger.info(f"ROUTE_PREDICT_DIAG n={_n} "
+                        f"pred_chosen_frac={_cf:.4f} pred_best_frac={_bf:.4f} "
+                        f"suboptimal={self._predict_suboptimal} "
+                        f"(chosen_tok={_chosen_match} best_tok={_best_match} "
+                        f"prompt_tok={_prompt_tokens} nservers={len(servers)})")
         if conv_key is not None:
             affinity[conv_key] = server
             affinity.move_to_end(conv_key)
