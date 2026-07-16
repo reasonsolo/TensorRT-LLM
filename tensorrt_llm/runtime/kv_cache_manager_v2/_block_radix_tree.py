@@ -39,6 +39,7 @@ class ReuseScope(NamedTuple):
 
     lora_id: int | None = None
     salt: int | None = None
+    ugpu_id: int | None = None
 
     def to_bytes(self) -> bytes:
         return reuse_scope_to_bytes(self)

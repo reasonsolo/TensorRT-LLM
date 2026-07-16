@@ -767,6 +767,7 @@ class KVCacheManagerV2(BaseResourceManager):
         is_disagg: bool = False,
         enable_stats: bool = False,
         num_reserved_index_slots: int = 1,
+        enable_ugpu: bool = False,
         **kwargs,
     ) -> None:
         self.mapping = mapping
@@ -980,7 +981,9 @@ class KVCacheManagerV2(BaseResourceManager):
 
         logger.info(f"KV cache manager v2 device quota set to {quota / (1 << 30)}GiB")
 
-        cache_tiers: List[CacheTierConfig] = [GpuCacheTierConfig(quota=int(quota))]
+        cache_tiers: List[CacheTierConfig] = [
+            GpuCacheTierConfig(quota=int(quota), enable_ugpu=enable_ugpu)
+        ]
         if kv_cache_config.host_cache_size is not None and kv_cache_config.host_cache_size >= 0:
             host_quota = kv_cache_config.host_cache_size
         else:
@@ -1071,6 +1074,10 @@ class KVCacheManagerV2(BaseResourceManager):
                 self._get_event_num_blocks_per_cache_level(cache_tiers, tokens_per_block),
                 self._get_event_layer_group_ids(),
             )
+
+        # Cache the fork-join attention flag at construction time so the
+        # manager's per-uGPU metadata invariants stay stable for its lifetime.
+        self._fork_join_attn = self.impl.num_ugpus > 1 and enable_ugpu
 
         self.num_pools = len(self.impl.layer_grouping)
         # num_pools is the physical pool count owned by the KV cache manager.
@@ -2131,6 +2138,111 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         return max_num_pages // self.kv_factor
 
+    def _get_buffer_views_for_invalid_value_check(
+        self, layer_idx: int, kv_layout: str = "NHD"
+    ) -> list[torch.Tensor]:
+        """Return contiguous tensor views covering the mapped KV pages to scan."""
+        if self.num_ugpus <= 1:
+            return [self.get_buffers(layer_idx, kv_layout=kv_layout).flatten(0, 1)]
+
+        layer_offset = self.layer_offsets[layer_idx]
+        storage = self.impl._storage
+        lc_id = storage._layer_to_life_cycle_ids[LayerId(layer_offset)]
+        attr = storage.get_buffer_attr(LayerId(layer_offset), Role.KEY)
+        pg_idx = storage.get_pool_group_index(lc_id)
+        gpu_storage = storage._levels[GPU_LEVEL].storage
+        pool_group = gpu_storage._pool_groups[pg_idx]
+        slot_size = pool_group.slot_size[attr.pool_index]
+        element_per_container = 1
+        dtype = self.dtype
+        if dtype == DataType.NVFP4:
+            element_per_container = 2
+            dtype = torch.int8
+
+        views: list[torch.Tensor] = []
+        for ugpu_id in range(self.num_ugpus):
+            local_page_upper_bound = (
+                exact_div(slot_size, attr.size) * pool_group.num_slots(ugpu_id)
+                - exact_div(attr.offset, attr.size)
+            ) * attr.expansion
+            if kv_layout == "NHD":
+                shape = [
+                    local_page_upper_bound // self.kv_factor,
+                    self.kv_factor,
+                    self.tokens_per_block,
+                    self.num_kv_heads_per_layer[layer_offset],
+                    self.head_dim // element_per_container,
+                ]
+            else:
+                shape = [
+                    local_page_upper_bound // self.kv_factor,
+                    self.kv_factor,
+                    self.num_kv_heads_per_layer[layer_offset],
+                    self.tokens_per_block,
+                    self.head_dim // element_per_container,
+                ]
+            addr_key = (
+                int(gpu_storage.slot_address(pg_idx, attr.pool_index, 0, ugpu_id)) + attr.offset
+            )
+            views.append(
+                convert_to_torch_tensor(TensorWrapper(addr_key, dtype, shape)).flatten(0, 1)
+            )
+        return views
+
+    @property
+    def num_ugpus(self) -> int:
+        """Number of uGPUs. Returns 1 for non-localized configurations."""
+        return self.impl.num_ugpus
+
+    def get_per_ugpu_free_slots(self) -> list[int]:
+        """Free slot count per uGPU, summed across all pool groups."""
+        return self.impl.get_per_ugpu_free_slots()
+
+    def pick_ugpu(self, request_id: int) -> int | None:
+        """Default uGPU placement for newly-created requests."""
+        if self.num_ugpus <= 1:
+            return None
+        return request_id % self.num_ugpus
+
+    def _request_ugpu_id(self, req: LlmRequest) -> int | None:
+        """Return the request-owned uGPU id after validating the invariant."""
+        ugpu_id = getattr(req, "py_ugpu_id", None)
+        if self.num_ugpus <= 1:
+            assert ugpu_id is None or ugpu_id == 0, (
+                "Non-localized requests must not use a nonzero ugpu_id"
+            )
+            return None
+
+        assert ugpu_id is not None, (
+            f"Request {req.py_request_id} must carry py_ugpu_id before localized KV-cache placement"
+        )
+        assert 0 <= ugpu_id < self.num_ugpus, (
+            f"ugpu_id must be in [0, {self.num_ugpus}), got {ugpu_id}"
+        )
+        return ugpu_id
+
+    def get_ugpu(self, request_id: int) -> int:
+        """Return the uGPU index assigned to an allocated request."""
+        if self.num_ugpus <= 1:
+            return 0
+        kv_cache = self.kv_cache_map.get(request_id)
+        assert kv_cache is not None, (
+            f"get_ugpu: request {request_id} has no allocated KV cache "
+            f"(num_ugpus={self.num_ugpus}, "
+            f"kv_cache_map size={len(self.kv_cache_map)})"
+        )
+        assert kv_cache.ugpu_id is not None, (
+            f"get_ugpu: request {request_id} has no concrete ugpu_id "
+            f"(num_ugpus={self.num_ugpus}, "
+            f"kv_cache_map size={len(self.kv_cache_map)})"
+        )
+        return kv_cache.ugpu_id
+
+    @property
+    def fork_join_attn(self) -> bool:
+        """Whether to drive single-forward fork-join attention."""
+        return self._fork_join_attn
+
     def commit_scheduled_kv_cache_stats(self, scheduled_batch: ScheduledRequests) -> None:
         if self.is_draft or not self.enable_stats:
             return
@@ -2314,6 +2426,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     )
                 else:
                     tokens = None
+                ugpu_id = self._request_ugpu_id(req)
                 kv_cache = self._create_kv_cache(
                     req.py_request_id,
                     req.lora_task_id,
@@ -2321,9 +2434,11 @@ class KVCacheManagerV2(BaseResourceManager):
                     cache_salt=req.cache_salt,
                     is_dummy=req.is_dummy,
                     expected_prompt_length=req.prompt_len - 1,
+                    ugpu_id=ugpu_id,
                 )
                 if kv_cache is None:
                     return False
+                assert kv_cache.ugpu_id == ugpu_id
                 kv_cache.cuda_stream = self._stream.cuda_stream
 
             if not self.enable_block_reuse:
@@ -2484,13 +2599,16 @@ class KVCacheManagerV2(BaseResourceManager):
             for req in scheduled_batch.context_requests:
                 kv_cache = self.kv_cache_map.get(req.py_request_id)
                 if kv_cache is None:
+                    ugpu_id = self._request_ugpu_id(req)
                     kv_cache = self._create_kv_cache(
                         req.py_request_id,
                         req.lora_task_id,
                         None,
                         cache_salt=req.cache_salt,
                         is_dummy=req.is_dummy,
+                        ugpu_id=ugpu_id,
                     )
+                    assert kv_cache.ugpu_id == ugpu_id
                     kv_cache.stop_committing()
                 if not self._resume_and_restore(req.py_request_id, kv_cache):
                     raise RuntimeError(
@@ -3054,7 +3172,13 @@ class KVCacheManagerV2(BaseResourceManager):
         encoder_output_lens: Optional[List[int]] = None,
         num_extra_decoding_steps: int = 0,
         draft_kv_cache_manager: Optional["BaseResourceManager"] = None,
+        ugpu_ids: Optional[List[int | None]] = None,
     ):
+        if ugpu_ids is not None:
+            assert len(ugpu_ids) == len(request_ids), (
+                "ugpu_ids must have the same length as request_ids"
+            )
+
         _kv_draft = (
             kv_reserve_draft_tokens if kv_reserve_draft_tokens is not None else max_num_draft_tokens
         )
@@ -3091,6 +3215,9 @@ class KVCacheManagerV2(BaseResourceManager):
             )
             # Using 1 instead of 0 prevents NaN during warmup in e.g. Deepseek
             input_tokens = [1 for _ in range(token_num)]
+            request_ugpu_id = (
+                self.pick_ugpu(req_id) if ugpu_ids is None or ugpu_ids[i] is None else ugpu_ids[i]
+            )
             req = LlmRequest(
                 request_id=req_id,
                 max_new_tokens=1,
@@ -3098,6 +3225,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 sampling_config=SamplingConfig(sampling_params._get_sampling_config()),
                 is_streaming=False,
                 encoder_input_tokens=encoder_input_tokens,
+                ugpu_id=request_ugpu_id,
                 encoder_output_len=encoder_output_len,
             )
             req.is_dummy_request = True
@@ -3107,9 +3235,15 @@ class KVCacheManagerV2(BaseResourceManager):
                 # writes to the radix tree, so the choice of branch does not
                 # affect committed state. ``cache_salt`` is left defaulted
                 # to None to avoid coupling synthetic data to any salted branch.
+                ugpu_id = self._request_ugpu_id(req)
                 kv_cache = self._create_kv_cache(
-                    req.py_request_id, req.lora_task_id, input_tokens, is_dummy=req.is_dummy
+                    req.py_request_id,
+                    req.lora_task_id,
+                    input_tokens,
+                    is_dummy=req.is_dummy,
+                    ugpu_id=ugpu_id,
                 )
+                assert kv_cache.ugpu_id == ugpu_id
                 # Saturated IndexMapper (e.g. disagg gen trans in progress)
                 # returns None; retry next iter.
                 if kv_cache is None:
@@ -3132,9 +3266,15 @@ class KVCacheManagerV2(BaseResourceManager):
                     return None
                 draft_kv_cache = None
                 if draft_kv_cache_manager is not None:
+                    ugpu_id = self._request_ugpu_id(req)
                     draft_kv_cache = draft_kv_cache_manager._create_kv_cache(
-                        req.py_request_id, req.lora_task_id, input_tokens, is_dummy=req.is_dummy
+                        req.py_request_id,
+                        req.lora_task_id,
+                        input_tokens,
+                        is_dummy=req.is_dummy,
+                        ugpu_id=ugpu_id,
                     )
+                    assert draft_kv_cache.ugpu_id == ugpu_id
                     # Dummy path: see comment above, no salt.
                     if draft_kv_cache is None:
                         release_resources(req)
@@ -3155,7 +3295,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 req.py_prompt_len = req.prompt_len
                 req.py_draft_tokens = [1] * max_num_draft_tokens
                 if prepare_resource:
-                    new_capacity = kv_cache.capacity + _kv_draft + 1
+                    new_capacity = kv_cache.capacity + _kv_draft
                     success = kv_cache.resize(new_capacity, history_length=history_hint)
                     if not success:
                         release_resources(req, free_draft_resources=draft_kv_cache is not None)
@@ -3423,10 +3563,8 @@ class KVCacheManagerV2(BaseResourceManager):
             pool_id = self.layer_to_pool_mapping_dict[layer_offset]
             if pool_id in pool_handled:
                 continue
-            buffer = self.get_buffers(layer_id)
-            if buffer is None:
-                continue
-            yield buffer
+            for buffer in self._get_buffer_views_for_invalid_value_check(layer_id):
+                yield buffer
             pool_handled.add(pool_id)
 
     def check_invalid_values_in_kv_cache(self, fill_with_zero: bool = False) -> bool:
@@ -3626,7 +3764,7 @@ class KVCacheManagerV2(BaseResourceManager):
             copy_idx,
             self.index_scales,
             self.kv_offset,
-            self._stream.cuda_stream,
+            torch.cuda.current_stream().cuda_stream,
         )
 
     @staticmethod
@@ -3652,10 +3790,20 @@ class KVCacheManagerV2(BaseResourceManager):
         cache_salt: str | None = None,
         is_dummy: bool = False,
         expected_prompt_length: int | None = None,
+        ugpu_id: int | None = None,
     ):
         assert request_id not in self.kv_cache_map, (
             f"KV cache for request {request_id} already exists"
         )
+        if self.num_ugpus > 1:
+            assert ugpu_id is not None, (
+                "Localized KV cache managers require a concrete ugpu_id for KV-cache creation"
+            )
+            assert 0 <= ugpu_id < self.num_ugpus, (
+                f"ugpu_id must be in [0, {self.num_ugpus}), got {ugpu_id}"
+            )
+        else:
+            assert ugpu_id is None, "Non-localized KV cache managers require ugpu_id=None"
         if self.index_mapper.num_free_slots() == 0:
             logger.warning(
                 "No free IndexMapper slots for request %s "
@@ -3668,10 +3816,11 @@ class KVCacheManagerV2(BaseResourceManager):
             return None
         salt_int = self._derive_reuse_salt(cache_salt)
         kv_cache = self.impl.create_kv_cache(
-            ReuseScope(lora_id=lora_task_id, salt=salt_int),
+            ReuseScope(lora_id=lora_task_id, salt=salt_int, ugpu_id=ugpu_id),
             input_tokens,
             id=request_id,
             expected_prompt_length=expected_prompt_length,
+            ugpu_id=ugpu_id,
         )
         self.kv_cache_map[request_id] = kv_cache
         if is_dummy:
