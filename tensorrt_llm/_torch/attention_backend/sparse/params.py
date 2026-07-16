@@ -58,3 +58,5 @@ class SkipSoftmaxKernelParams:
     # Only autoregressive (LLM) decoding has a decode phase; diffusion and
     # visual generation leave this at zero.
     threshold_scale_factor_decode: float = 0.0
+    # Context-phase spcompress (SM107 only).
+    uses_spcompress: bool = False

@@ -397,7 +397,7 @@ class SkipSoftmaxScheduler:
             return None
         return int(timestep_value < disabled_until_timestep)
 
-    def get_kernel_params(self, *, timestep: Any = None):
+    def get_kernel_params(self, *, timestep: Any = None, uses_spcompress: bool = False):
         """Return kernel params, applying timestep-based disablement when provided."""
         if (
             self.get_graph_phase_for_timestep(
@@ -406,10 +406,11 @@ class SkipSoftmaxScheduler:
             )
             == 0
         ):
-            return SkipSoftmaxKernelParams()
+            return SkipSoftmaxKernelParams(uses_spcompress=uses_spcompress)
         return SkipSoftmaxKernelParams(
             threshold_scale_factor_prefill=self.threshold_scale_factor_prefill,
             threshold_scale_factor_decode=self.threshold_scale_factor_decode,
+            uses_spcompress=uses_spcompress,
         )
 
 
@@ -419,3 +420,4 @@ class SkipSoftmaxParams(SparseParams):
 
     algorithm: Literal["skip_softmax"] = field(init=False, default="skip_softmax")
     scheduler: SkipSoftmaxScheduler = field(default_factory=SkipSoftmaxScheduler)
+    uses_spcompress: bool = False

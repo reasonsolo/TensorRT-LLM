@@ -7,6 +7,8 @@ import triton.language as tl
 import triton.language.core as core
 from triton.language.standard import _log2, sum, zeros_like
 
+from tensorrt_llm._utils import get_sm_version
+
 ########################################################
 # Index gather kernel
 ########################################################
@@ -403,6 +405,7 @@ def triton_bmm(q: torch.Tensor,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
+        num_warps=8 if get_sm_version() == 107 else 4,
     )
 
     return bmm_results

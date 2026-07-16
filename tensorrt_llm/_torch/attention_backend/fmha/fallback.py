@@ -58,7 +58,6 @@ class FallbackFmha(Fmha):
         forward_args: AttentionForwardArgs,
     ) -> None:
         attn = self.attn
-
         # Every kwarg sources from ``attn`` / ``metadata`` / ``forward_args``
         # (with ``forward_args.sparse_prediction`` for sparse-attn inputs),
         # or a literal allowlisted in ``_THOP_LITERALS``.
@@ -170,6 +169,7 @@ class FallbackFmha(Fmha):
             v_head_dim=attn.v_head_dim,
             rope_append=attn.rope_append,
             attention_chunk_size=attn.attention_chunk_size,
+            uses_spcompress=forward_args.skip_softmax_kernel_params.uses_spcompress,
             skip_softmax_stat=attn.skip_softmax_stat,
             # --- Sparse-specific (AttentionForwardArgs.sparse_prediction) ---
             sparse_kv_indices=forward_args.sparse_prediction.sparse_kv_indices,
