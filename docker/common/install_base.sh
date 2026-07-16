@@ -70,6 +70,17 @@ cleanup() {
 }
 
 init_ubuntu() {
+  # install dependencies for rubin-fake-driver
+  apt-get update
+  apt-get install -y libzmq3-dev
+  # uname -m returns: x86_64 or aarch64
+  ARCH=$(uname -m)
+  LIB_PATH="/usr/lib/${ARCH}-linux-gnu"
+  ln -s ${LIB_PATH}/libmlx5.so.1 ${LIB_PATH}/libmlx5.so
+  git config --global --add safe.directory /workspace/TensorRT-LLM/cpp/build/_deps/googletest-src
+  apt-get install -y ccache
+  pip install --upgrade cmake
+
   apt-get update
   # libibverbs-dev is installed but libmlx5.so is missing, reinstall the package
   apt remove -y ibverbs-providers libibverbs1
@@ -122,6 +133,14 @@ init_ubuntu() {
     apt-get remove --purge -y tensorrt*
   fi
   pip3 uninstall -y tensorrt
+
+  # Install flashinfer for rubin, note that the below won't work because the ci account
+  # does not have permission to access the flashinfer repo.
+  #git clone -b feat_sm107 https://gitlab-master.nvidia.com/dl/flashinfer/flashinfer.git --recursive
+  #cd flashinfer
+  #python3 -m pip install -v .
+  #cd ..
+  #rm -rf flashinfer
 }
 
 install_python_rockylinux() {

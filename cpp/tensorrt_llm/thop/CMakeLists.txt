@@ -126,6 +126,7 @@ add_library(
   customMoeRoutingOp.cpp
   mamba2MTPSSMCacheOp.cpp
   selectiveScanOp.cpp
+  ugpuAllocator.cpp
   userbuffersFinalizeOp.cpp
   userbuffersTensor.cpp
   virtualMemoryAllocator.cpp
@@ -172,7 +173,8 @@ endif()
 
 if(ENABLE_MULTI_DEVICE)
   target_include_directories(th_common PUBLIC ${MPI_C_INCLUDE_DIRS})
-  target_link_libraries(th_common PRIVATE ${MPI_C_LIBRARIES} ${NCCL_LIB})
+  target_link_libraries(th_common PRIVATE ${MPI_C_LIBRARIES} ${NCCL_LIB}
+                                          CUDA::nvml)
 endif()
 
 if(NOT WIN32)

@@ -306,10 +306,11 @@ inline int getSMVersion(bool queryRealSmArch = false)
     return sm;
 }
 
-inline bool isSM100Family()
+inline bool isSM100Family(std::optional<int> sm = std::nullopt)
 {
-    int const sm = getSMVersion();
-    return sm == 100 || sm == 103; // To be continued...
+    int smVersion = sm.value_or(getSMVersion());
+    // Check if major version is 10 (supports SM 100-109 automatically, including SM107, SM109)
+    return smVersion >= 100 && smVersion < 110;
 }
 
 inline int getDevice()
