@@ -968,15 +968,10 @@ class MLA(nn.Module):
                 requires_grad=False,
             )
             if is_sm_100f():
-                # DSv4 always keeps o_a_proj in its native FP8 e4m3 form so
-                # cute_dsl_fp8_bmm_blackwell + fused_inv_rope_fp8_quant can
-                # consume it directly. Decoupled from
-                # use_cute_dsl_blockscaling_bmm: only DSv4 has o_a_proj, and
-                # the fused inv-RoPE -> FP8 quant -> cute-dsl BMM chain is the
-                # only viable path for it on SM100; gating on the global
-                # bmm-config flag was conflating two independent kernel
-                # choices (K/V absorption BMM vs. DSv4 o_a_proj BMM).
-                if self.is_deepseek_v4:
+                # Keep o_a_proj in FP8 only when the CuTe DSL BMM path is
+                # explicitly enabled. Otherwise retain the established
+                # load-time dequantized BF16 path.
+                if self.is_deepseek_v4 and self.use_cute_dsl_blockscaling_bmm:
                     self.o_a_proj = nn.Parameter(
                         torch.empty(
                             (
@@ -1268,7 +1263,11 @@ class MLA(nn.Module):
         # fp8_batched_quantize_1x128_permute102 pair. Decoupled from
         # use_cute_dsl_blockscaling_bmm (which gates the separate K/V
         # absorption BMM kernel choice).
-        fused_inv_rope_fp8 = self.o_a_proj.dtype == torch.float8_e4m3fn and is_sm_100f()
+        fused_inv_rope_fp8 = (
+            self.o_a_proj.dtype == torch.float8_e4m3fn
+            and self.use_cute_dsl_blockscaling_bmm
+            and is_sm_100f()
+        )
         if fused_inv_rope_fp8:
             heads_per_group = self.num_heads_tp // self.n_local_groups
             attn_fp8, attn_scale = torch.ops.trtllm.fused_inv_rope_fp8_quant_vllm_port(
