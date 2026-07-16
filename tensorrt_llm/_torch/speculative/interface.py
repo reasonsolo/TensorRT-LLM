@@ -2135,56 +2135,76 @@ class SpecWorkerBase(nn.Module, ABC):
         return None
 
     @contextmanager
-    def draft_kv_cache_context(self, attn_metadata, draft_kv_cache_manager):
+    def draft_kv_cache_context(self,
+                               attn_metadata,
+                               draft_kv_cache_manager,
+                               enable_draft_ugpu_forkjoin: bool = False):
         """
-        Select draft attention metadata for one-engine speculative decoding.
+        Context manager for the draft sub-forward in one-engine speculative decoding.
 
-        TRTLLM metadata temporarily swaps its manager and block offsets.
-        FlashInfer uses an independently planned metadata view because its page
-        tables and kernel wrappers are manager-specific.
+        For TRTLLM metadata, swap to a separate draft cache when present and
+        control fork-join attention for the draft sub-forward. FlashInfer uses
+        an independently planned metadata view because its page tables and
+        kernel wrappers are manager-specific.
         """
-
-        # draft_kv_cache_manager is None if using two-engine speculative decoding or not enabling separate draft KV cache.
-        if draft_kv_cache_manager is None:
-            yield attn_metadata
-            return
 
         from ..attention_backend.flashinfer import FlashInferAttentionMetadata
         if isinstance(attn_metadata, FlashInferAttentionMetadata):
-            yield attn_metadata.get_draft_metadata(draft_kv_cache_manager)
+            draft_metadata = (attn_metadata if draft_kv_cache_manager is None
+                              else attn_metadata.get_draft_metadata(
+                                  draft_kv_cache_manager))
+            yield draft_metadata
             return
 
         if not isinstance(attn_metadata, TrtllmAttentionMetadata):
             yield attn_metadata
             return
 
-        # Check if draft KV cache block offsets are allocated
-        draft_block_offsets = getattr(attn_metadata,
-                                      'draft_kv_cache_block_offsets', None)
-        if draft_block_offsets is None:
-            # Draft KV cache block offsets not allocated, skip switching
-            yield attn_metadata
-            return
+        saved_metadata_attrs = []
 
-        # Save main KV cache manager and block offsets
-        target_kv_cache_manager = attn_metadata.kv_cache_manager
-        target_kv_cache_block_offsets = attn_metadata.kv_cache_block_offsets
-        target_host_kv_cache_block_offsets = attn_metadata.host_kv_cache_block_offsets
+        def patch_metadata(name, value):
+            saved_metadata_attrs.append((name, getattr(attn_metadata, name)))
+            setattr(attn_metadata, name, value)
 
-        # Switch to draft KV cache manager and its block offsets
-        attn_metadata.kv_cache_manager = draft_kv_cache_manager
-        attn_metadata.kv_cache_block_offsets = attn_metadata.draft_kv_cache_block_offsets
-        attn_metadata.host_kv_cache_block_offsets = draft_kv_cache_manager.host_kv_cache_block_offsets
-        if attn_metadata.enable_flash_mla:
-            attn_metadata.prepare_flash_mla()
+        draft_manager_supports_ugpu_forkjoin = getattr(draft_kv_cache_manager,
+                                                       'fork_join_attn', False)
+
+        using_separate_draft_cache = (
+            draft_kv_cache_manager is not None
+            and attn_metadata.draft_kv_cache_block_offsets is not None)
 
         try:
+            if using_separate_draft_cache:
+                patch_metadata('kv_cache_manager', draft_kv_cache_manager)
+                patch_metadata('kv_cache_block_offsets',
+                               attn_metadata.draft_kv_cache_block_offsets)
+                patch_metadata(
+                    'host_kv_cache_block_offsets',
+                    draft_kv_cache_manager.host_kv_cache_block_offsets)
+                if attn_metadata.enable_flash_mla:
+                    attn_metadata.prepare_flash_mla()
+
+            if attn_metadata.ugpu_enabled:
+                if not enable_draft_ugpu_forkjoin:
+                    patch_metadata('ugpu_enabled', False)
+                elif using_separate_draft_cache:
+                    if draft_manager_supports_ugpu_forkjoin:
+                        draft_ugpu_block_offsets = (
+                            attn_metadata.draft_ugpu_kv_cache_block_offsets)
+                        if draft_ugpu_block_offsets is None:
+                            raise RuntimeError(
+                                "uGPU fork-join is enabled for the draft KV "
+                                "cache, but draft_ugpu_kv_cache_block_offsets "
+                                "was not prepared.")
+                        patch_metadata('ugpu_kv_cache_block_offsets',
+                                       draft_ugpu_block_offsets)
+                    else:
+                        patch_metadata('ugpu_enabled', False)
+
             yield attn_metadata
         finally:
-            # Restore main KV cache manager and block offsets
-            attn_metadata.kv_cache_manager = target_kv_cache_manager
-            attn_metadata.kv_cache_block_offsets = target_kv_cache_block_offsets
-            attn_metadata.host_kv_cache_block_offsets = target_host_kv_cache_block_offsets
+            for name, value in reversed(saved_metadata_attrs):
+                setattr(attn_metadata, name, value)
             if attn_metadata.enable_flash_mla:
                 attn_metadata.prepare_flash_mla()
 

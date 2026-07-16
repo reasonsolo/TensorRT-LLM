@@ -1273,6 +1273,7 @@ def _make_adp_request(
     parent_request_id=None,
 ):
     req = Mock()
+    req.py_request_id = request_id
     req.state = state
     req.state_value = (
         state.value
@@ -1321,6 +1322,12 @@ class _StubADPExecutor:
         self._enable_dsv4_adp_dummy_fixes = enable_dsv4_adp_dummy_fixes
         self.add_dummy_calls = []
         self.model_engine = Mock(max_num_tokens=max_num_tokens, max_seq_len=max_seq_len)
+        self.inflight_req_ids = Mock()
+        self._terminate_request = Mock()
+        self._is_kv_manager_v2 = True
+        self._terminate_attention_dp_dummy_requests = types.MethodType(
+            PyExecutor._terminate_attention_dp_dummy_requests, self
+        )
 
         self.dist = Mock()
         self.dist.tp_size = 1
@@ -1376,6 +1383,26 @@ def test_adp_dummy_role_set_to_ctx_on_context_only_request():
     _run_update_role(stub, [req])
 
     assert stub._adp_dummy_is_gen is False
+
+
+@pytest.mark.parametrize(
+    ("request_type", "expected_is_gen"),
+    [
+        ("REQUEST_TYPE_CONTEXT_ONLY", False),
+        ("REQUEST_TYPE_GENERATION_ONLY", True),
+    ],
+)
+def test_adp_dummy_role_reads_request_queue_item(request_type, expected_is_gen):
+    from tensorrt_llm.bindings.executor import RequestType
+
+    stub = _StubADPExecutor()
+    stub._adp_dummy_is_gen = not expected_is_gen
+    executor_request = Mock(request_type=getattr(RequestType, request_type))
+    item = RequestQueueItem(id=1, request=executor_request)
+
+    _run_update_role(stub, [item])
+
+    assert stub._adp_dummy_is_gen is expected_is_gen
 
 
 def test_adp_dummy_role_set_to_gen_on_generation_only_request():
@@ -1659,8 +1686,32 @@ def test_pad_dummy_skips_when_active_request_present():
     assert len(stub.active_requests) == 1
 
 
-def test_pad_dummy_ctx_pads_to_max_num_tokens():
-    stub = _StubADPExecutor(max_num_tokens=4096)
+@pytest.mark.parametrize(
+    (
+        "max_num_tokens",
+        "model_max_seq_len",
+        "manager_max_seq_len",
+        "expected_token_num",
+    ),
+    [
+        (4096, 8232, 8233, 4096),
+        (16384, 8232, 8233, 8232),
+        (16384, 16384, 8192, 8192),
+    ],
+)
+def test_pad_dummy_ctx_caps_to_single_sequence_limit(
+    max_num_tokens,
+    model_max_seq_len,
+    manager_max_seq_len,
+    expected_token_num,
+):
+    # max_num_tokens is batch-wide (e.g. BS2 x 8K), but add_dummy_requests
+    # creates one sequence whose page-index buffer is sized for max_seq_len.
+    stub = _StubADPExecutor(
+        max_num_tokens=max_num_tokens,
+        max_seq_len=model_max_seq_len,
+        kv_manager_max_seq_len=manager_max_seq_len,
+    )
     stub._adp_dummy_is_gen = False
     stub.expected_num_active_requests = 1
 
@@ -1668,7 +1719,7 @@ def test_pad_dummy_ctx_pads_to_max_num_tokens():
 
     assert len(stub.add_dummy_calls) == 1
     call = stub.add_dummy_calls[0]
-    assert call["token_nums"] == [4096]
+    assert call["token_nums"] == [expected_token_num]
     assert call["is_gen"] is False
 
 
@@ -1683,6 +1734,103 @@ def test_pad_dummy_gen_keeps_default_token_nums():
     call = stub.add_dummy_calls[0]
     assert call["token_nums"] is None
     assert call["is_gen"] is True
+
+
+def test_pad_dummy_allocation_failure_retries_without_crashing():
+    stub = _StubADPExecutor()
+    stub.kv_cache_manager.add_dummy_requests.side_effect = None
+    stub.kv_cache_manager.add_dummy_requests.return_value = None
+    stub.expected_num_active_requests = 1
+
+    _run_pad(stub)
+
+    stub.kv_cache_manager.add_dummy_requests.assert_called_once()
+    assert stub.active_requests == []
+
+
+def test_pad_dummy_allocation_failure_recovers_on_next_iteration():
+    stub = _StubADPExecutor()
+    dummy = _make_adp_request(
+        _STATE_GENERATION_IN_PROGRESS,
+        is_dummy_request=True,
+        request_id=17,
+    )
+    stub.kv_cache_manager.add_dummy_requests.side_effect = [None, [dummy]]
+    stub.expected_num_active_requests = 1
+
+    _run_pad(stub)
+    _run_pad(stub)
+
+    assert stub.kv_cache_manager.add_dummy_requests.call_count == 2
+    assert stub.active_requests == [dummy]
+
+
+def test_can_queue_adp_skips_all_ranks_when_one_rank_is_empty():
+    stub = Mock()
+    stub.enable_attention_dp = True
+    stub.dist.tp_allgather.return_value = [1, 0, 2, 1]
+    scheduled_batch = Mock(batch_size=1)
+
+    can_queue, can_queue_this_rank = PyExecutor._can_queue(stub, scheduled_batch)
+
+    assert can_queue is False
+    assert can_queue_this_rank is True
+
+
+def test_skipped_adp_batch_releases_dummy_even_when_not_last():
+    stub = _StubADPExecutor()
+    stub.expected_num_active_requests = 1
+
+    _run_pad(stub)
+    dummy = stub.active_requests[0]
+    real_request = _make_adp_request(_STATE_GENERATION_IN_PROGRESS, request_id=18)
+    stub.active_requests.append(real_request)
+    scheduled_batch = Mock(generation_requests=[dummy])
+
+    PyExecutor._revert_gen_alloc(stub, scheduled_batch)
+    stub._terminate_attention_dp_dummy_requests()
+
+    stub.kv_cache_manager.revert_allocate_generation.assert_called_once_with(dummy)
+    stub.inflight_req_ids.erase.assert_called_once_with(dummy.py_request_id)
+    stub._terminate_request.assert_called_once_with(dummy)
+    assert stub.active_requests == [real_request]
+
+
+def test_skipped_adp_dummy_is_recreated_for_updated_role():
+    stub = _StubADPExecutor()
+    stub.expected_num_active_requests = 1
+
+    _run_pad(stub)
+    first_dummy = stub.active_requests[0]
+    PyExecutor._revert_gen_alloc(stub, Mock(generation_requests=[first_dummy]))
+    stub._terminate_attention_dp_dummy_requests()
+
+    stub._adp_dummy_is_gen = False
+    _run_pad(stub)
+
+    assert [call["is_gen"] for call in stub.add_dummy_calls] == [True, False]
+
+
+def test_attention_dp_dummy_cleanup_preserves_real_requests():
+    stub = _StubADPExecutor()
+    real_request = _make_adp_request(_STATE_GENERATION_IN_PROGRESS, request_id=19)
+    stub.active_requests = [real_request]
+
+    stub._terminate_attention_dp_dummy_requests()
+
+    assert stub.active_requests == [real_request]
+    stub.inflight_req_ids.erase.assert_not_called()
+    stub._terminate_request.assert_not_called()
+
+
+def test_update_request_states_uses_common_dummy_cleanup():
+    stub = Mock()
+    stub._terminate_attention_dp_dummy_requests = Mock()
+    scheduled_requests = Mock(context_requests=[])
+
+    PyExecutor._update_request_states_tp(stub, scheduled_requests)
+
+    stub._terminate_attention_dp_dummy_requests.assert_called_once_with()
 
 
 def test_pad_dummy_ctx_skips_padding_when_max_num_tokens_missing():

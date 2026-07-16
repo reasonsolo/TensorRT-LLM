@@ -2486,10 +2486,10 @@ class Indexer(nn.Module):
         if self.use_fp4:
             return fp8_fp4_paged_mqa_logits(
                 (q_decode, q_scale), k_cache, weights_decode, context_lens,
-                block_table, scheduler_metadata_buffer, max_seq_len)
+                block_table, scheduler_metadata_buffer, int(max_seq_len))
         return fp8_paged_mqa_logits(q_decode, k_cache, weights_decode,
                                     context_lens, block_table,
-                                    scheduler_metadata_buffer, max_seq_len)
+                                    scheduler_metadata_buffer, int(max_seq_len))
 
     def sparse_attn_indexer(
         self,
@@ -2867,7 +2867,8 @@ class Indexer(nn.Module):
                             metadata.scheduler_metadata_buffer_expanded)
                     logits_decode = torch.ops.trtllm.cute_dsl_fp8_paged_mqa_logits(
                         dsl_q, k_cache, weights_decode, fp8_ctx_lens,
-                        fp8_block_table, fp8_schedule_meta, indexer_max_seq_len)
+                        fp8_block_table, fp8_schedule_meta,
+                        int(indexer_max_seq_len))
             else:
                 decode_q_scale = q_scale[num_ctx_tokens:num_ctx_tokens +
                                          num_gen_tokens,
