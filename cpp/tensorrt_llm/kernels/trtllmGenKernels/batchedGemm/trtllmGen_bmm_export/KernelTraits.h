@@ -172,6 +172,15 @@ inline int getNumSmemBitsPerElt(tg::Dtype dtype, tg::MmaKind mmaKind, int mmaK, 
     }
     if (mmaKind == tg::MmaKind::MxFp8Fp6Fp4)
     {
+#ifdef TLLM_RUBIN_FEATURES
+        if ((!isSparseA && mmaK >= 64) || (isSparseA && mmaK >= 128))
+        {
+            return tg::dtypeGetNumBits(dtype);
+        }
+#else
+        (void) mmaK;
+        (void) isSparseA;
+#endif // TLLM_RUBIN_FEATURES
         return 8;
     }
     else
@@ -197,10 +206,18 @@ public:
         bool transposeMmaOutput, AllReduceAlgo allReduceAlgo, bool fuseUtccpWithUtcmma, bool useMaxTmemOverlap,
         bool useCustomizedMma3xNvFp4, int32_t numEpilogueWarps, bool usePersistentScheduler, bool useDeepSeekFp8,
         bool usePerTokenSfA, bool usePerTokenSfB, bool useTwoCtas, BiasType biasType,
-        FusedBiasShuffleMode fusedBiasShuffleMode)
+        FusedBiasShuffleMode fusedBiasShuffleMode
+#ifdef TLLM_RUBIN_FEATURES
+        ,
+        bool useLamportProducer, bool useUniqueSfA
+#endif // TLLM_RUBIN_FEATURES
+        )
         : mMmaKind{mmaKind}
         , mFuseUtccpWithUtcmma{fuseUtccpWithUtcmma}
         , mUseMaxTmemOverlap{useMaxTmemOverlap}
+#ifdef TLLM_RUBIN_FEATURES
+        , mUseUniqueSfA{useUniqueSfA}
+#endif // TLLM_RUBIN_FEATURES
         , mUseCustomizedMma3xNvFp4{useCustomizedMma3xNvFp4}
         , mFusedBiasShuffleMode{fusedBiasShuffleMode}
         , mNumEpilogueWarps{numEpilogueWarps}
@@ -333,14 +350,35 @@ public:
                 // Epilogue1 does not reuse and continues after the memory allocated Epilogue0
                 // NOTE: we can always reuse loadAb SMEM as long as we don't have persistent scheduler.
 
-                auto const reuseFirstChunksSmemStoreC
-                    = doesSplitKUseDsmem(splitK) && resIdx == 0 && !usePersistentScheduler;
+                // or Lamport producer. The Lamport producer will use the smemStoreC buffer at the beginning
+                // of the kernel to issue UTMASTG instructions.
+                auto const reuseFirstChunksSmemStoreC = doesSplitKUseDsmem(splitK) && resIdx == 0
+                    && !usePersistentScheduler
+#ifdef TLLM_RUBIN_FEATURES
+                    && !useLamportProducer
+#endif // TLLM_RUBIN_FEATURES
+                    ;
 
                 // Add info.
                 smemChunkNames.emplace_back("smemGmemC" + std::to_string(resIdx));
                 numBytesAndAlignmentPerSmemChunk.emplace_back(
                     std::make_pair(numBytesSmemStoreC, numBytesAlignmentStoreC));
                 firstChunkReuseSmem.emplace_back(reuseFirstChunksSmemStoreC);
+
+#ifdef TLLM_RUBIN_FEATURES
+                // Add smem buffer for Lamport invalidation stores. For non-persistent kernels, this could
+                // be combined with smemGmemC.
+                if (useLamportProducer)
+                {
+                    // Do not reuse the chunk.
+                    bool const reuseChunksSmemInvalidate = false;
+                    // Add Info.
+                    smemChunkNames.emplace_back("smemInvalidate" + std::to_string(resIdx));
+                    numBytesAndAlignmentPerSmemChunk.emplace_back(
+                        std::make_pair(numBytesSmemStoreC, numBytesAlignmentStoreC));
+                    firstChunkReuseSmem.emplace_back(reuseChunksSmemInvalidate);
+                }
+#endif // TLLM_RUBIN_FEATURES
             }
 
             // SmemSparsityInfoA
@@ -543,10 +581,22 @@ public:
         bool const useConstSfA = useBlockScalingA && !tg::dtypeIsBlockFmt(dtypeA);
         // TMEM cols group size in the K dimension.
         int32_t kGroupSize = 4;
-        // Number of columns per stage.
-        int32_t const numColsPerStage = useBlockScalingA
-            ? ((mmaTileK / (kGroupSize * numEltsPerSfA)) * tg::getTmemColStridePerGroup(tileM, mmaK, kGroupSize))
-            : 0;
+#ifdef TLLM_RUBIN_FEATURES
+        int const scaleVecSize = mmaK / numEltsPerSfA;
+        if (scaleVecSize == 8)
+        {
+            kGroupSize = 8;
+        }
+#endif // TLLM_RUBIN_FEATURES
+       // Number of columns per stage.
+        int32_t const numColsPerStage = useBlockScalingA ? ((mmaTileK / (kGroupSize * numEltsPerSfA))
+                                            * tg::getTmemColStridePerGroup(tileM, mmaK, kGroupSize
+#ifdef TLLM_RUBIN_FEATURES
+                                                ,
+                                                mUseUniqueSfA
+#endif // TLLM_RUBIN_FEATURES
+                                                ))
+                                                         : 0;
         // Number of columns for scaling factors of A.
         auto const numTmemColsSfA = useConstSfA ? tg::roundUp(numColsPerStage, 4)
                                                 : (numColsPerStage * (mFuseUtccpWithUtcmma ? 1 : numStagesSfA));
@@ -569,10 +619,22 @@ public:
         bool const useConstSfB = useBlockScalingB && !tg::dtypeIsBlockFmt(dtypeB);
         // TMEM cols group size in the K dimension.
         int32_t kGroupSize = 4;
-        // Number of columns per stage.
-        int32_t const numColsPerStage = useBlockScalingB
-            ? ((mmaTileK / (kGroupSize * numEltsPerSfB)) * tg::getTmemColStridePerGroup(tileN, mmaK, kGroupSize))
-            : 0;
+#ifdef TLLM_RUBIN_FEATURES
+        int const scaleVecSize = mmaK / numEltsPerSfB;
+        if (scaleVecSize == 8)
+        {
+            kGroupSize = 8;
+        }
+#endif // TLLM_RUBIN_FEATURES
+       // Number of columns per stage.
+        int32_t const numColsPerStage = useBlockScalingB ? ((mmaTileK / (kGroupSize * numEltsPerSfB))
+                                            * tg::getTmemColStridePerGroup(tileN, mmaK, kGroupSize
+#ifdef TLLM_RUBIN_FEATURES
+                                                ,
+                                                /* useUniqueSf */ false
+#endif // TLLM_RUBIN_FEATURES
+                                                ))
+                                                         : 0;
         // Number of columns for scaling factors of B.
         auto const numTmemColsSfB = useConstSfB ? tg::roundUp(numColsPerStage, 4)
                                                 : (numColsPerStage * (mFuseUtccpWithUtcmma ? 1 : numStagesSfB));
@@ -616,6 +678,10 @@ tg::MmaKind mMmaKind{};
 bool mFuseUtccpWithUtcmma{};
 // Whether use the max TMEM overlap trick.
 bool mUseMaxTmemOverlap{};
+#ifdef TLLM_RUBIN_FEATURES
+// Whether use unique scaling factor for A.
+bool mUseUniqueSfA{};
+#endif // TLLM_RUBIN_FEATURES
 // Whether use customized MMA for 3xNvFp4
 bool mUseCustomizedMma3xNvFp4{};
 // Which BiasType::Mn preprocessing steps are fused into the kernel instead of the host.
@@ -682,6 +748,13 @@ inline int32_t getSmemOffsetGmemC(KernelTraits traits, int resIdx = 0)
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#ifdef TLLM_RUBIN_FEATURES
+inline int32_t getSmemOffsetInvalidate(KernelTraits traits, int resIdx = 0)
+{
+    return traits.mSmemAllocatorHelper.getChunkOffsetByName("smemInvalidate" + std::to_string(resIdx));
+}
+#endif // TLLM_RUBIN_FEATURES
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

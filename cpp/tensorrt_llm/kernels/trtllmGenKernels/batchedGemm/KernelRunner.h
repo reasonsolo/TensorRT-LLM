@@ -85,6 +85,10 @@ struct TrtllmGenBatchedGemmRunnerOptions
     bool transposeMmaOutput{false};
     int32_t tileSize{8};
     int32_t epilogueTileM{128};
+    bool lamportConsumerA{false};
+    bool lamportConsumerB{false};
+    bool lamportForceValid{false};
+    bool lamportProducer{false};
 };
 
 class TrtllmGenBatchedGemmRunner

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -44,7 +44,12 @@ using tensorrt_llm::common::fmtstr;
 
 constexpr bool isSMCompatible(int gpuSM, SmVersion kernelSM)
 {
-    if (gpuSM == 103)
+    if (gpuSM == 107)
+    {
+        // SM107 (Rubin) can run SM100f family kernels or SM107a-specific kernels
+        return kernelSM == SmVersion::Sm100f || kernelSM == SmVersion::Sm107a;
+    }
+    else if (gpuSM == 103)
     {
         return kernelSM == SmVersion::Sm100f || kernelSM == SmVersion::Sm103a;
     }
@@ -55,6 +60,11 @@ constexpr bool isSMCompatible(int gpuSM, SmVersion kernelSM)
     else if (gpuSM == 90)
     {
         return kernelSM == SmVersion::Sm90a;
+    }
+    // Redirect SM100 family (major version 10) to family kernels
+    else if (tensorrt_llm::common::isSM100Family(gpuSM))
+    {
+        return kernelSM == SmVersion::Sm100f;
     }
 
     TLLM_THROW("Unexpected gpuSM %d", gpuSM);
@@ -203,31 +213,9 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunne
             continue;
         }
 
-        auto sm = configs[i].mSm;
-        if (sm != SmVersion::Sm100f)
-        {
-            int smVersion = tensorrt_llm::common::getSMVersion();
-            if (smVersion == 100)
-            {
-                if (!acceptIf(sm == SmVersion::Sm100a,
-                        fmtstr("SM version 100 requires Sm100a (kernel has: %d)", static_cast<int>(sm))))
-                {
-                    continue;
-                }
-            }
-            else if (smVersion == 103)
-            {
-                if (!acceptIf(sm == SmVersion::Sm103a,
-                        fmtstr("SM version 103 requires Sm103a (kernel has: %d)", static_cast<int>(sm))))
-                {
-                    continue;
-                }
-            }
-        }
-
         if (options.mUseDeepSeekFp8)
         {
-            if (!acceptIf(options.mUseShuffledMatrix == false, "useShuffledMatrixA should be false for DeepSeek Fp8"))
+            if (!acceptIf(options.mUseShuffledMatrix == false, "useShuffledMatrix should be false for DeepSeek Fp8"))
             {
                 continue;
             }
@@ -252,6 +240,31 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunne
         if (!acceptIf(options.mEpilogueTileM == mOptions.epilogueTileM,
                 fmtstr("epilogueTileM mismatch (kernel: %d, expected: %d)", options.mEpilogueTileM,
                     mOptions.epilogueTileM)))
+        {
+            continue;
+        }
+
+        if (!acceptIf(options.mLamportConsumerA == mOptions.lamportConsumerA,
+                fmtstr("lamportConsumerA mismatch (kernel: %d, expected: %d)", options.mLamportConsumerA,
+                    mOptions.lamportConsumerA)))
+        {
+            continue;
+        }
+        if (!acceptIf(options.mLamportConsumerB == mOptions.lamportConsumerB,
+                fmtstr("lamportConsumerB mismatch (kernel: %d, expected: %d)", options.mLamportConsumerB,
+                    mOptions.lamportConsumerB)))
+        {
+            continue;
+        }
+        if (!acceptIf(options.mLamportForceValid == mOptions.lamportForceValid,
+                fmtstr("lamportForceValid mismatch (kernel: %d, expected: %d)", options.mLamportForceValid,
+                    mOptions.lamportForceValid)))
+        {
+            continue;
+        }
+        if (!acceptIf(options.mLamportProducer == mOptions.lamportProducer,
+                fmtstr("lamportProducer mismatch (kernel: %d, expected: %d)", options.mLamportProducer,
+                    mOptions.lamportProducer)))
         {
             continue;
         }
@@ -413,7 +426,7 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, int32_t va
     bmm.runInitBeforeWorldSync(config, gemmData, static_cast<void*>(stream));
 
     auto const err = bmm.run(config, workspace, gemmData, static_cast<void*>(stream), multiProcessorCount,
-        tensorrt_llm::common::getEnvEnablePDL(), nullptr, globalTrtllmGenBatchedGemmModuleCache);
+        tensorrt_llm::common::getEnvEnablePDL(), nullptr, std::ref(globalTrtllmGenBatchedGemmModuleCache));
 
     CUresult cuErr = static_cast<CUresult>(err);
     char const* cuErrStr = nullptr;

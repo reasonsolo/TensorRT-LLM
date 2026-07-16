@@ -231,7 +231,7 @@ static auto makeTmaShapeStrideAbc(GemmOptions const& options, int sizeM, int siz
 
 // Create the TMA shape/stride for A/B block scaling factors.
 static auto makeTmaShapeStrideSfAb(int mM, int mN, int mK, MatrixType matrixType, int tileM, int tileN, int tileK,
-    tg::SfLayout layout, int sfReshapeFactor, const int32_t numEltsPerSf)
+    tg::SfLayout layout, int sfReshapeFactor, int32_t const numEltsPerSf)
 {
 
     // The outer dimension.
@@ -247,6 +247,16 @@ static auto makeTmaShapeStrideSfAb(int mM, int mN, int mK, MatrixType matrixType
     {
     case tg::SfLayout::R128c4:
     {
+        // The scaling factor tensor packs 128x4 tiles into contiguous 512B blocks.
+        // The 512B block maps to a 32x16B (32x128b) block in TMEM.
+        // See https://nvbugspro.nvidia.com/bug/4165523
+        //
+        // Additionally, we have to meet constraints of TMA that the box dimensions are less
+        // than 256 and boxDim[0] is a multiple of 16B.
+        //
+        // The "logical" tensor is:      [outer,       inner / numEltsPerSf]
+        // The aforementioned format is: [outer / 128, inner / numEltsPerSf / 4,    512]
+        // The shape we use for TMA is:  [outer / 128, inner / numEltsPerSf / 4, 2, 256]
         auto shape = std::vector<uint64_t>{256, 2, static_cast<uint64_t>(ceilDiv(hiddenSize, numEltsPerSf * 4)),
             static_cast<uint64_t>(ceilDiv(numTokens, 128))};
 
@@ -263,6 +273,36 @@ static auto makeTmaShapeStrideSfAb(int mM, int mN, int mK, MatrixType matrixType
 
         return std::make_tuple(shape, stride, tileShapes);
     }
+
+#ifdef TLLM_RUBIN_FEATURES
+    case tg::SfLayout::R128c16:
+    {
+        // The scaling factor tensor packs 128x16 tiles into contiguous 2048B blocks.
+        // The 2048B block maps to a 128x16B (128x128b) block in TMEM.
+        //
+        // Additionally, we have to meet constraints of TMA that the box dimensions are less
+        // than 256 and boxDim[0] is a multiple of 16B.
+        //
+        // The "logical" tensor is:      [outer,       inner / numEltsPerSf]
+        // The aforementioned format is: [outer / 128, inner / numEltsPerSf / 16,    2048]
+        // The shape we use for TMA is:  [outer / 128, inner / numEltsPerSf / 16, 8,  256]
+        auto shape = std::vector<uint64_t>{256, 8, static_cast<uint64_t>(ceilDiv(hiddenSize, numEltsPerSf * 16)),
+            static_cast<uint64_t>(ceilDiv(numTokens, 128))};
+
+        std::vector<uint64_t> stride(shape.size());
+        stride[0] = 1;
+        for (size_t i = 1; i < shape.size(); i++)
+        {
+            stride[i] = shape[i - 1] * stride[i - 1];
+        }
+
+        auto tileShapes
+            = std::vector<uint32_t>{256, 8, static_cast<uint32_t>(ceilDiv(hiddenSizePerTile, numEltsPerSf * 16)),
+                static_cast<uint32_t>(ceilDiv(numTokensPerTile, 128))};
+
+        return std::make_tuple(shape, stride, tileShapes);
+    }
+#endif // TLLM_RUBIN_FEATURES
 
     case tg::SfLayout::R8c4:
     {
@@ -353,8 +393,13 @@ static KernelParams setKernelParams(GemmOptions_ const& options, bool const batc
     void* ptrC, void const* dSfA, void const* dSfB, void const* ptrPerTokenSfA, void const* ptrPerTokenSfB,
     [[maybe_unused]] void const* ptrSparsityInfoA, void const* ptrBias, int32_t const* ptrPermutedIdxToBiasRowIdx,
     void* dSfC, float const* ptrScaleC, float const* ptrScaleAct, float const* ptrScaleGate, float const* ptrClampLimit,
-    float const* ptrGatedActAlpha, float const* ptrGatedActBeta, int32_t const* routeMap, float* rowMax,
-    uint32_t* rowMaxBars, int32_t const* ptrNumNonExitingCtas = nullptr,
+    float const* ptrGatedActAlpha, float const* ptrGatedActBeta,
+#ifdef TLLM_RUBIN_FEATURES
+#ifdef TLLM_TEST
+    void* ptrInvalidate, void* ptrSfInvalidate,
+#endif // TLLM_TEST
+#endif // TLLM_RUBIN_FEATURES
+    int32_t const* routeMap, float* rowMax, uint32_t* rowMaxBars, int32_t const* ptrNumNonExitingCtas = nullptr,
     int32_t const* ptrTotalNumPaddedTokens = nullptr, int32_t const* ptrCtaIdxXyToBatchIdx = nullptr,
     int32_t const* ptrCtaIdxXyToMnLimit = nullptr, int32_t const maxNumCtas = KernelParams::MaxNumCtas,
     uint32_t* ptrDynamicTileCounter = nullptr)
@@ -466,6 +511,12 @@ static KernelParams setKernelParams(GemmOptions_ const& options, bool const batc
     params.ptrSfA = dSfA;
     params.ptrSfB = dSfB;
     params.ptrSfC = dSfC;
+
+#ifdef TLLM_RUBIN_FEATURES
+#ifdef TLLM_TEST
+    params.ptrSfInvalidate = ptrSfInvalidate;
+#endif // TLLM_TEST
+#endif // TLLM_RUBIN_FEATURES
 
     // Do we pad A or B?
     bool doPadA = tg::dtypeNeedsPadding(options.mDtypeA, options.mMmaKind, options.mMmaK, isSparseA);
@@ -609,6 +660,18 @@ static KernelParams setKernelParams(GemmOptions_ const& options, bool const batc
             // Build tma descriptor for C.
             params.tmaC[0] = gemm::buildNdTmaDescriptor(options.mDtypeC, shapeC, strideC, tileShapeC, ptrC,
                 /*doPad=*/false);
+
+#ifdef TLLM_RUBIN_FEATURES
+#ifdef TLLM_TEST
+            if (ptrInvalidate)
+            {
+                // Build tma descriptor for invalidate..
+                params.tmaInvalidate[0]
+                    = gemm::buildNdTmaDescriptor(options.mDtypeC, shapeC, strideC, tileShapeC, ptrInvalidate,
+                        /*doPad=*/false);
+            }
+#endif // TLLM_TEST
+#endif // TLLM_RUBIN_FEATURES
         }
         else
         {

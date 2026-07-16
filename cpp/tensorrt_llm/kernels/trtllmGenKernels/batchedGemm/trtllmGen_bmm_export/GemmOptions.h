@@ -125,7 +125,6 @@ struct GemmOptions
 #endif
 
     GemmOptions() = default;
-
     GemmOptions(AllReduceAlgo allReduceAlgo, tg::Dtype biasDtype, BiasType biasType, int blockK, bool clcFastDrain,
         int clusterDimX, int clusterDimY, int clusterDimZ, CtaSwizzleType ctaSwizzleType, tg::Dtype dtypeAcc,
         tg::Dtype dtypeA, tg::Dtype dtypeB, tg::Dtype dtypeC, tg::Dtype dtypeMmaA, tg::Dtype dtypeMmaB,
@@ -134,21 +133,34 @@ struct GemmOptions
         int fallbackClusterDimY, int fallbackClusterDimZ, FusedBiasShuffleMode fusedBiasShuffleMode,
         bool fuseLoadSfTask, bool fuseUtccpWithUtcmma, bool gridTriggerSecondaryA, bool gridTriggerSecondaryB,
         bool gridWaitForPrimaryEarlyExit, bool gridWaitForPrimaryA, bool gridWaitForPrimaryB, bool hoistLoadTaskInit,
-        bool hoistMmaTaskTryWaits, int k, KernelTraits kernelTraits, MatrixLayout layoutA, MatrixLayout layoutB, int m,
-        int mmaK, tg::MmaKind mmaKind, int mmaM, int mmaN, int mmaTileK, bool mockAllReduce, int n,
-        int numEpilogueWarps, int numRegsCastAWarps, int numRegsCopySfLdsSttm, int numRegsCopySparsityInfo,
-        int numRegsPerThreadEpilogueWarp, int numRegsPerThreadNonEpilogueWarp, int numSlicesForSplitK,
-        int numSlicesForSliceK, int numStagesA, int numStagesB, int numStagesMma, int numStagesMmaWithinWorkTile,
-        int numStagesMmaAcrossWorkTile, int numStagesSmemSfA, int numStagesSmemSfB, int numStagesTmemA,
-        int numStagesTmemSfA, int numStagesTmemSfB, int numStagesWorkId, bool outputDebugTensors, bool patchF2fp,
+        bool hoistMmaTaskTryWaits, int k, KernelTraits kernelTraits,
+#ifdef TLLM_RUBIN_FEATURES
+        bool lamportConsumerA, bool lamportConsumerB, bool lamportForceValid, bool lamportProducer,
+#ifdef TLLM_TEST
+        bool lamportSeparateInvalidation,
+#endif // TLLM_TEST
+#endif // TLLM_RUBIN_FEATURES
+        MatrixLayout layoutA, MatrixLayout layoutB, int m, int mmaK, tg::MmaKind mmaKind, int mmaM, int mmaN,
+        int mmaTileK, bool mockAllReduce, int n, int numEpilogueWarps, int numRegsCastAWarps, int numRegsCopySfLdsSttm,
+        int numRegsCopySparsityInfo, int numRegsPerThreadEpilogueWarp, int numRegsPerThreadNonEpilogueWarp,
+        int numSlicesForSplitK, int numSlicesForSliceK, int numStagesA, int numStagesB, int numStagesMma,
+        int numStagesMmaWithinWorkTile, int numStagesMmaAcrossWorkTile, int numStagesSmemSfA, int numStagesSmemSfB,
+        int numStagesTmemA, int numStagesTmemSfA, int numStagesTmemSfB, int numStagesWorkId, bool outputDebugTensors,
+        bool patchF2fp,
+#ifdef TLLM_RUBIN_FEATURES
+        bool patchPzo,
+#endif // TLLM_RUBIN_FEATURES
         tg::Dtype perTokenSfDtype, SchedHostTask schedHostTask, int32_t sfBlockSizeA, int32_t sfBlockSizeB,
         int32_t sfBlockSizeC, tg::SfLayout sfLayoutA, tg::SfLayout sfLayoutB, tg::SfLayout sfLayoutC,
         int sfReshapeFactor, bool sliceK, tg::Sparsity sparsityA, SplitK splitK, int tileK, int tileM, int tileN,
         TileScheduler tileScheduler, bool transposeMmaOutput, bool useCustomizedMma3xNvFp4, bool useCustomMmaSchedule,
         bool useDeepSeekFp8, bool useFlexibleClusterDims, bool useHoistTryWaitForCustomMmaSchedule,
         bool useMaxTmemOverlap, bool usePerTokenSfA, bool usePerTokenSfB, bool useShuffledMatrix, bool useTmaStore,
-        bool useTwoTmaLoadWarps, bool useTwoMmaWarps, bool useUnrollLoop2xForMma, int validM, int validN, int validK,
-        int worldSize)
+        bool useTwoTmaLoadWarps, bool useTwoMmaWarps,
+#ifdef TLLM_RUBIN_FEATURES
+        bool useUniqueSfA,
+#endif // TLLM_RUBIN_FEATURES
+        bool useUnrollLoop2xForMma, int validM, int validN, int validK, int worldSize)
         : mAllReduceAlgo{allReduceAlgo}
         , mBiasDtype{biasDtype}
         , mBiasType{biasType}
@@ -187,6 +199,15 @@ struct GemmOptions
         , mHoistMmaTaskTryWaits{hoistMmaTaskTryWaits}
         , mK{k}
         , mKernelTraits{kernelTraits}
+#ifdef TLLM_RUBIN_FEATURES
+        , mLamportConsumerA(lamportConsumerA)
+        , mLamportConsumerB(lamportConsumerB)
+        , mLamportForceValid(lamportForceValid)
+        , mLamportProducer(lamportProducer)
+#ifdef TLLM_TEST
+        , mLamportSeparateInvalidation(lamportSeparateInvalidation)
+#endif // TLLM_TEST
+#endif // TLLM_RUBIN_FEATURES
         , mLayoutA{layoutA}
         , mLayoutB{layoutB}
         , mM{m}
@@ -218,6 +239,9 @@ struct GemmOptions
         , mNumStagesWorkId{numStagesWorkId}
         , mOutputDebugTensors{outputDebugTensors}
         , mPatchF2fp{patchF2fp}
+#ifdef TLLM_RUBIN_FEATURES
+        , mPatchPzo{patchPzo}
+#endif // TLLM_RUBIN_FEATURES
         , mPerTokenSfDtype{perTokenSfDtype}
         , mSchedHostTask{schedHostTask}
         , mSfBlockSizeA{sfBlockSizeA}
@@ -247,6 +271,9 @@ struct GemmOptions
         , mUseTmaStore{useTmaStore}
         , mUseTwoTmaLoadWarps{useTwoTmaLoadWarps}
         , mUseTwoMmaWarps{useTwoMmaWarps}
+#ifdef TLLM_RUBIN_FEATURES
+        , mUseUniqueSfA{useUniqueSfA}
+#endif // TLLM_RUBIN_FEATURES
         , mUseUnrollLoop2xForMma{useUnrollLoop2xForMma}
         , mValidM{validM}
         , mValidN{validN}
@@ -254,7 +281,6 @@ struct GemmOptions
         , mWorldSize{worldSize}
     {
     }
-
     // The all-reduce algorithm.
     AllReduceAlgo mAllReduceAlgo{AllReduceAlgo::None};
     // The data type of bias in global memory.
@@ -361,6 +387,20 @@ struct GemmOptions
     int mK{16 * 16};
     // Traits of the kernel.
     KernelTraits mKernelTraits{};
+#ifdef TLLM_RUBIN_FEATURES
+    // Whether the load task A uses a Lamport pipeline.
+    bool mLamportConsumerA{false};
+    // Whether the load task B uses a Lamport pipeline.
+    bool mLamportConsumerB{false};
+    // Whether the kernel forces the output to be valid values (not -0.0 for FP and NAN for UE8m0).
+    bool mLamportForceValid{false};
+    // Whether the kernel is a Lamport producer (invalidates output buffer prior to writing results).
+    bool mLamportProducer{false};
+#ifdef TLLM_TEST
+    // Whether the Lamport Producer kernel invalidates a separate buffer (used for testing only).
+    bool mLamportSeparateInvalidation{false};
+#endif // TLLM_TEST
+#endif // TLLM_RUBIN_FEATURES
     // Layout of A matrix
     MatrixLayout mLayoutA{MatrixLayout::MajorK};
     // Layout of B matrix
@@ -430,6 +470,10 @@ struct GemmOptions
     bool mOutputDebugTensors{false};
     // Patch float conversions.
     bool mPatchF2fp{false};
+#ifdef TLLM_RUBIN_FEATURES
+    // Patch conversions with PZO modifier to force positive zeros.
+    bool mPatchPzo{false};
+#endif // TLLM_RUBIN_FEATURES
     // The dtype of scale factors when using per-token scaling.
     // When not provided, it will be Fp32 if usePerTokenSfA and usePerTokenSfB else Bfloat16.
     tg::Dtype mPerTokenSfDtype{tg::Dtype::Void};
@@ -499,6 +543,10 @@ struct GemmOptions
     bool mUseTwoTmaLoadWarps{false};
     // Use two different warps for MMA tasks. Applicable only to DeepSeek FP8.
     bool mUseTwoMmaWarps{false};
+#if TLLM_RUBIN_FEATURES
+    // Use unique scaling factors for A.
+    bool mUseUniqueSfA{false};
+#endif
     // Whether to unroll the loop by 2x.
     bool mUseUnrollLoop2xForMma{true};
     // The valid range of M/N/K dimension of GEMM without padding values.
@@ -625,6 +673,9 @@ inline std::string toString(SchedHostTask e)
     case SchedHostTask::LoadB: return "LoadB";
     case SchedHostTask::LoadSfA: return "LoadSfA";
     case SchedHostTask::LoadSfB: return "LoadSfB";
+#ifdef TLLM_RUBIN_FEATURES
+    case SchedHostTask::Invalidate: return "Invalidate";
+#endif // TLLM_RUBIN_FEATURES
     default: return std::to_string(static_cast<int32_t>(e));
     }
 }
@@ -700,6 +751,21 @@ inline std::string dumpOptions(GemmOptions const& options, bool dumpRuntimeParam
     }
     ss << "mKernelTraits={}"
        << "," << std::endl;
+#if TLLM_RUBIN_FEATURES
+    // Add the internal filter to log. For public releases, it will be filtered out prior to being
+    // written to MetaInfo.h header.
+    ss << "\
+  " << std::endl;
+    ss << "mLamportConsumerA=" << options.mLamportConsumerA << "," << std::endl;
+    ss << "mLamportConsumerB=" << options.mLamportConsumerB << "," << std::endl;
+    ss << "mLamportForceValid=" << options.mLamportForceValid << "," << std::endl;
+    ss << "mLamportProducer=" << options.mLamportProducer << "," << std::endl;
+#ifdef TLLM_TEST
+    ss << "mLamportSeparateInvalidation=" << options.mLamportSeparateInvalidation << "," << std::endl;
+#endif // TLLM_TEST
+    ss << "\
+  " << std::endl;
+#endif
     ss << "mLayoutA=gemm::MatrixLayout(" << static_cast<int32_t>(options.mLayoutA) << ")"
        << "," << std::endl;
     ss << "mLayoutB=gemm::MatrixLayout(" << static_cast<int32_t>(options.mLayoutB) << ")"
@@ -741,6 +807,13 @@ inline std::string dumpOptions(GemmOptions const& options, bool dumpRuntimeParam
     ss << "mNumStagesWorkId=" << options.mNumStagesWorkId << "," << std::endl;
     ss << "mOutputDebugTensors=" << options.mOutputDebugTensors << "," << std::endl;
     ss << "mPatchF2fp=" << options.mPatchF2fp << "," << std::endl;
+#ifdef TLLM_RUBIN_FEATURES
+    ss << "\
+  " << std::endl;
+    ss << "mPatchPzo=" << options.mPatchPzo << "," << std::endl;
+    ss << "\
+  " << std::endl;
+#endif // TLLM_RUBIN_FEATURES
     ss << "mPerTokenSfDtype="
        << "trtllm::gen::Dtype(" << static_cast<int32_t>(options.mPerTokenSfDtype) << ")"
        << "," << std::endl;
@@ -786,6 +859,13 @@ inline std::string dumpOptions(GemmOptions const& options, bool dumpRuntimeParam
     ss << "mUseTmaStore=" << options.mUseTmaStore << "," << std::endl;
     ss << "mUseTwoTmaLoadWarps=" << options.mUseTwoTmaLoadWarps << "," << std::endl;
     ss << "mUseTwoMmaWarps=" << options.mUseTwoMmaWarps << "," << std::endl;
+#ifdef TLLM_RUBIN_FEATURES
+    ss << "\
+  " << std::endl;
+    ss << "mUseUniqueSfA=" << options.mUseUniqueSfA << "," << std::endl;
+    ss << "\
+  " << std::endl;
+#endif // TLLM_RUBIN_FEATURES
     ss << "mUseUnrollLoop2xForMma=" << options.mUseUnrollLoop2xForMma << "," << std::endl;
     if (dumpRuntimeParams)
     {
@@ -1001,6 +1081,13 @@ inline bool checkAndUpdateGemmOptions(
     options.mPatchF2fp = false;
 #endif // TLLM_PUBLIC_RELEASE
 
+#ifdef TLLM_RUBIN_FEATURES
+    if (options.mPatchPzo)
+    {
+        TLLM_CHECK_ERROR(cudaArch == tg::CudaArch::Sm107a, "PatchPzo is only supported on sm_107a.");
+    }
+#endif // TLLM_RUBIN_FEATURES
+
     // FIXME: We do not support different dtypes for A and B when not on Blackwell.
     if (!isBlackwell)
     {
@@ -1175,11 +1262,19 @@ inline bool checkAndUpdateGemmOptions(
     {
         bool isSupported_2_4
             = (options.mMmaKind == tg::MmaKind::Fp8Fp6Fp4 || options.mMmaKind == tg::MmaKind::MxFp8Fp6Fp4);
+#ifdef TLLM_RUBIN_FEATURES
+        // On Rubin, 2:4 sparsity is also supported for MxFp4NvFp4.
+        isSupported_2_4 |= (cudaArch == tg::CudaArch::Sm107a && options.mMmaKind == tg::MmaKind::MxFp4NvFp4);
+#endif
         TLLM_CHECK_ERROR(isSupported_2_4, "2:4 sparsity is not supported for MMA kind ",
             tg::mmaKindToString(options.mMmaKind), " on target ", tg::cudaArchToString(cudaArch));
         break;
     }
     case tg::Sparsity::Pairwise_4_8:
+        // Due to deprecation in Rubin, we only allow this sparsity mode on 100a, 103a.
+        // PTX ISA also forbids mma.sp with kind mxf4nvf4 on 100f for that reason.
+        TLLM_CHECK_ERROR(cudaArch == tg::CudaArch::Sm100a || cudaArch == tg::CudaArch::Sm103a,
+            "Pairwise 4:8 sparsity is only supported on sm_100a and sm_103a.");
         TLLM_CHECK_ERROR(options.mMmaKind == tg::MmaKind::MxFp4NvFp4,
             "Pairwise 4:8 sparsity is only supported for MMA kind MxFp4NvFp4.");
         break;
@@ -1199,11 +1294,27 @@ inline bool checkAndUpdateGemmOptions(
         TLLM_CHECK_ERROR(options.mDtypeA == options.mDtypeMmaA, "Sparsity is not supported with on-the-fly upcasting.");
         TLLM_CHECK_ERROR(!options.mUseDeepSeekFp8, "Sparsity is not supported with DeepSeek Fp8.");
         TLLM_CHECK_ERROR(!options.mSliceK, "Sparsity is not supported with slice-k.");
+#ifdef TLLM_RUBIN_FEATURES
+        // Note: we could probably support Lamport + sparsity, but it is not necessary if we use
+        // sparsity only for weights, and Lamport for activations.
+        TLLM_CHECK_ERROR(!options.mLamportConsumerA, "Sparsity is not supported with Lamport consumer.");
+#endif
     }
 
     if (options.mMmaKind == tg::MmaKind::Fp8Fp6Fp4)
     {
         int mmaK = isSparseA ? 64 : 32;
+#ifdef TLLM_RUBIN_FEATURES
+        if (options.mMmaK == (isSparseA ? 128 : 64))
+        {
+            TLLM_CHECK_ERROR(cudaArch == tg::CudaArch::Sm107a,
+                "MmaK == 64 (/128 sparse) is only supported on SM 107a for ", tg::mmaKindToString(options.mMmaKind));
+            TLLM_CHECK_ERROR(options.mMmaM % 128 == 0,
+                "MmaM must be a multiple of 128 for MmaK == 64 (/128 sparse) and ",
+                tg::mmaKindToString(options.mMmaKind), ". Got mmaM == ", options.mMmaM);
+            mmaK = isSparseA ? 128 : 64;
+        }
+#endif // TLLM_RUBIN_FEATURES
 
         if (options.mMmaK != mmaK)
         {
@@ -1298,11 +1409,43 @@ inline bool checkAndUpdateGemmOptions(
         if (options.mMmaKind == tg::MmaKind::MxFp4NvFp4)
         {
             mmaK = isSparseA ? 128 : 64;
+#ifdef TLLM_RUBIN_FEATURES
+            if (options.mMmaK == 128 && !isSparseA)
+            {
+                TLLM_CHECK_ERROR(cudaArch == tg::CudaArch::Sm107a,
+                    "MmaK == 128 dense is only supported on SM 107a for ", tg::mmaKindToString(options.mMmaKind));
+                // The SF layout for k=128 depends on whether mmaN is <= or > 128. To keep it simple in smem
+                // -> tmem data movement, we don't want to have multiple possible layouts for the same tileN
+                // (i.e. we keep that code agnostic of mmaN for now).
+                TLLM_CHECK_ERROR(
+                    options.mTileN == options.mMmaN, "When mmaK == 128 dense, TileN must be equal to MmaN.");
+                mmaK = 128;
+            }
+#endif // TLLM_RUBIN_FEATURES
             if (options.mMmaK == 96 && !isSparseA)
             {
                 mmaK = 96;
             }
+            // mmaK == 192 with sparsity is introduced in Rubin.
+            if (options.mMmaK == 192 && isSparseA)
+            {
+#ifdef TLLM_RUBIN_FEATURES
+                TLLM_CHECK_ERROR(cudaArch == tg::CudaArch::Sm107a,
+                    "MmaK == 192 sparse is only supported on SM 107a for ", tg::mmaKindToString(options.mMmaKind));
+#endif // TLLM_RUBIN_FEATURES
+                mmaK = 192;
+                TLLM_CHECK_ERROR(options.mTileK == 768, "When mmaK == 192 sparse, only tileK == 768 is supported");
+                TLLM_CHECK_ERROR(options.mTileN <= 128, "When mmaK == 192 sparse, only tileN <= 128 is supported");
+            }
         }
+#ifdef TLLM_RUBIN_FEATURES
+        if (options.mMmaKind == tg::MmaKind::MxFp8Fp6Fp4 && options.mMmaK == (isSparseA ? 128 : 64))
+        {
+            TLLM_CHECK_ERROR(cudaArch == tg::CudaArch::Sm107a,
+                "MmaK == 64 (/128 sparse) is only supported on SM 107a for ", tg::mmaKindToString(options.mMmaKind));
+            mmaK = isSparseA ? 128 : 64;
+        }
+#endif // TLLM_RUBIN_FEATURES
         if (options.mMmaK != mmaK)
         {
             int newTileK = mmaK * divUp(options.mTileK, mmaK);
@@ -1427,9 +1570,26 @@ inline bool checkAndUpdateGemmOptions(
         GEMM_UPDATE_OR_ERROR(options.mSfBlockSizeC, -1);
     }
 
+#ifdef TLLM_RUBIN_FEATURES
+    if (options.mUseUniqueSfA)
+    {
+        TLLM_CHECK_ERROR(options.mSfLayoutA == tg::SfLayout::R128c16, "useUniqueSfA requires sfLayoutA 128x16.");
+    }
+    if (options.mSfLayoutA == tg::SfLayout::R128c16)
+    {
+        TLLM_CHECK_ERROR(options.mUseUniqueSfA, "sfLayoutA 128x16 is only supported with useUniqueSfA.");
+    }
+#endif
+
     if (tg::dtypeIsBlockFmt(options.mDtypeA))
     {
         int sfATileK = 4;
+#ifdef TLLM_RUBIN_FEATURES
+        if (options.mSfLayoutA == tg::SfLayout::R128c16)
+        {
+            sfATileK = 16;
+        }
+#endif
         int numEltsPerSfA = options.mSfBlockSizeA;
         TLLM_CHECK_ERROR(options.mTileK % (sfATileK * numEltsPerSfA) == 0, "TileK (", options.mTileK,
             ") must be a multiple of ", (sfATileK * numEltsPerSfA), " for numEltsPerSfA=", numEltsPerSfA,
@@ -1470,6 +1630,14 @@ inline bool checkAndUpdateGemmOptions(
         {
             padMultiplierB = 2;
         }
+#ifdef TLLM_RUBIN_FEATURES
+        // No padding with 2x mmaK.
+        if ((!isSparseA && options.mMmaK == 64) || (isSparseA && options.mMmaK == 128))
+        {
+            padMultiplierA = 1;
+            padMultiplierB = 1;
+        }
+#endif // TLLM_RUBIN_FEATURES
     }
     TLLM_CHECK_ERROR((padMultiplierA * tg::dtypeGetNumBits(options.mDtypeA) * options.mK / 8) % 16 == 0,
         "K dimension of A must be aligned to 16 bytes.");
@@ -2130,7 +2298,10 @@ inline bool checkAndUpdateGemmOptions(
         }
         else
         {
-            TLLM_CHECK_ERROR(false, "Persistent scheduler and !UseCustomMmaSchedule is not supported.");
+            TLLM_CHECK_ERROR(false,
+                "Persistent scheduler and !UseCustomMmaSchedule is not supported."
+                "This avoids race between TMEM consumer (epilogue) and producer (mma). "
+                "DsFp8 reads early from TMEM before releasing TMEM so it is not affected.)");
         }
     }
 
@@ -2317,6 +2488,59 @@ inline bool checkAndUpdateGemmOptions(
             "TileN must be a multiple of EpilogueTileN * numEpilogueWrpGrps");
     }
 
+#ifdef TLLM_RUBIN_FEATURES
+    if (options.mLamportConsumerA)
+    {
+        // TODO This should be easy to enable, just need to modify the consumer arrival count.
+        TLLM_CHECK_ERROR(options.mDtypeA == options.mDtypeMmaA, "Lamport pipeline does not support casting");
+        TLLM_CHECK_ERROR(!options.mUseDeepSeekFp8, "Lamport Consumer does not support DeepSeek FP8 format");
+        TLLM_CHECK_ERROR(padMultiplierA == 1,
+            "Lamport consumer does not support bit padding for dtypeA=", tg::dtypeToString(options.mDtypeA));
+    }
+    if (options.mLamportConsumerB)
+    {
+        TLLM_CHECK_ERROR(options.mDtypeB == options.mDtypeMmaB, "Lamport pipeline does not support casting");
+        TLLM_CHECK_ERROR(!options.mUseDeepSeekFp8, "Lamport Consumer does not support DeepSeek FP8 format");
+        TLLM_CHECK_ERROR(padMultiplierB == 1,
+            "Lamport consumer does not support bit padding for dtypeB=", tg::dtypeToString(options.mDtypeB));
+    }
+    if (options.mLamportConsumerA || options.mLamportConsumerB)
+    {
+        TLLM_CHECK_ERROR(
+            options.mUseTwoTmaLoadWarps, "Separate load warps must be used when Lamport pipeline is enabled");
+
+        TLLM_CHECK_ERROR(!options.mGridWaitForPrimaryEarlyExit, "Lamport consumer should not wait for primary");
+
+        // TODO Need to test this, might need to modify the consumer arrival count.
+        TLLM_CHECK_ERROR(!options.mSliceK, "SliceK is not compatible with Lamport pipeline");
+
+        // TODO Update the Lamport pipeline to use CGA barriers. Note, the SplitK implementation does
+        // not use CGA barriers within the DMA pipelines, so that feature is enabled.
+        TLLM_CHECK_ERROR(options.mClusterDimX == 1 && options.mClusterDimY == 1,
+            "Lamport pipeline does not support 2 CTA mode or features requiring CGA "
+            "barriers in DMA pipeline");
+    }
+    if (options.mLamportForceValid)
+    {
+        TLLM_CHECK_ERROR(options.mDtypeC != tg::Dtype::Fp32, "LamportForceValid is not implemented for Fp32 output");
+        TLLM_CHECK_ERROR(!options.mUseDeepSeekFp8, "LamportForceValid is not implemented for DeepSeekFp8");
+    }
+    if (options.mLamportProducer)
+    {
+        TLLM_CHECK_ERROR(options.mUseTmaStore, "Lamport producer requires Tma store");
+        TLLM_CHECK_ERROR(options.mLamportForceValid, "Lamport producer should always force valid values");
+        TLLM_CHECK_ERROR(!options.mGridTriggerSecondaryA, "Lamport producer cannot trigger secondary in A");
+        TLLM_CHECK_ERROR(!options.mGridTriggerSecondaryB, "Lamport producer cannot trigger secondary in B");
+        TLLM_CHECK_ERROR(!options.mUseDeepSeekFp8, "Lamport producer is not implemented for DeepSeekFp8");
+    }
+#ifdef TLLM_TEST
+    if (options.mLamportSeparateInvalidation)
+    {
+        TLLM_CHECK_ERROR(options.mLamportProducer, "LamportSeparateInvalidation requires LamportProducer");
+    }
+#endif // TLLM_TEST
+#endif // TLLM_RUBIN_FEATURES
+
     if (updateOptions)
     {
         // Init kernel traits.
@@ -2333,7 +2557,12 @@ inline bool checkAndUpdateGemmOptions(
             options.mAllReduceAlgo, options.mFuseUtccpWithUtcmma, options.mUseMaxTmemOverlap,
             options.mUseCustomizedMma3xNvFp4, options.mNumEpilogueWarps, isPersistentScheduler(options.mTileScheduler),
             options.mUseDeepSeekFp8, options.mUsePerTokenSfA, options.mUsePerTokenSfB,
-            /* useTwoCtas*/ options.mClusterDimX >= 2, options.mBiasType, options.mFusedBiasShuffleMode);
+            /* useTwoCtas*/ options.mClusterDimX >= 2, options.mBiasType, options.mFusedBiasShuffleMode
+#ifdef TLLM_RUBIN_FEATURES
+            ,
+            options.mLamportProducer, options.mUseUniqueSfA
+#endif // TLLM_RUBIN_FEATURES
+        );
     }
 
     return true;
@@ -2387,8 +2616,8 @@ inline CUresult loadCubinData(CUmodule* module, Config const& config)
     // Trtllm links the cubin into the executable while Flashinfer loads the cubin from storage.
 #ifdef TLLM_GEN_EXPORT_FLASHINFER
 #ifdef TLLM_GEN_GEMM_CUBIN_PATH
-    static const std::string tllm_gen_gemm_cubin_path = std::string(TLLM_GEN_GEMM_CUBIN_PATH);
-    const std::string sha256 = config.mHash ? config.mHash : "";
+    static std::string const tllm_gen_gemm_cubin_path = std::string(TLLM_GEN_GEMM_CUBIN_PATH);
+    std::string const sha256 = config.mHash ? config.mHash : "";
     std::string fileName = config.mFunctionName;
     if (!fileName.empty())
     {
