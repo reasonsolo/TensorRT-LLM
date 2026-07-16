@@ -63,6 +63,7 @@ X86_64_DOCKER_IMAGE = LLM_DOCKER_IMAGE.replace("aarch64", "x86_64").replace("sbs
 LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = env.wheelDockerImagePy310
 LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = env.wheelDockerImagePy312
 LLM_WHEEL_DOCKER_IMAGE = env.wheelDockerImage
+LLM_RUBIN_DOCKER_IMAGE = env.rubinDockerImage
 
 // DLFW torch image
 DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:26.05-py3"
@@ -92,12 +93,20 @@ def LLVM_CONFIG = "LLVM"
 def LINUX_AARCH64_CONFIG = "linux_aarch64"
 
 @Field
+def RUBIN_BRINGUP_CUDA13_4_CONFIG = "RubinBringupCUDA13_4"
+
+@Field
+def RUBIN_BRINGUP_CUDA13_4_AARCH64_CONFIG = "RubinBringupCUDA13_4_aarch64"
+
+@Field
 def BUILD_CONFIGS = [
   // Vanilla TARNAME is used for packaging in runLLMPackage
   (VANILLA_CONFIG) : [(TARNAME) : "TensorRT-LLM.tar.gz"],
   (SINGLE_DEVICE_CONFIG) : [(TARNAME) : "single-device-TensorRT-LLM.tar.gz"],
   (LLVM_CONFIG) : [(TARNAME) : "llvm-TensorRT-LLM.tar.gz"],
   (LINUX_AARCH64_CONFIG) : [(TARNAME) : "TensorRT-LLM-GH200.tar.gz"],
+  (RUBIN_BRINGUP_CUDA13_4_CONFIG) : [(TARNAME) : "RubinBringup-TensorRT-LLM-CUDA13.4.tar.gz"],
+  (RUBIN_BRINGUP_CUDA13_4_AARCH64_CONFIG) : [(TARNAME) : "RubinBringup-TensorRT-LLM-VR200-CUDA13.4.tar.gz"],
 ]
 
 // TODO: Move common variables to an unified location
@@ -128,7 +137,7 @@ RELEASE_SCRIPT_COMMIT = env.releaseScriptCommit ? env.releaseScriptCommit.trim()
 REQUIRED_OPEN_DRIVER_TYPES = ["b100-ts2", "rtx-5080", "rtx-5090", "rtx-pro-6000", "rtx-pro-6000d"]
 
 // GPU types that don't support dynamic driver flashing
-REQUIRED_NO_DRIVER_TYPES = ["dgx-h100", "dgx-h200", "gh200", "gb10x"]
+REQUIRED_NO_DRIVER_TYPES = ["dgx-h100", "dgx-h200", "gh200", "gb10x", "gr100-ts1"]
 
 // Maximum SLURM infra-failure retries (total attempts = SLURM_INFRA_RETRY_MAX + 1).
 // Recognised failure patterns are tagged with scope=SLURM or BOTH in the
@@ -934,6 +943,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
 
     def slurmJobID = null
     def dockerArgs = null
+    def dockerImage = stageName.contains("VR200-PyTorch-Post-Merge-1") ? LLM_RUBIN_DOCKER_IMAGE : X86_64_DOCKER_IMAGE
 
     try {
         // Run ssh command to start node in desired cluster via SLURM
@@ -949,8 +959,8 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
 
                 Utils.exec(pipeline, script: "echo Sleeping before Slurm job submission; sleep \$((RANDOM % 29 + 1))")
 
-                def mounts = getMountListForSlurmTest(cluster, false).join(",")
-                def slurmCommand = SlurmConfig.generateCommand(cluster, partition, nodeSecret, nodeName, Jenkins.instance.rootUrl, LLM_DOCKER_IMAGE, mounts)
+                def mounts = getMountListForSlurmTest(cluster, false, stageName).join(",")
+                def slurmCommand = SlurmConfig.generateCommand(cluster, partition, nodeSecret, nodeName, Jenkins.instance.rootUrl, dockerImage, mounts)
                 def clusterExcludes = placementContext?.excludedSlurmNodeListsByCluster?.get(partition.clusterName)
                 def slurmCommandWithExclusion = trtllm_utils.addSlurmExcludeToCommand(slurmCommand, clusterExcludes)
                 def slurmExcludeArg = trtllm_utils.buildSlurmExcludeArg(clusterExcludes)
@@ -1138,7 +1148,9 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                                 dockerArgs += " --device=/dev/gdrdrv:/dev/gdrdrv"
                             }
                         }
-                        if (fileExists('/home/scratch.trt_llm_data_ci')) {
+                        if (stageName.contains("VR200") && fileExists('/mnt/cifs/home/scratch.trt_llm_data')) {
+                            dockerArgs += " -v /mnt/cifs/home/scratch.trt_llm_data:/scratch.trt_llm_data:ro "
+                        } else if (fileExists('/home/scratch.trt_llm_data_ci')) {
                             dockerArgs += " -v /home/scratch.trt_llm_data_ci:/scratch.trt_llm_data:ro "
                         } else if (fileExists('/home/scratch.trt_llm_data')) {
                             dockerArgs += " -v /home/scratch.trt_llm_data:/scratch.trt_llm_data:ro "
@@ -1181,7 +1193,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
         echo "${stageName} Slurm partition timeout: ${partition.time}"
         def partitionTimeout = partition?.time ? partition.time : SlurmConfig.DEFAULT_TIMEOUT_SHORT
         if (cluster.containerRuntime.toString() == "DOCKER") {
-            slurmRunner = runInDockerOnNodeMultiStage(LLM_DOCKER_IMAGE, nodeName, dockerArgs, partitionTimeout, true)
+            slurmRunner = runInDockerOnNodeMultiStage(dockerImage, nodeName, dockerArgs, partitionTimeout, true)
         } else if (cluster.containerRuntime.toString() == "ENROOT") {
             slurmRunner = runInEnrootOnNode(nodeName, partitionTimeout)
         } else {
@@ -1404,7 +1416,7 @@ def getPytestBaseCommandLine(
     return testCmdLine as String[]
 }
 
-def getMountListForSlurmTest(SlurmCluster cluster, boolean useSbatch = false)
+def getMountListForSlurmTest(SlurmCluster cluster, boolean useSbatch = false, String stageName = "")
 {
     def mounts = []
 
@@ -1655,7 +1667,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
                 // Generate Job Launch Script
                 def container = LLM_DOCKER_IMAGE.replace("urm.nvidia.com/", "urm.nvidia.com#")
-                def mounts = getMountListForSlurmTest(cluster, true).join(",")
+                def mounts = getMountListForSlurmTest(cluster, true, stageName).join(",")
                 String[] taskArgs = getNodeArgs(nodeCount, gpuCount, disaggMultiNodeMode)
                 if (taskArgs == null) {
                     error "Invalid Slurm test stage name is set"
@@ -4077,6 +4089,8 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         // setup HF_HOME to cache model and datasets
         // init the huggingface cache from nfs, since the nfs is read-only, and HF_HOME needs to be writable, otherwise it will fail at creating file lock
         sh "mkdir -p ${HF_HOME} && ls -alh ${HF_HOME}"
+        // ensure rsync is available, some container images don't ship it by default
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "command -v rsync || (apt-get update && apt-get install -y rsync)")
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "rsync -r ${MODEL_CACHE_DIR}/hugging-face-cache/ ${HF_HOME}/ && ls -lh ${HF_HOME}")
         sh "df -h"
 
@@ -4099,6 +4113,11 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             if (env.alternativeTRT) {
                 sh "cd ${llmSrc} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
             }
+            // Remove stale nvidia-cutlass-dsl to prevent namespace directory corruption
+            // when pip installs the version pinned in requirements.txt. Necessary because
+            // flashinfer 0.6.12+ imports cutlass unconditionally at module level.
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 uninstall -y nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base || true")
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: 'rm -rf $(python3 -c "import site; print(site.getsitepackages()[0])")/nvidia_cutlass_dsl*')
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-dev.txt")
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install opencv-python-headless")
             if (stageName.contains("-Ray-")) {
@@ -5132,16 +5151,23 @@ def launchTestJobs(pipeline, testFilter)
         "RTXPro6000D-PyTorch-Post-Merge-1": ["rtx-pro-6000d", "l0_rtx_pro_6000", 1, 1],
         "RTXPro6000D-4_GPUs-PyTorch-Post-Merge-1": ["rtx-pro-6000d-x4", "l0_rtx_pro_6000", 1, 2, 4],
         "RTXPro6000D-4_GPUs-PyTorch-Post-Merge-2": ["rtx-pro-6000d-x4", "l0_rtx_pro_6000", 2, 2, 4],
+        // GR100 (gr100-ts1) single-GPU post-merge stage on a Blossom k8s pod.
+        "GR100-PyTorch-Post-Merge-1": ["gr100-ts1", "l0_gr100", 1, 1],
     ]
 
     x86TestConfigs = cbtsResizeSplits(x86TestConfigs)
-    parallelJobs = x86TestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, key.contains("-Perf-")), { attemptTag, isFinalAttempt, retryContext = null ->
+    parallelJobs = x86TestConfigs.collectEntries{key, values ->
+        def dockerImage = key.contains("GR100-PyTorch-Post-Merge-1") ? LLM_RUBIN_DOCKER_IMAGE : X86_64_DOCKER_IMAGE
+        [key, [createKubernetesPodConfig(dockerImage, values[0], "amd64", values[4] ?: 1, key.contains("-Perf-")), { attemptTag, isFinalAttempt, retryContext = null ->
         def config = VANILLA_CONFIG
         if (key.contains("single-device")) {
             config = SINGLE_DEVICE_CONFIG
         }
         if (key.contains("llvm")) {
             config = LLVM_CONFIG
+        }
+        if (key.contains("GR100")) {
+            config = RUBIN_BRINGUP_CUDA13_4_CONFIG
         }
         runLLMTestlistOnPlatform(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], false, "cp312", attemptTag, false, isFinalAttempt, retryContext)
     }]]}
@@ -5287,6 +5313,8 @@ def launchTestJobs(pipeline, testFilter)
         "GB200-4_GPUs-PyTorch-Post-Merge-1": ["auto:gb200-x4", "l0_gb200_multi_gpus", 1, 1, 4, 1, false, true],
         "GB10-PyTorch-Post-Merge-1": ["gb10x-single", "l0_gb10", 1, 1],
         "GB300-PyTorch-1": ["auto:gb300-x4", "l0_gb300", 1, 1],
+        // VR200 = Vera Rubin NVL72 (Vera aarch64 CPU + Rubin GPU), single GPU on dlcluster preprod CI partition.
+        "VR200-PyTorch-Post-Merge-1": ["auto:vr200-x1", "l0_vr200", 1, 1],
         "GB300-4_GPUs-PyTorch-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus", 1, 3, 4],
         "GB300-4_GPUs-PyTorch-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus", 2, 3, 4],
         "GB300-4_GPUs-PyTorch-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus", 3, 3, 4],
@@ -5528,7 +5556,9 @@ def launchTestJobs(pipeline, testFilter)
         // singleAttempt:true disables the outer K8s pod retry; see the x86
         // SLURM closure above for the full rationale (cap nested retry budget
         // so consistently-timing-out tests don't burn ~36h on retry cascades).
-        parallelSlurmJobs = SBSASlurmTestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(X86_64_DOCKER_IMAGE, "slurm", "amd64"), { attemptTag, isFinalAttempt, retryContext = null ->
+        parallelSlurmJobs = SBSASlurmTestConfigs.collectEntries{key, values ->
+            def dockerImage = key.contains("VR200-PyTorch-Post-Merge-1") ? LLM_RUBIN_DOCKER_IMAGE : X86_64_DOCKER_IMAGE
+            [key, [createKubernetesPodConfig(dockerImage, "slurm", "amd64"), { attemptTag, isFinalAttempt, retryContext = null ->
             // attemptTag is threaded into runLLMTestlistOnSlurm as the outer
             // dispatcher pod's tag so the inner SLURM retry's postTag can't
             // collide with a previous dispatcher pod's upload. See the x86
@@ -5539,6 +5569,9 @@ def launchTestJobs(pipeline, testFilter)
             }
             if (key.contains("llvm")) {
                 config = LLVM_CONFIG
+            }
+            if (key.contains("VR200-PyTorch-Post-Merge-1")) {
+                config = RUBIN_BRINGUP_CUDA13_4_AARCH64_CONFIG
             }
             runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false, false, "cp312", attemptTag, values[7] ?: false, retryContext?.infraRetryMax)
         }, [singleAttempt: true, slurmDispatcher: true]]]}
@@ -5962,6 +5995,8 @@ def launchTestJobs(pipeline, testFilter)
             echo "CBTS [${cbts.scope}]: empty stage set after filtering"
         }
     }
+    // Specific for the Rubin bring-up feature branch
+    parallelJobsFiltered = parallelJobsFiltered.findAll { key, values -> ((key.contains("B200_PCIe") || key.contains("H100_PCIe-PyTorch-Ray") || key.contains("H100_PCIe-AutoDseploy")) && !key.contains("Post-Merge") && !key.contains("PackageSanityCheck")) || key.contains("GR100") || key.contains("VR200") }
 
     echo "Check the passed GitLab bot testFilter parameters."
     def keysStr = parallelJobsFiltered.keySet().join(",\n")

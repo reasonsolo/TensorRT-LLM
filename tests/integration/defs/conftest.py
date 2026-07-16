@@ -1585,7 +1585,7 @@ def get_sm_version():
 def is_sm_100f(sm_version=None):
     if sm_version is None:
         sm_version = get_sm_version()
-    return sm_version == 100 or sm_version == 103
+    return sm_version >= 100 and sm_version < 110
 
 
 def get_gpu_device_list():
@@ -1641,9 +1641,19 @@ skip_post_blackwell = pytest.mark.skipif(
     reason="This test is not supported in post-Blackwell architecture",
 )
 
+skip_no_rubin = pytest.mark.skipif(
+    get_sm_version() != 107,
+    reason="This test is only supported in Rubin architecture",
+)
+
 skip_post_blackwell_ultra = pytest.mark.skipif(
     get_sm_version() >= 103,
     reason="This test is not supported in post-Blackwell-Ultra architecture",
+)
+
+skip_pre_rubin = pytest.mark.skipif(
+    get_sm_version() < 107,
+    reason="This test is not supported in pre-Rubin architecture",
 )
 
 skip_device_contain_gb200 = pytest.mark.skipif(
@@ -1877,6 +1887,20 @@ def pytest_addoption(parser):
         "This helps identify which test was running when a timeout or crash occurs. "
         "Only used with --periodic-junit.",
     )
+    parser.addoption(
+        "--nvfp4-gemm-backend",
+        action="store",
+        default=None,
+        help=
+        "Override the NVFP4 GEMM backend for tests. Valid values: 'cutedsl', None. "
+        "When not specified, tests use their default behavior.",
+    )
+
+
+@pytest.fixture
+def nvfp4_gemm_backend(request):
+    """Fixture that provides nvfp4_gemm_backend value from command line or default."""
+    return request.config.getoption("--nvfp4-gemm-backend")
 
 
 @pytest.hookimpl(trylast=True)

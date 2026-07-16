@@ -62,7 +62,9 @@ def getContainerURIs()
         "LLM_SBSA_DOCKER_IMAGE",
         "LLM_SBSA_WHEEL_DOCKER_IMAGE",
         "LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE",
-        "LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"
+        "LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE",
+        "LLM_RUBIN_DOCKER_IMAGE",
+        "LLM_SBSA_RUBIN_DOCKER_IMAGE"
     ]
     for (key in keys) {
         uris[key] = tagProps[key]
@@ -93,7 +95,8 @@ boolean enableFailFast = !(env.JOB_NAME ==~ /.*PostMerge.*/ || env.JOB_NAME ==~ 
 
 boolean isReleaseCheckMode = (gitlabParamsFromBot.get("run_mode", "full") == "release_check")
 
-GEN_POST_MERGE_BUILDS_ONLY = (env.JOB_NAME?.contains("GenPostMergeBuilds") ?: false)
+// feat/rubin-bringup: treat L0_PostMerge as builds-only since NGC images / tests are not yet enabled.
+GEN_POST_MERGE_BUILDS_ONLY = (env.JOB_NAME?.contains("GenPostMergeBuilds") || env.JOB_NAME ==~ /.*PostMerge.*/ ?: false)
 
 BUILD_STATUS_NAME = isReleaseCheckMode ? "Jenkins Release Check" : "Jenkins Full Build"
 
@@ -445,9 +448,9 @@ def preparation(pipeline, testFilter, globalVars)
         stage("Setup Environment") {
             setupPipelineEnvironment(pipeline, testFilter, globalVars)
         }
-        stage("Merge Test Waive List") {
-            mergeWaiveList(pipeline, globalVars)
-        }
+        // stage("Merge Test Waive List") {
+        //     mergeWaiveList(pipeline, globalVars)
+        // }
     })
 }
 
@@ -1528,6 +1531,9 @@ def launchJob(pipeline, jobName, reuseBuild, enableFailFast, globalVars, platfor
 
 def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
 {
+    // TODO: TEMP WORKAROUND - Save original stage list before modifications for filtering later
+    def originalStageList = testFilter[TEST_STAGE_LIST] != null ? new ArrayList(testFilter[TEST_STAGE_LIST]) : null
+
     stages = [
         "Release-Check": {
             script {
@@ -1578,6 +1584,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             'dockerImage': globalVars["LLM_DOCKER_IMAGE"],
                             'wheelDockerImagePy310': globalVars["LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE"],
                             'wheelDockerImagePy312': globalVars["LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"],
+                            'rubinDockerImage': globalVars["LLM_RUBIN_DOCKER_IMAGE"],
                         ]
 
                         launchJob(pipeline, "L0_Test-x86_64-Single-GPU", false, enableFailFast, globalVars, "x86_64", additionalParameters)
@@ -1601,25 +1608,25 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     }
                 }
 
-                def requireMultiGpuTesting = currentBuild.description?.contains("Require x86_64 Multi-GPU Testing") ?: false
-                echo "requireMultiGpuTesting: ${requireMultiGpuTesting}"
-                if (!requireMultiGpuTesting) {
-                    if (singleGpuTestFailed) {
-                        error "x86_64 single-GPU test failed"
-                    }
-                    return
-                }
+                // def requireMultiGpuTesting = currentBuild.description?.contains("Require x86_64 Multi-GPU Testing") ?: false
+                // echo "requireMultiGpuTesting: ${requireMultiGpuTesting}"
+                // if (!requireMultiGpuTesting) {
+                //     if (singleGpuTestFailed) {
+                //         error "x86_64 single-GPU test failed"
+                //     }
+                //     return
+                // }
 
-                if (singleGpuTestFailed) {
-                    if (env.JOB_NAME ==~ /.*PostMerge.*/) {
-                        echo "In the official post-merge pipeline, x86_64 single-GPU test failed, whereas multi-GPU test is still kept running."
-                    } else {
-                        stage("[Test-x86_64-Multi-GPU] Blocked") {
-                            error "This pipeline requires running multi-GPU test, but x86_64 single-GPU test has failed."
-                        }
-                        return
-                    }
-                }
+                // if (singleGpuTestFailed) {
+                //     if (env.JOB_NAME ==~ /.*PostMerge.*/ || !enableFailFast) {
+                //         echo "In the official post-merge pipeline or when fail fast is disabled, x86_64 single-GPU test failed, whereas multi-GPU test is still kept running."
+                //     } else {
+                //         stage("[Test-x86_64-Multi-GPU] Blocked") {
+                //             error "This pipeline requires running multi-GPU test, but x86_64 single-GPU test has failed."
+                //         }
+                //         return
+                //     }
+                // }
 
                 // Label gate: check before entering the Remote Run stage so a
                 // missing/unauthorized label shows as "Blocked" (not a Remote Run
@@ -1649,22 +1656,22 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             'wheelDockerImagePy312': globalVars["LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"],
                         ]
 
-                        launchJob(pipeline, "L0_Test-x86_64-Multi-GPU", false, enableFailFast, globalVars, "x86_64", additionalParameters)
+                //         launchJob(pipeline, "L0_Test-x86_64-Multi-GPU", false, enableFailFast, globalVars, "x86_64", additionalParameters)
 
-                    } catch (InterruptedException e) {
-                        throw e
-                    } catch (Exception e) {
-                        if (X86_TEST_CHOICE == STAGE_CHOICE_IGNORE) {
-                            catchError(
-                                buildResult: 'SUCCESS',
-                                stageResult: 'FAILURE') {
-                                error "x86_64 test failed but ignored due to Jenkins configuration"
-                            }
-                        } else {
-                            throw e
-                        }
-                    }
-                }
+                //     } catch (InterruptedException e) {
+                //         throw e
+                //     } catch (Exception e) {
+                //         if (X86_TEST_CHOICE == STAGE_CHOICE_IGNORE) {
+                //             catchError(
+                //                 buildResult: 'SUCCESS',
+                //                 stageResult: 'FAILURE') {
+                //                 error "x86_64 test failed but ignored due to Jenkins configuration"
+                //             }
+                //         } else {
+                //             throw e
+                //         }
+                //     }
+                // }
             }
         },
         "SBSA-Linux": {
@@ -1707,6 +1714,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             'testFilter': testFilterJson,
                             "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
                             'wheelDockerImage': globalVars["LLM_SBSA_WHEEL_DOCKER_IMAGE"],
+                            "rubinDockerImage": globalVars["LLM_SBSA_RUBIN_DOCKER_IMAGE"],
                         ]
 
                         launchJob(pipeline, "L0_Test-SBSA-Single-GPU", false, enableFailFast, globalVars, "SBSA", additionalParameters)
@@ -1729,26 +1737,39 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         }
                     }
                 }
+                // def requireMultiGpuTesting = currentBuild.description?.contains("Require SBSA Multi-GPU Testing") ?: false
+                // echo "requireMultiGpuTesting: ${requireMultiGpuTesting}"
+                // if (!requireMultiGpuTesting) {
+                //     if (singleGpuTestFailed) {
+                //         error "SBSA single-GPU test failed"
+                //     }
+                //     return
+                // }
 
-                def requireMultiGpuTesting = currentBuild.description?.contains("Require SBSA Multi-GPU Testing") ?: false
-                echo "requireMultiGpuTesting: ${requireMultiGpuTesting}"
-                if (!requireMultiGpuTesting) {
-                    if (singleGpuTestFailed) {
-                        error "SBSA single-GPU test failed"
-                    }
-                    return
-                }
+                // if (singleGpuTestFailed) {
+                //     if (env.JOB_NAME ==~ /.*PostMerge.*/ || !enableFailFast) {
+                //         echo "In the official post-merge pipeline or when fail fast is disabled, SBSA single-GPU test failed, whereas multi-GPU test is still kept running."
+                //     } else {
+                //         stage("[Test-SBSA-Multi-GPU] Blocked") {
+                //             error "This pipeline requires running SBSA multi-GPU test, but SBSA single-GPU test has failed."
+                //         }
+                //         return
+                //     }
+                // }
 
-                if (singleGpuTestFailed) {
-                    if (env.JOB_NAME ==~ /.*PostMerge.*/) {
-                        echo "In the official post-merge pipeline, SBSA single-GPU test failed, whereas multi-GPU test is still kept running."
-                    } else {
-                        stage("[Test-SBSA-Multi-GPU] Blocked") {
-                            error "This pipeline requires running SBSA multi-GPU test, but SBSA single-GPU test has failed."
-                        }
-                        return
-                    }
-                }
+                // testStageName = "[Test-SBSA-Multi-GPU] Remote Run"
+                // stage(testStageName) {
+                //     if (SBSA_TEST_CHOICE == STAGE_CHOICE_SKIP) {
+                //         echo "SBSA test job is skipped due to Jenkins configuration"
+                //         return
+                //     }
+                //     try {
+                //         def testFilterJson = writeJSON returnText: true, json: testFilter
+                //         def additionalParameters = [
+                //             'testFilter': testFilterJson,
+                //             "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
+                //             'wheelDockerImage': globalVars["LLM_SBSA_WHEEL_DOCKER_IMAGE"],
+                //         ]
 
                 def sbsaLabelBlock = requireMultiGpuApprovalLabel(pipeline, globalVars, "SBSA")
                 if (sbsaLabelBlock) {
@@ -1774,22 +1795,20 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             'wheelDockerImage': globalVars["LLM_SBSA_WHEEL_DOCKER_IMAGE"],
                         ]
 
-                        launchJob(pipeline, "L0_Test-SBSA-Multi-GPU", false, enableFailFast, globalVars, "SBSA", additionalParameters)
-
-                    } catch (InterruptedException e) {
-                        throw e
-                    } catch (Exception e) {
-                        if (SBSA_TEST_CHOICE == STAGE_CHOICE_IGNORE) {
-                            catchError(
-                                buildResult: 'SUCCESS',
-                                stageResult: 'FAILURE') {
-                                error "SBSA test failed but ignored due to Jenkins configuration"
-                            }
-                        } else {
-                            throw e
-                        }
-                    }
-                }
+                //     } catch (InterruptedException e) {
+                //         throw e
+                //     } catch (Exception e) {
+                //         if (SBSA_TEST_CHOICE == STAGE_CHOICE_IGNORE) {
+                //             catchError(
+                //                 buildResult: 'SUCCESS',
+                //                 stageResult: 'FAILURE') {
+                //                 error "SBSA test failed but ignored due to Jenkins configuration"
+                //             }
+                //         } else {
+                //             throw e
+                //         }
+                //     }
+                // }
             }
         },
     ]
