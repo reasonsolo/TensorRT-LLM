@@ -327,6 +327,7 @@ class TRTLLMOpBackend(MoEOpBackend):
         output=None,
         tune_max_num_tokens=8192,
         use_dp=False,
+        use_lamport=False,
     ):
         hidden_size = gemm1_weights.shape[-1] * 2
         if hidden_states.dtype == torch.uint8 or hidden_states.dtype == torch.float8_e4m3fn:
@@ -370,6 +371,7 @@ class TRTLLMOpBackend(MoEOpBackend):
                     output=output,
                     tune_max_num_tokens=tune_max_num_tokens,
                     use_dp=use_dp,
+                    use_lamport=use_lamport,
                 )
                 if not do_finalize:
                     return outputs

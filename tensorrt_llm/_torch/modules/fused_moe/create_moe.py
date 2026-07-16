@@ -105,9 +105,25 @@ def get_moe_cls(
                             sm_version,
                         )
             return CuteDslFusedMoE
+        elif quant_config is None or not quant_config.quant_mode.has_any_quant(
+                exclude_kv_cache=True):
+            # Unquantized BF16 on Rubin (SM107)
+            from tensorrt_llm._utils import get_sm_version as _get_sm_version
+
+            from ...cute_dsl_utils import IS_CUTLASS_DSL_INTERNAL_AVAILABLE
+            _sm = _get_sm_version()
+            if _sm == 107 and IS_CUTLASS_DSL_INTERNAL_AVAILABLE:
+                return CuteDslFusedMoE
+            else:
+                logger.warning(
+                    "CuteDslFusedMoE unquantized mode requires SM107 (Rubin) "
+                    f"with CuTE DSL internal. Got SM{_sm}. "
+                    "Using CutlassFusedMoE instead.")
+                return CutlassFusedMoE
         else:
             logger.warning(
-                f"{layer_prefix}CuteDslFusedMoE only supports fp8_block_scales and nvfp4. "
+                f"{layer_prefix}CuteDslFusedMoE only supports fp8_block_scales and nvfp4, "
+                "and unquantized BF16 (SM107). "
                 f"Check out details in quant_config: {quant_config}. Using CutlassFusedMoE instead."
             )
             return CutlassFusedMoE
@@ -261,6 +277,7 @@ def create_moe_backend(
     swiglu_limit_scalar: Optional[float] = None,
     init_load_balancer: bool = True,
     activation_type: ActivationType = ActivationType.Swiglu,
+    override_quant_config: Optional[QuantConfig] = None,
 ) -> MoE:
     """
     Create MoE backend instance with validation.
@@ -444,6 +461,7 @@ def create_moe_backend(
             swiglu_limit_scalar=swiglu_limit_scalar,
             init_load_balancer=init_load_balancer,
             activation_type=activation_type,
+            override_quant_config=override_quant_config,
         )
     elif moe_cls == DeepGemmFusedMoE:
         return moe_cls(
@@ -643,4 +661,5 @@ def create_moe(
         swiglu_limit=swiglu_limit,
         swiglu_limit_scalar=swiglu_limit_scalar,
         activation_type=activation_type,
+        override_quant_config=override_quant_config,
     )

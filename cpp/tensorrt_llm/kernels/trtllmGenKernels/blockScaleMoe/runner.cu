@@ -398,8 +398,8 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
 namespace PermuteGemm1
 {
 
-tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
-    btg::Dtype dtypeAct, btg::Dtype dtypeWeights, int32_t tileTokensDim, bool useDeepSeekFp8, ActType actType)
+tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(btg::Dtype dtypeAct, btg::Dtype dtypeWeights,
+    int32_t tileTokensDim, bool useDeepSeekFp8, ActType actType, bool useLamport = false)
 {
     bool is_gated_activation = actType == ActType::SwiGlu;
     tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions options;
@@ -415,7 +415,12 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
             .routeAct = true,
             .staticBatch = false,
             .tileSize = tileTokensDim,
-            .epilogueTileM = useDeepSeekFp8 ? 64 : 128};
+            .epilogueTileM = useDeepSeekFp8 ? 64 : 128,
+            // PermuteGemm1 is the producer kernel.
+            .lamportConsumerA = false,
+            .lamportConsumerB = false,
+            .lamportForceValid = useLamport,
+            .lamportProducer = useLamport};
     }
     else
     {
@@ -437,17 +442,23 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
             .staticBatch = false,
             .tileSize = tileTokensDim,
             .epilogueTileM = 128,
+            // PermuteGemm1 is the producer kernel.
+            .lamportConsumerA = false,
+            .lamportConsumerB = false,
+            .lamportForceValid = useLamport,
+            .lamportProducer = useLamport,
         };
     }
     return options;
 }
 
-Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, bool useDeepSeekFp8, int tileTokensDim, ActType actType)
+Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, bool useDeepSeekFp8, int tileTokensDim, ActType actType,
+    bool useLamport)
     : mDtypeAct(dtypeAct)
     , mDtypeWeights(dtypeWeights)
     , mTileTokensDim(tileTokensDim)
     , mRunner(tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner(
-          getOptions(mDtypeAct, mDtypeWeights, mTileTokensDim, useDeepSeekFp8, actType)))
+          getOptions(mDtypeAct, mDtypeWeights, mTileTokensDim, useDeepSeekFp8, actType, useLamport)))
     , mActType(actType)
 {
 }
@@ -526,8 +537,8 @@ std::string Runner::getKernelNameFromConfigIndex(int32_t configIndex) const
 
 namespace Gemm2
 {
-tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
-    btg::Dtype dtypeAct, btg::Dtype dtypeWeights, btg::Dtype dtypeOut, int32_t tileTokensDim, bool useDeepSeekFp8)
+tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(btg::Dtype dtypeAct, btg::Dtype dtypeWeights,
+    btg::Dtype dtypeOut, int32_t tileTokensDim, bool useDeepSeekFp8, bool useLamport = false)
 {
     tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions options = {.dtypeA = dtypeAct,
         .dtypeB = dtypeWeights,
@@ -538,18 +549,23 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
         .routeAct = false,
         .staticBatch = false,
         .tileSize = tileTokensDim,
-        .epilogueTileM = useDeepSeekFp8 ? 64 : 128};
+        .epilogueTileM = useDeepSeekFp8 ? 64 : 128,
+        // Gemm2 is the consumer kernel.
+        .lamportConsumerA = false,
+        .lamportConsumerB = useLamport,
+        .lamportForceValid = false,
+        .lamportProducer = false};
     return options;
 }
 
-Runner::Runner(
-    btg::Dtype dtypeAct, btg::Dtype dtypeWeights, btg::Dtype dtypeOut, bool useDeepSeekFp8, int tileTokensDim)
+Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, btg::Dtype dtypeOut, bool useDeepSeekFp8,
+    int tileTokensDim, bool useLamport)
     : mDtypeAct(dtypeAct)
     , mDtypeWeights(dtypeWeights)
     , mDtypeOut(dtypeOut)
     , mTileTokensDim(tileTokensDim)
     , mRunner(tensorrt_llm::kernels::TrtllmGenBatchedGemmRunner(
-          getOptions(dtypeAct, dtypeWeights, dtypeOut, tileTokensDim, useDeepSeekFp8)))
+          getOptions(dtypeAct, dtypeWeights, dtypeOut, tileTokensDim, useDeepSeekFp8, useLamport)))
 {
 }
 
@@ -617,10 +633,10 @@ std::string Runner::getKernelNameFromConfigIndex(int32_t configIndex) const
 
 namespace MoE
 {
-Runner::Runner(
-    btg::Dtype dtypeAct, btg::Dtype dtypeWeights, bool useDeepSeekFp8, int32_t tileTokensDim, ActType actType)
-    : mPermuteGemm1(PermuteGemm1::Runner(dtypeAct, dtypeWeights, useDeepSeekFp8, tileTokensDim, actType))
-    , mGemm2(Gemm2::Runner(dtypeAct, dtypeWeights, btg::Dtype::Bfloat16, useDeepSeekFp8, tileTokensDim))
+Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, bool useDeepSeekFp8, int32_t tileTokensDim,
+    ActType actType, bool useLamport)
+    : mPermuteGemm1(PermuteGemm1::Runner(dtypeAct, dtypeWeights, useDeepSeekFp8, tileTokensDim, actType, useLamport))
+    , mGemm2(Gemm2::Runner(dtypeAct, dtypeWeights, btg::Dtype::Bfloat16, useDeepSeekFp8, tileTokensDim, useLamport))
     , mActType(actType)
 {
     auto const& gemm1PassingIndices = mPermuteGemm1.getPassingConfigIndices();
@@ -640,8 +656,8 @@ Runner::Runner(
     TLLM_CHECK_WITH_INFO(!mPassingConfigs.empty(), "No compatible configs found for the fp8 block scale MoE runner.");
 }
 
-Runner::Runner(btg::Dtype dtypeElt, bool useDeepSeekFp8, int32_t tileTokensDim)
-    : Runner(dtypeElt, dtypeElt, useDeepSeekFp8, tileTokensDim, ActType::SwiGlu)
+Runner::Runner(btg::Dtype dtypeElt, bool useDeepSeekFp8, int32_t tileTokensDim, bool useLamport)
+    : Runner(dtypeElt, dtypeElt, useDeepSeekFp8, tileTokensDim, ActType::SwiGlu, useLamport)
 {
 }
 

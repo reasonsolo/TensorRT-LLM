@@ -121,7 +121,7 @@ class TRTLLMGenFusedMoE(MoE):
         """
         Check if TRTLLMGenFusedMoE can implement the given quantization algorithm.
 
-        TRTLLMGenFusedMoE only supports SM in {100, 103} and the following quantizations:
+        TRTLLMGenFusedMoE only supports SM in {100, 103, 107} and the following quantizations:
         - NVFP4
         - FP8_BLOCK_SCALES
         - W4A8_NVFP4_FP8
@@ -146,10 +146,10 @@ class TRTLLMGenFusedMoE(MoE):
 
         sm_version = get_sm_version()
 
-        # TRTLLMGenFusedMoE requires SM in {100, 103}
-        if sm_version not in {100, 103}:
+        # TRTLLMGenFusedMoE requires SM in {100, 103, 107}
+        if sm_version not in {100, 103, 107}:
             return _warn_and_return(
-                f"TRTLLMGenFusedMoE requires SM100 or SM103, got SM{sm_version}"
+                f"TRTLLMGenFusedMoE requires SM100, SM103 or SM107, got SM{sm_version}"
             )
 
         # Check dtype_activation: only bfloat16 is supported
@@ -224,6 +224,7 @@ class TRTLLMGenFusedMoE(MoE):
             init_load_balancer=init_load_balancer,
             activation_type=activation_type,
         )
+        self.model_config = model_config
 
         # Cached for autotune profile sizing (forward path passes
         # tune_max_num_tokens to the MoE op).
@@ -743,6 +744,7 @@ class TRTLLMGenFusedMoE(MoE):
                 # Pass that to the autotuner so the top bucket profiles per-expert load at runtime scale.
                 tune_max_num_tokens=self.max_num_tokens,
                 use_dp=self.use_dp,
+                use_lamport=self.model_config.use_lamport_sync,
             )
 
             if not do_finalize:
