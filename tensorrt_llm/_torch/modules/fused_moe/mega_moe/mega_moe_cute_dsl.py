@@ -373,7 +373,9 @@ class MegaMoECuteDsl(MoE):
         """
         sm = get_sm_version()
         if not is_sm_100f(sm):
-            return False, (f"MegaMoECuteDsl requires SM100 family (SM100 or SM103); got SM{sm}.")
+            return False, (
+                f"MegaMoECuteDsl requires an SM100-family GPU (SM100-SM109); got SM{sm}."
+            )
         if dtype_activation not in cls._SUPPORTED_ACTIVATION_DTYPES:
             return False, (
                 f"MegaMoECuteDsl supports activations in "
