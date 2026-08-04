@@ -61,6 +61,7 @@ from tensorrt_llm._torch.modules.fused_moe import (
 from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe_backend, get_moe_cls
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_cutlass import CutlassFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_marlin import MarlinFusedMoE
+from tensorrt_llm._torch.modules.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.interface import MoE, MoEWeightLoadingMode
 from tensorrt_llm._torch.modules.fused_moe.mega_moe import MegaMoECuteDsl, MegaMoEDeepGemm
 from tensorrt_llm._torch.modules.fused_moe.quantization import (
@@ -82,6 +83,12 @@ _MEGAMOE_BACKEND_TYPES = {
     MoeBackendType.MEGAMOE_DEEPGEMM,
     MoeBackendType.MEGAMOE_CUTEDSL,
 }
+
+
+def test_trtllm_gen_honors_separated_routing_requirement():
+    backend = SimpleNamespace(routing_method=SimpleNamespace(requires_separated_routing=True))
+
+    assert TRTLLMGenFusedMoE._requires_separated_routing(backend)
 
 
 def _ensure_single_proc_dist_for_megamoe(backend_type: MoeBackendType, rank: int) -> None:
