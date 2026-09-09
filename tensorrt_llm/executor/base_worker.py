@@ -38,7 +38,7 @@ from ..bindings import executor as tllm
 from ..llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
-from ..llmapi.utils import _SyncQueue, configure_cpu_affinity, logger_debug
+from ..llmapi.utils import _SyncQueue, logger_debug
 from ..runtime import ModelConfig
 from ..sampling_params import BatchedLogitsProcessor, SamplingParams
 from .executor import GenerationExecutor, IterationResultQueue
@@ -147,8 +147,6 @@ class BaseWorker(GenerationExecutor):
         global_rank = global_mpi_rank()
         comm_ranks = mpi_comm().allgather(global_rank)
         device_ids = mpi_comm().allgather(device_id)
-
-        configure_cpu_affinity(device_id)
 
         return comm_ranks, device_ids
 

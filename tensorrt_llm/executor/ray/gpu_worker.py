@@ -32,7 +32,6 @@ from tensorrt_llm.executor.ray.utils import control_action_decorator
 from ... import TorchLlmArgs
 from ...llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType
 from ...llmapi.tokenizer import TokenizerBase
-from ...llmapi.utils import configure_cpu_affinity
 from ...sampling_params import BatchedLogitsProcessor
 from ..base_worker import BaseWorker
 from ..postproc_worker import PostprocWorkerConfig
@@ -362,8 +361,6 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
 
         torch.distributed.all_gather_object(comm_ranks, global_rank)
         torch.distributed.all_gather_object(device_ids, self.device_id)
-
-        configure_cpu_affinity(self.device_id)
 
         return comm_ranks, device_ids
 

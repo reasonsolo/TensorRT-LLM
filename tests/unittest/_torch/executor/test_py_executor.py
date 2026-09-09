@@ -69,6 +69,40 @@ class _TorchCollectiveDist:
         return int(tensor.item())
 
 
+def test_start_worker_configures_affinity_before_starting_thread(monkeypatch):
+    call_order = []
+    executor = object.__new__(PyExecutor)
+    executor.worker_lock = threading.Lock()
+    executor.worker_started = False
+    executor.device_id = 3
+    executor.dist = types.SimpleNamespace(pp_size=1, world_size=1)
+    executor._disable_mpi = True
+    executor.llm_args = types.SimpleNamespace(sleep_config=None)
+    executor._event_loop_wrapper = Mock()
+    executor.sampler = object()
+
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.py_executor.configure_cpu_affinity",
+        lambda device_id: call_order.append(("affinity", device_id)),
+    )
+
+    class _Thread:
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            call_order.append(("thread", None))
+
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.py_executor.threading.Thread", _Thread
+    )
+
+    executor.start_worker()
+
+    assert call_order == [("affinity", 3), ("thread", None)]
+
+
 def _run_sync_idle_progress_rank(rank: int, world_size: int, rendezvous_file: str) -> None:
     torch_dist.init_process_group(
         "gloo",
