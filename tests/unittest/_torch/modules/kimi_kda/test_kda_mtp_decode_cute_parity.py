@@ -260,7 +260,7 @@ def cpu_reference(data):
     }
 
 
-def cute_run(data, zero_accepted_hint=False):
+def cute_run(data, zero_accepted_hint=False, beta_cache_override=None):
     """Run the in-tree op on cloned caches; return the drop-format dict."""
     import tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_kda_mtp_ops  # noqa: F401
 
@@ -275,7 +275,7 @@ def cute_run(data, zero_accepted_hint=False):
         cs[name] = dst
     qkg_cache = data["qkg_cache"].clone()
     v_cache = data["v_cache"].clone()
-    beta_cache = data["beta_cache"].clone()
+    beta_cache = data["beta_cache"].clone() if beta_cache_override is None else beta_cache_override
     out = torch.ops.trtllm.kda_mtp_decode(
         x_q=data["x_q"],
         x_k=data["x_k"],
@@ -534,10 +534,10 @@ def test_zero_accepted_hint_variant(B, H):
         _assert_close(f"{name}(fast vs general)", fast[name], general[name], atol=1e-5)
 
 
-def test_misaligned_state_indices_rejected_after_aligned_warmup():
-    """The op enforces the alignment contract supplied by metadata prep."""
+def test_misaligned_state_indices_after_aligned_warmup():
+    """An offset int32 state-index view keeps CuTe parity after warmup."""
     data = make_conv_data(B=1, H=6, M=M, seed=13)
-    cute_run(data)
+    expected = cute_run(data)
 
     index_storage = torch.empty(2, dtype=torch.int32, device="cuda")
     index_storage[0] = -1
@@ -548,8 +548,56 @@ def test_misaligned_state_indices_rejected_after_aligned_warmup():
 
     misaligned_data = dict(data)
     misaligned_data["ssm_state_indices"] = misaligned_indices
-    with pytest.raises(ValueError, match="16-byte aligned"):
-        cute_run(misaligned_data)
+    actual = cute_run(misaligned_data)
+
+    for name in (
+        "out",
+        "recurrent_state",
+        "qkg_cache",
+        "v_cache",
+        "beta_cache",
+        "cs_q",
+        "cs_k",
+        "cs_v",
+    ):
+        _assert_close(f"{name}(misaligned vs aligned)", actual[name], expected[name], atol=1e-5)
+
+
+@pytest.mark.parametrize("field", ("cu_seqlens", "num_accepted_tokens"))
+def test_misaligned_scalar_metadata_after_aligned_warmup(field):
+    """Every scalar CuTe metadata argument accepts an offset int32 view."""
+    data = make_conv_data(B=1, H=6, M=M, seed=17)
+    expected = cute_run(data)
+
+    source = data[field]
+    storage = torch.empty(source.numel() + 1, dtype=torch.int32, device="cuda")
+    storage[0] = -1
+    storage[1:].copy_(source)
+    misaligned = storage[1:]
+    assert misaligned.is_contiguous()
+    assert misaligned.data_ptr() % 16 != 0
+
+    misaligned_data = dict(data)
+    misaligned_data[field] = misaligned
+    actual = cute_run(misaligned_data)
+
+    for name in expected:
+        if name != "state_v_first":
+            _assert_close(
+                f"{name}({field} misaligned vs aligned)", actual[name], expected[name], atol=1e-5
+            )
+
+
+def test_beta_cache_alignment_uses_padded_physical_stride():
+    from tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_kda_mtp_ops import (
+        _beta_cache_assumed_align,
+    )
+
+    parent = torch.empty(2, 1177, 7, 8, dtype=torch.float32, device="cuda")
+    beta_cache = parent[0, ..., :6]
+    assert beta_cache.shape == (1177, 7, 6)
+    assert beta_cache.stride() == (56, 8, 1)
+    assert _beta_cache_assumed_align(beta_cache) == 16
 
 
 if __name__ == "__main__":
