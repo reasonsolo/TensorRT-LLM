@@ -600,6 +600,50 @@ def test_beta_cache_alignment_uses_padded_physical_stride():
     assert _beta_cache_assumed_align(beta_cache) == 16
 
 
+@pytest.mark.parametrize(
+    "local_heads,num_spec,expected_alignment",
+    (
+        pytest.param(96, 7, 16, id="dep16-mtp7"),
+        pytest.param(12, 7, 16, id="tep8-mtp7"),
+        pytest.param(6, 5, 8, id="tep16-mtp5"),
+        pytest.param(6, 7, 8, id="tep16-mtp7"),
+        pytest.param(3, 7, 4, id="tep32-mtp7"),
+    ),
+)
+def test_beta_cache_sibling_layer_after_aligned_warmup(local_heads, num_spec, expected_alignment):
+    """A cached kernel accepts the next real per-layer beta-cache slice."""
+    from tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_kda_mtp_ops import (
+        _beta_cache_assumed_align,
+    )
+
+    data = make_conv_data(B=1, H=local_heads, M=num_spec, seed=29)
+    parent = torch.zeros(2, 1177, num_spec, local_heads, dtype=torch.float32, device="cuda")
+    layer0, layer1 = parent.unbind(0)
+    layer0[0].copy_(data["beta_cache"][0])
+    layer1[0].copy_(data["beta_cache"][0])
+
+    assert _beta_cache_assumed_align(layer0) == expected_alignment
+    assert layer0.data_ptr() % 16 == 0
+    assert layer1.data_ptr() % expected_alignment == 0
+    if expected_alignment < 16:
+        assert layer1.data_ptr() % (2 * expected_alignment) != 0
+
+    expected = cute_run(data, beta_cache_override=layer0)
+    actual = cute_run(data, beta_cache_override=layer1)
+
+    for name in (
+        "out",
+        "recurrent_state",
+        "qkg_cache",
+        "v_cache",
+        "beta_cache",
+        "cs_q",
+        "cs_k",
+        "cs_v",
+    ):
+        _assert_close(f"{name}(sibling beta cache)", actual[name], expected[name], atol=1e-5)
+
+
 if __name__ == "__main__":
     import sys
 
