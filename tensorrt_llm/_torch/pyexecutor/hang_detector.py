@@ -33,6 +33,35 @@ _HARD_KILL_EXIT_CODE = 137
 RANK_CRASH_KILL_GRACE_ENV = "TLLM_RANK_CRASH_HARD_KILL_GRACE"
 _RANK_CRASH_KILL_GRACE_DEFAULT = 10.0
 
+# Seconds the executor loop may make no progress before the hang is reported.
+# Nothing in the codebase passes HangDetector(timeout=...), so this default is
+# the only value that ever applies; the environment variable exists so a long
+# legitimately-slow step can be distinguished from a real deadlock without a
+# rebuild. Invalid or non-positive values fall back to the default.
+HANG_DETECTION_TIMEOUT_ENV = "TLLM_HANG_DETECTION_TIMEOUT"
+_HANG_DETECTION_TIMEOUT_DEFAULT = 300
+
+
+def _resolve_hang_detection_timeout() -> int:
+    raw = os.environ.get(HANG_DETECTION_TIMEOUT_ENV)
+    if raw is None or raw.strip() == "":
+        return _HANG_DETECTION_TIMEOUT_DEFAULT
+    try:
+        parsed = int(raw)
+    except ValueError:
+        logger.warning(
+            f"Ignoring invalid {HANG_DETECTION_TIMEOUT_ENV}={raw!r} "
+            f"(expected a positive integer); using {_HANG_DETECTION_TIMEOUT_DEFAULT}s"
+        )
+        return _HANG_DETECTION_TIMEOUT_DEFAULT
+    if parsed <= 0:
+        logger.warning(
+            f"Ignoring non-positive {HANG_DETECTION_TIMEOUT_ENV}={raw!r}; "
+            f"using {_HANG_DETECTION_TIMEOUT_DEFAULT}s"
+        )
+        return _HANG_DETECTION_TIMEOUT_DEFAULT
+    return parsed
+
 
 def _best_effort_flush_streams() -> None:
     """Flush stdout/stderr without ever raising; diagnostics must not block hard kill."""
@@ -353,7 +382,7 @@ class HangDetector:
         on_detected: Optional[Callable[[], None]] = None,
         report_context: Optional[str] = None,
     ) -> None:
-        self.timeout = timeout if timeout is not None else 300
+        self.timeout = timeout if timeout is not None else _resolve_hang_detection_timeout()
         assert self.timeout > 0, "timeout must be greater than 0"
         self.on_detected = on_detected or (lambda: None)
         self.report_context = report_context
