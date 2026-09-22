@@ -258,7 +258,7 @@ class NVLinkOneSided(Communication):
         dtype: Optional[torch.dtype] = None,
         num_experts: Optional[int] = None,
         use_low_precision_combine: bool = False,
-        can_use_cft_counted_writes: bool = False,
+        can_use_cft_counted_writes: bool = True,
         ep_group_health: EPGroupHealthLike | None = None,
         alltoall_watchdog_timeout_s: Optional[float] = None,
         alltoall_watchdog_poll_interval_s: float = DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
@@ -285,10 +285,21 @@ class NVLinkOneSided(Communication):
                 writes (fabric.try_put.counted via Logical Endpoints) for dispatch.
                 Requires sm_100+ (Blackwell or later), a build against CUDA 13.4+, an
                 NVLink fabric, and a driver exporting the CUDA logical endpoint API.
-                Defaults to False: CFT is opt-in, so the fence-based path remains the
-                default on every architecture. Callers that have verified the CFT
-                prerequisites may pass True, or set TRTLLM_MOE_A2A_FORCE_CFT=1 to force
-                CFT for supported workloads (0 forces the fence path).
+                Defaults to True, which is what makes CFT availability gate the
+                strategy: CommunicationFactory never passes this argument, so with
+                True a host without the logical-endpoint driver API fails
+                construction and auto-selection falls through to NVLinkTwoSided.
+                Defaulting to False instead silently keeps NVLinkOneSided on its
+                fence-based path, whose dispatch/combine polling does not scale to
+                context-sized batches: on GB300 / oci-jhb (driver below 615.00) the
+                Kimi-K3 ctx-only dep16 shape at max_num_tokens=8192 degraded from
+                ~2 s to ~90 s per iteration (jobs 561379 / 564134), while the guard
+                reference for that preset, which took the NVLinkTwoSided fallback
+                because this default was True, held ~2.9 s mean (job 555412). Gen-sized batches (256 tokens) are unaffected, which is
+                why the fence path looks healthy in decode-only tests. Set
+                TRTLLM_MOE_A2A_FORCE_CFT=1 to force CFT for supported workloads
+                (0 forces the fence path), or pass False explicitly to opt in to
+                fence-based NVLinkOneSided.
             ep_group_health: Optional read-only committed EP membership. When present, rank-mask handling is
                 enabled in the CUDA kernels, and its mask defines the peers expected by the watchdog. Timeout
                 detection never mutates it. CUDA graphs are rejected until membership-scoped recapture lands.
