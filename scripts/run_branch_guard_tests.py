@@ -373,6 +373,25 @@ GUARD_JOBS = (
         use_pmix=False,
         launcher="benchmark",
     ),
+    # DSpark on the EP16 topology. The EP8 DSpark job above cannot be made to
+    # fit on GB300: it OOMs during model creation, before KV-cache sizing, at
+    # 252.59 GB/rank of weights alone, so no free_gpu_memory_fraction helps.
+    # Expert-parallel width is the only measured lever -- EP16 holds 56 experts
+    # per rank per layer against EP8's 112 and was measured at 163.44 GB/rank
+    # on the same cluster -- so this is the variant that actually exercises
+    # DSpark there.
+    GuardJob(
+        name="k3-disaggregated-dspark-dep16-gsm8k",
+        scope="multi-node",
+        selectors=(K3_DEP16_DISAGGREGATED_ACCURACY_CONFIG,),
+        nodes=8,
+        ntasks=32,
+        ntasks_per_node=4,
+        gpus_per_node=4,
+        use_pmix=False,
+        launcher="benchmark",
+        speculative_config=K3_DSPARK_SPECULATIVE_CONFIG,
+    ),
     *(
         GuardJob(
             name=f"dsv4-multi-node-{test_name.rsplit('::', maxsplit=1)[-1]}",
@@ -1016,6 +1035,7 @@ def _benchmark_config(args: argparse.Namespace, job: GuardJob) -> tuple[Path, Pa
     if job.name in {
         "k3-disaggregated-dspark-gsm8k",
         "k3-disaggregated-dspark-helix-cp8-gsm8k",
+        "k3-disaggregated-dspark-dep16-gsm8k",
     }:
         for role in ("ctx", "gen"):
             config["worker_config"][role]["kv_cache_config"]["dtype"] = "fp8"
@@ -1034,7 +1054,10 @@ def _benchmark_config(args: argparse.Namespace, job: GuardJob) -> tuple[Path, Pa
                 "max_num_tokens": 256,
             }
         )
-    if job.name == "k3-disaggregated-dep16-gsm8k":
+    if job.name in {
+        "k3-disaggregated-dep16-gsm8k",
+        "k3-disaggregated-dspark-dep16-gsm8k",
+    }:
         # The normal SBSA GB300 image does not provide the MegaMoE DeepGEMM
         # implementation selected by the performance recipe. Use K3's
         # supported TRTLLM MoE backend for this correctness guard.
