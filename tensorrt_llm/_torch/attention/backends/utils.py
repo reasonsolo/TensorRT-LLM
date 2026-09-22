@@ -82,6 +82,7 @@ def create_attention(
     aux_stream: Optional[torch.cuda.Stream] = None,
     kv_cache_dtype: str = "auto",
     skip_correction_threshold: float = 0.0,
+    flashinfer_mla_backend: Optional[str] = None,
 ) -> AttentionBackend:
     if attention_chunk_size is not None and backend_name.upper() != "TRTLLM":
         raise ValueError(
@@ -119,6 +120,10 @@ def create_attention(
         kv_cache_dtype=kv_cache_dtype,
         skip_correction_threshold=skip_correction_threshold,
     )
+    # Only TrtllmAttention accepts this; leave it out entirely when unset so
+    # the other backends keep their current constructor signatures.
+    if flashinfer_mla_backend is not None:
+        kwargs["flashinfer_mla_backend"] = flashinfer_mla_backend
 
     return attn_cls(
         layer_idx,

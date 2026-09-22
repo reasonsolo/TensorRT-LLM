@@ -250,6 +250,7 @@ class MLA(nn.Module):
         o_lora_rank: int = 1024,
         fuse_qkv_a_proj: bool = True,
         rms_norm_eps: Optional[float] = None,
+        flashinfer_mla_backend: Optional[str] = None,
     ) -> None:
         """
         Initialize the MLA module.
@@ -278,6 +279,10 @@ class MLA(nn.Module):
             fuse_qkv_a_proj (bool): Whether q_a and kv_a share one fused
                 projection. Set to ``False`` for checkpoints that store a
                 separate ``q_a_proj``.
+            flashinfer_mla_backend (Optional[str]): Statically configured
+                generation backend for the MLA (mqa) attention instance, one
+                of ``trtllm-gen`` or ``cute-dsl``. ``None`` (the default)
+                preserves the attention backend's own default.
             rms_norm_eps (Optional[float]): Override the RMSNorm epsilon from
                 the pretrained config. If neither source provides a value
                 (e.g. config.pretrained_config is None), falls back to 1e-6.
@@ -596,6 +601,7 @@ class MLA(nn.Module):
             rope_append=(self.sparse_attn_hooks is None or self.sparse_attn_hooks.mqa_rope_append),
             kv_cache_dtype=self.kv_cache_dtype,
             skip_correction_threshold=config.skip_correction_threshold,
+            flashinfer_mla_backend=flashinfer_mla_backend,
         )
         if self.mqa is None:
             raise RuntimeError("MLA requires a non-null MQA attention backend")

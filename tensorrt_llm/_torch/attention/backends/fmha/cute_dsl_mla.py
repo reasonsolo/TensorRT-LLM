@@ -92,6 +92,29 @@ class CuteDslMlaFmha(PhasedFmha):
         return True
 
     @staticmethod
+    def _is_fp8_cute_dsl_selected(
+        attn: "TrtllmAttention",
+        meta: "TrtllmAttentionMetadata",
+        num_tokens: int,
+        kernel_dtype: Optional[torch.dtype],
+    ) -> bool:
+        """Whether this layer explicitly asked for CuTe DSL on FP8 KV.
+
+        ``flashinfer_mla_backend`` defaults to ``trtllm-gen`` for every model,
+        so this is False unless a module deliberately requested ``cute-dsl``
+        (Kimi K3 does, because TRTLLM-Gen rejects its 96 query heads). When it
+        is True the request is a correctness requirement rather than a
+        performance preference, so the measured-win gate is skipped.
+        """
+        if kernel_dtype != torch.float8_e4m3fn:
+            return False
+        backend = getattr(attn, "flashinfer_mla_backend", None)
+        policy = getattr(attn, "mla_backend_policy", None)
+        if policy is not None:
+            backend = policy(backend, meta, num_tokens)
+        return backend == "cute-dsl"
+
+    @staticmethod
     def _get_kernel_dtype(attn: "TrtllmAttention", q: torch.Tensor) -> Optional[torch.dtype]:
         if getattr(attn, "has_fp8_kv_cache", False):
             return torch.float8_e4m3fn
@@ -336,7 +359,13 @@ class CuteDslMlaFmha(PhasedFmha):
         helix_h96_verify_group = (
             attn.num_heads == 96 and seq_len_q > 1 and meta.helix_position_offsets is not None
         )
-        if not helix_h96_verify_group:
+        # An explicit CuTe-DSL request on FP8 KV is likewise a correctness
+        # carve-out, not a perf preference: the only other MLA generation
+        # library is TRTLLM-Gen, which rejects 64 < num_heads_q < 128.
+        fp8_cute_dsl_selected = self._is_fp8_cute_dsl_selected(
+            attn, meta, q.shape[0], self._get_kernel_dtype(attn, q)
+        )
+        if not (helix_h96_verify_group or fp8_cute_dsl_selected):
             # Perf gate (NOT a correctness limit).
             favorable, reason = self._is_perf_favorable(
                 attn.num_heads,

@@ -18,7 +18,7 @@ import math
 import os
 import weakref
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
 
 import torch
 
@@ -1547,6 +1547,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         sparse_params: Optional[SparseParams] = None,
         kv_cache_dtype: str = "auto",
         skip_correction_threshold: float = 0.0,
+        flashinfer_mla_backend: str = "trtllm-gen",
         **kwargs,
     ) -> None:
         """
@@ -1571,10 +1572,27 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 used by DeepSeek-V4 and DSA on SM120/SM121.
             skip_correction_threshold (float): Runtime MLA threshold. Zero disables
                 skip-correction.
+            flashinfer_mla_backend (str): Statically configured MLA generation
+                backend, one of ``trtllm-gen`` (default) or ``cute-dsl``.
+                ``cute-dsl`` is an explicit request for the native CuTe DSL MLA
+                decode library rather than a performance preference, so the
+                CuTe DSL FMHA library treats it as a correctness carve-out and
+                skips its measured-win gate for FP8 KV.
         """
         super().__init__(layer_idx, num_heads, head_dim, num_kv_heads,
                          quant_config, **kwargs)
         self.sparse_params = sparse_params
+        self.flashinfer_mla_backend = flashinfer_mla_backend
+        # Per-batch MLA decode backend override hook. Maps (statically
+        # configured backend, batch metadata, num_tokens) -> backend name for
+        # the current batch. None (the default) keeps the static
+        # ``flashinfer_mla_backend`` selection unchanged. Model code that
+        # needs batch-dependent selection (e.g. Kimi K3's MLA module)
+        # installs a policy on the attention instances it owns; it lives on
+        # the backend object rather than the FMHA lib instances because those
+        # may be recreated after model construction.
+        self.mla_backend_policy: Optional[Callable[
+            [str, "TrtllmAttentionMetadata", int], str]] = None
         self.kv_cache_dtype = kv_cache_dtype
         self.use_fp8_ds_mla = kv_cache_dtype == "fp8_ds_mla"
         self.is_mla_enable = mla_params is not None
