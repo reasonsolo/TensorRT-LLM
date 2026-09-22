@@ -287,8 +287,11 @@ class NVLinkOneSided(Communication):
                 NVLink fabric, and a driver exporting the CUDA logical endpoint API.
                 Defaults to True, which is what makes CFT availability gate the
                 strategy: CommunicationFactory never passes this argument, so with
-                True a host without the logical-endpoint driver API fails
+                True a host that cannot bring up CFT logical endpoints fails
                 construction and auto-selection falls through to NVLinkTwoSided.
+                That failure can surface either as loadApis() rejecting a driver
+                that does not export the API, or, as on GB300 / oci-jhb, as
+                createEndpointExternal() failing afterwards; both are caught.
                 Defaulting to False instead silently keeps NVLinkOneSided on its
                 fence-based path, whose dispatch/combine polling does not scale to
                 context-sized batches: on GB300 / oci-jhb (driver below 615.00) the
