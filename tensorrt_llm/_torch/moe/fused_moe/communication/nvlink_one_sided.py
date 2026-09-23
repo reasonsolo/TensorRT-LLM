@@ -170,6 +170,13 @@ class NVLinkOneSided(Communication):
     EPLB_GATHERED_STATS_OFFSET_INDEX = None
     PAYLOAD_DATA_OFFSET_INDEX = None
 
+    # Set once when CFT logical-endpoint creation is found unavailable on this
+    # host, so the probe is not repeated for every MoE instance. Each failed
+    # attempt costs a driver call that returns CUDA_ERROR_INVALID_VALUE *and*
+    # leaks the MNNVL workspace registered earlier in __init__, because the
+    # exception escapes after _WORKSPACE_REFCOUNTS has been incremented.
+    _CFT_UNAVAILABLE: bool = False
+
     @staticmethod
     def get_aux_data_size(
         ep_size: int,
@@ -345,6 +352,13 @@ class NVLinkOneSided(Communication):
         self._force_cft = get_force_cft()
         if self._force_cft is False:
             can_use_cft_counted_writes = False
+        if can_use_cft_counted_writes and NVLinkOneSided._CFT_UNAVAILABLE:
+            # Raise before allocating anything so the factory falls through to
+            # NVLinkTwoSided without leaving a workspace behind.
+            raise RuntimeError(
+                "CftLeManager: CFT logical endpoints are unavailable on this host "
+                "(cached from an earlier probe); NVLinkOneSided requires them."
+            )
         self.can_use_cft_counted_writes = can_use_cft_counted_writes
         if self._force_cft is None:
             self.cft_max_batch_for_dispatch = _get_cft_max_batch_for_dispatch()
@@ -525,13 +539,20 @@ class NVLinkOneSided(Communication):
         # Initialize CFT Logical Endpoints by binding the LE to the workspace.
         # The LE IS the workspace — no separate allocation or payload layout needed.
         if self.can_use_cft_counted_writes and not workspace_state.get("cft_initialized", False):
-            torch.ops.trtllm.moe_a2a_cft_initialize(
-                self.workspace,
-                self.mnnvl_mem.local_mem_handle,
-                int(self.workspace.size(1)),
-                self.ep_rank,
-                self.ep_size,
-            )
+            try:
+                torch.ops.trtllm.moe_a2a_cft_initialize(
+                    self.workspace,
+                    self.mnnvl_mem.local_mem_handle,
+                    int(self.workspace.size(1)),
+                    self.ep_rank,
+                    self.ep_size,
+                )
+            except Exception:
+                # Latch the result so the remaining MoE instances take the
+                # fail-fast path above instead of repeating a driver call that
+                # cannot succeed and leaking a workspace on every attempt.
+                NVLinkOneSided._CFT_UNAVAILABLE = True
+                raise
             workspace_state["cft_initialized"] = True
 
         # Initialize dispatch state
