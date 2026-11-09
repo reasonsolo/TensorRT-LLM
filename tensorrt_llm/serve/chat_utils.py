@@ -156,6 +156,7 @@ def parse_chat_message_content_part(
     if (isinstance(part, dict)
             and part.get("type") in ("image_url", "image_embeds")
             and isinstance(mm_data_tracker._model_type, str)
+            and mm_data_tracker._model_type
             and not MULTIMODAL_PLACEHOLDER_REGISTRY.is_valid(
                 mm_data_tracker._model_type, "image")):
         return "[image omitted]"

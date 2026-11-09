@@ -61,6 +61,7 @@ from tensorrt_llm.executor import (EngineDeadError, GenerationResult,
                                    RequestError)
 from tensorrt_llm.inputs import PromptInputs, prompt_inputs
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
+from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
 from tensorrt_llm.inputs.utils import resolve_hf_chat_template
 from tensorrt_llm.llmapi import SamplingParams
 from tensorrt_llm.llmapi.disagg_utils import get_usage_tokens_from_ctx
@@ -1156,13 +1157,18 @@ def _fold_tool_calls_into_open_assistant_turn(
 async def _create_input_messages(
     request: ResponsesRequest,
     prev_msgs: list[ChatCompletionMessageParam],
+    model_type: Optional[str] = None,
 ) -> list[ChatCompletionMessageParam]:
-    return chat_messages_from_responses_input(request, prev_msgs)
+    return chat_messages_from_responses_input(request,
+                                              prev_msgs,
+                                              model_type=model_type)
 
 
 def chat_messages_from_responses_input(
     request: ResponsesRequest,
     prev_msgs: list[ChatCompletionMessageParam],
+    *,
+    model_type: Optional[str] = None,
 ) -> list[ChatCompletionMessageParam]:
     """Convert a Responses request's instructions, history and input to chat messages."""
     messages: list[ChatCompletionMessageParam] = []
@@ -1194,7 +1200,12 @@ def chat_messages_from_responses_input(
     else:
         turn_start = len(messages)
         tool_resolution = _tool_resolution(request.tools)
+        omit_images = bool(
+            model_type) and not MULTIMODAL_PLACEHOLDER_REGISTRY.is_valid(
+                model_type, "image")
         for inp in request.input:
+            if omit_images:
+                inp = _omit_response_input_images(inp)
             message = _response_output_item_to_chat_completion_message(
                 inp, tool_resolution)
             if message is None:
@@ -1422,6 +1433,26 @@ def _get_chat_completion_function_tools(
     return function_tools
 
 
+def _omit_response_input_images(item: Any) -> dict:
+    """Replace native image blocks before source-reference validation."""
+    value = item if isinstance(item, dict) else item.model_dump()
+    for field in ("content", "output"):
+        parts = value.get(field)
+        if isinstance(parts, list) and any(
+                isinstance(part, dict) and part.get("type") in
+            ("input_image", "image_url", "image_embeds") for part in parts):
+            value = {
+                **value, field:
+                [{
+                    "type": "text",
+                    "text": "[image omitted]"
+                } if isinstance(part, dict) and part.get("type")
+                 in ("input_image", "image_url", "image_embeds") else part
+                 for part in parts]
+            }
+    return value
+
+
 async def _create_input_tokens(
     request: ResponsesRequest,
     prev_response: Optional[ResponsesResponse],
@@ -1448,6 +1479,7 @@ async def _create_input_tokens(
     messages = await _create_input_messages(
         request=request,
         prev_msgs=prev_msgs,
+        model_type=resolve_top_level_model_type(model_config),
     )
 
     if enable_store and request.store:

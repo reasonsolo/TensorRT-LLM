@@ -214,8 +214,8 @@ The chat parser replaces each `image_url` or `image_embeds` content block with
 `[image omitted]` when the selected model's registered modalities do not include
 images. It does so before creating a media loader or decoding embeddings.
 Surrounding text, history order and tool-result IDs are preserved, and the
-original request messages are not modified. Responses images use the same path
-after conversion to chat content.
+original request messages are not modified. Native Responses image blocks, including file-ID references, are omitted before
+source-reference validation for a text-only model.
 
 Models registered for image input retain their existing image-loading and
 placeholder behavior. Omitting an unsupported image does not produce a caption

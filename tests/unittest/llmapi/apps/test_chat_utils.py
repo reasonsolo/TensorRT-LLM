@@ -20,6 +20,7 @@ from tensorrt_llm.serve.chat_utils import (
     parse_chat_message_content_part,
     parse_chat_messages_coroutines,
 )
+from tensorrt_llm.serve.responses_utils import _omit_response_input_images
 
 pytestmark = pytest.mark.cpu_only
 
@@ -1117,13 +1118,15 @@ class TestRequestLocalMediaPaths:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("image_kind", ["image_url", "image_embeds"])
+@pytest.mark.parametrize("image_kind", ["image_url", "image_embeds", "input_image"])
 async def test_text_only_images_are_omitted_before_media_loading(image_kind):
     image = (
         {"type": "image_url", "image_url": {"url": "https://invalid.invalid/image"}}
         if image_kind == "image_url"
         else {"type": "image_embeds", "image_embeds": {"data": "not-encoded"}}
     )
+    if image_kind == "input_image":
+        image = {"type": "input_image", "file_id": "file-image"}
     messages = [
         {
             "role": "user",
@@ -1140,6 +1143,11 @@ async def test_text_only_images_are_omitted_before_media_loading(image_kind):
         },
     ]
     original = deepcopy(messages)
+    parsed_messages = (
+        [_omit_response_input_images(message) for message in messages]
+        if image_kind == "input_image"
+        else messages
+    )
     with (
         patch.object(
             _chat_utils, "_make_media_io", side_effect=AssertionError("media must not load")
@@ -1151,7 +1159,7 @@ async def test_text_only_images_are_omitted_before_media_loading(image_kind):
         ),
     ):
         conversation, pending, counts, order = parse_chat_messages_coroutines(
-            messages, None, model_type_override="llama"
+            parsed_messages, None, model_type_override="llama"
         )
         assert await pending == (None, None)
     assert conversation[0]["content"] == "before\n[image omitted]\nafter"

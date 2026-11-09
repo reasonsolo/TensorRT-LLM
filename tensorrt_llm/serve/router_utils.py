@@ -513,7 +513,9 @@ class BlockHashMixin:
         # As on the worker, developer messages render as system for a chat
         # template that has no developer role.
         messages = responses_utils._render_developer_as_system(
-            responses_utils.chat_messages_from_responses_input(request, []),
+            responses_utils.chat_messages_from_responses_input(
+                request, [], model_type=self._get_model_type()
+            ),
             self._get_tokenizer(request.model),
             None,
             [tool.model_dump() for tool in tools],
