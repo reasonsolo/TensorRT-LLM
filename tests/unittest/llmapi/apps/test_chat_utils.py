@@ -1,4 +1,8 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import os
+from copy import deepcopy
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -624,7 +628,7 @@ class TestParseChatMessageContentPart:
 
     @pytest.fixture
     def mm_tracker(self):
-        return MultimodalDataTracker(model_type="dummy")
+        return MultimodalDataTracker(model_type=_MM_MODEL_TYPE)
 
     def test_string_input_returned_directly(self, mm_tracker):
         assert parse_chat_message_content_part("hello world", mm_tracker) == "hello world"
@@ -756,7 +760,7 @@ class TestMediaIoKwargsLoaderForwarding:
     def mm_tracker_factory(self):
         def _make(server_kwargs=None, request_kwargs=None):
             return MultimodalDataTracker(
-                model_type="dummy",
+                model_type=_MM_MODEL_TYPE,
                 multimodal_server_config=MultimodalServerConfig(media_io_kwargs=server_kwargs),
                 request_media_io_kwargs=request_kwargs,
             )
@@ -918,7 +922,7 @@ class TestRequestLocalMediaPaths:
 
     @staticmethod
     async def _load(url, kind="image_url"):
-        tracker = MultimodalDataTracker(model_type="dummy")
+        tracker = MultimodalDataTracker(model_type=_MM_MODEL_TYPE)
         part = {"type": kind, kind: {"url": url}}
         return await parse_chat_message_content_part(part, tracker)["data"]
 
@@ -1110,3 +1114,50 @@ class TestRequestLocalMediaPaths:
         with pytest.raises(ValueError, match="Local media paths are not accepted") as excinfo:
             await self._load(str(media_dirs[0] / "img.png"))
         assert str(missing) not in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("image_kind", ["image_url", "image_embeds"])
+async def test_text_only_images_are_omitted_before_media_loading(image_kind):
+    image = (
+        {"type": "image_url", "image_url": {"url": "https://invalid.invalid/image"}}
+        if image_kind == "image_url"
+        else {"type": "image_embeds", "image_embeds": {"data": "not-encoded"}}
+    )
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "before"},
+                image,
+                {"type": "text", "text": "after"},
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": [image, {"type": "text", "text": "result"}],
+        },
+    ]
+    original = deepcopy(messages)
+    with (
+        patch.object(
+            _chat_utils, "_make_media_io", side_effect=AssertionError("media must not load")
+        ),
+        patch.object(
+            _chat_utils,
+            "load_base64_image_embeds",
+            side_effect=AssertionError("embeddings must not decode"),
+        ),
+    ):
+        conversation, pending, counts, order = parse_chat_messages_coroutines(
+            messages, None, model_type_override="llama"
+        )
+        assert await pending == (None, None)
+    assert conversation[0]["content"] == "before\n[image omitted]\nafter"
+    assert conversation[1]["content"] == "[image omitted]\nresult"
+    assert conversation[1]["tool_call_id"] == "call_1"
+    assert all(message["media"] == [] for message in conversation)
+    assert counts == [{}, {}]
+    assert order == []
+    assert messages == original

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import json
 import uuid
 from functools import lru_cache, partial
@@ -149,6 +152,13 @@ def parse_chat_message_content_part(
     """Parse a single part of a chat message."""
     if isinstance(part, str):
         return part
+
+    if (isinstance(part, dict)
+            and part.get("type") in ("image_url", "image_embeds")
+            and isinstance(mm_data_tracker._model_type, str)
+            and not MULTIMODAL_PLACEHOLDER_REGISTRY.is_valid(
+                mm_data_tracker._model_type, "image")):
+        return "[image omitted]"
 
     part_type, content = _parse_chat_message_content_mm_part(part)
 

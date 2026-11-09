@@ -206,3 +206,17 @@ compatibility separately from transport fields when changing this interface.
 
 These contracts do not change the supported model/modality matrix or impose a
 common batching policy on every model.
+
+
+## Image blocks for text-only models
+
+The chat parser replaces each `image_url` or `image_embeds` content block with
+`[image omitted]` when the selected model's registered modalities do not include
+images. It does so before creating a media loader or decoding embeddings.
+Surrounding text, history order and tool-result IDs are preserved, and the
+original request messages are not modified. Responses images use the same path
+after conversion to chat content.
+
+Models registered for image input retain their existing image-loading and
+placeholder behavior. Omitting an unsupported image does not produce a caption
+or an interpretation of its contents.
