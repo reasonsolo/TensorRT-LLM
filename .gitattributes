@@ -27,3 +27,4 @@ tensorrt_llm/grpc/openengine/_generated/** linguist-generated=true
 tensorrt_llm/schemas/*.json linguist-generated=true
 .claude/skills/trtllm-visualgen-bench/media/image_with_red_background.png filter=lfs diff=lfs merge=lfs -text
 .claude/skills/trtllm-visualgen-bench/media/landscape.png filter=lfs diff=lfs merge=lfs -text
+.github/pr-assets/pr22083-prefill-monitoring-blurred.png filter=lfs diff=lfs merge=lfs -text
